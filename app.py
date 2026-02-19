@@ -308,9 +308,121 @@ def format_num(col_name, val):
     except:
         return str(val)
 
-def clean_resin_df(sheet_name):
-    """Clean resin dataframe — auto-detect header row."""
+# Per-sheet resin cache: { sheet_name: {'df': DataFrame, 'file_mtime': float} }
+_resin_sheet_cache = {}
+# Lightweight meta cache: { sheet_name: {'locations': [...], 'grades': [...], 'file_mtime': float} }
+_resin_meta_cache = {}
+
+def invalidate_resin_cache():
+    """Clear all cached resin sheets (call after import/upload)."""
+    global _resin_sheet_cache, _resin_meta_cache
+    _resin_sheet_cache.clear()
+    _resin_meta_cache.clear()
+    logger.info("Resin sheet cache invalidated")
+
+
+def load_resin_meta(sheet_name):
+    """Fast metadata reader — returns only Location & Grade lists.
+    Reads only first 6 columns via usecols, skipping hundreds of date columns."""
+    global _resin_meta_cache
     try:
+        current_mtime = RESIN_EXCEL.stat().st_mtime if RESIN_EXCEL.exists() else 0
+        cached = _resin_meta_cache.get(sheet_name)
+        if cached and cached.get('file_mtime') == current_mtime:
+            return cached
+
+        logger.info(f"Fast-reading resin meta for '{sheet_name}'")
+
+        # Read only first 6 columns — skips hundreds of price/date columns
+        meta_cols_range = list(range(6))
+
+        # Try header=0 first
+        df = pd.read_excel(RESIN_EXCEL, sheet_name=sheet_name, usecols=meta_cols_range)
+        df.columns = [str(c).strip() for c in df.columns]
+
+        if 'Location' not in df.columns:
+            df = pd.read_excel(RESIN_EXCEL, sheet_name=sheet_name, header=1, usecols=meta_cols_range)
+            df.columns = [str(c).strip() for c in df.columns]
+
+        if 'Location' not in df.columns:
+            for h in range(5):
+                df = pd.read_excel(RESIN_EXCEL, sheet_name=sheet_name, header=h, usecols=meta_cols_range)
+                df.columns = [str(c).strip() for c in df.columns]
+                if 'Location' in df.columns:
+                    break
+
+        locations = sorted(df["Location"].dropna().astype(str).str.strip().unique().tolist()) if 'Location' in df.columns else []
+        grades = sorted(df["Grade"].dropna().astype(str).str.strip().unique().tolist()) if 'Grade' in df.columns else []
+
+        result = {'locations': locations, 'grades': grades, 'file_mtime': current_mtime}
+        _resin_meta_cache[sheet_name] = result
+        return result
+    except Exception as e:
+        logger.warning(f"Fast meta read failed for '{sheet_name}': {e}, falling back to full read")
+        df = clean_resin_df(sheet_name)
+        result = {
+            'locations': sorted(df["Location"].dropna().unique().tolist()),
+            'grades': sorted(df["Grade"].dropna().unique().tolist()),
+            'file_mtime': RESIN_EXCEL.stat().st_mtime if RESIN_EXCEL.exists() else 0
+        }
+        _resin_meta_cache[sheet_name] = result
+        return result
+
+
+def parse_date_col(col_str):
+    """Parse a date column name into a datetime object.
+    Supports: YYYY/MM/DD, YYYY-MM-DD, M/D/YYYY, MM/DD/YYYY, DD/MM/YYYY,
+    pandas Timestamp, and other common date formats.
+    Returns datetime or None if unparseable."""
+    from datetime import datetime as _dt
+    s = str(col_str).strip()
+    # Handle pandas Timestamp objects
+    if hasattr(col_str, 'year') and hasattr(col_str, 'month'):
+        try:
+            return _dt(col_str.year, col_str.month, col_str.day)
+        except:
+            pass
+    for fmt in [
+        '%Y/%m/%d', '%Y-%m-%d', '%Y/%m/%d %H:%M:%S', '%Y-%m-%d %H:%M:%S',
+        '%m/%d/%Y', '%d/%m/%Y', '%m-%d-%Y', '%d-%m-%Y',
+        '%B %d, %Y', '%b %d, %Y', '%B %d %Y', '%b %d %Y',
+    ]:
+        try:
+            return _dt.strptime(s, fmt)
+        except ValueError:
+            continue
+    try:
+        return pd.to_datetime(s).to_pydatetime()
+    except:
+        return None
+
+
+def sort_date_series(dates_str, values):
+    """Parse date strings, sort chronologically, return (sorted_iso_dates, sorted_labels, sorted_values)."""
+    paired = []
+    for d, v in zip(dates_str, values):
+        dt_obj = parse_date_col(d)
+        if dt_obj:
+            paired.append((dt_obj, v, d))
+        else:
+            paired.append((datetime.max, v, d))
+    paired.sort(key=lambda x: x[0])
+    iso_dates = [p[0].strftime('%Y-%m-%d') if p[0] != datetime.max else p[2] for p in paired]
+    labels = [p[0].strftime('%b %Y') if p[0] != datetime.max else p[2] for p in paired]
+    sorted_values = [p[1] for p in paired]
+    return iso_dates, labels, sorted_values
+
+
+def clean_resin_df(sheet_name):
+    """Clean resin dataframe — auto-detect header row. Cached per-sheet with file-mtime invalidation."""
+    global _resin_sheet_cache
+    try:
+        current_mtime = RESIN_EXCEL.stat().st_mtime if RESIN_EXCEL.exists() else 0
+        cached = _resin_sheet_cache.get(sheet_name)
+        if cached and cached.get('file_mtime') == current_mtime:
+            return cached['df']
+
+        logger.info(f"Reading resin sheet '{sheet_name}' from disk (cache miss)")
         # Try header=0 first (standard format from auto-created sheets)
         df = pd.read_excel(RESIN_EXCEL, sheet_name=sheet_name)
         df.columns = [str(c).strip() for c in df.columns]
@@ -328,6 +440,7 @@ def clean_resin_df(sheet_name):
                 if 'Location' in df.columns:
                     break
 
+        _resin_sheet_cache[sheet_name] = {'df': df, 'file_mtime': current_mtime}
         return df
     except Exception as e:
         logger.error(f"Error cleaning resin dataframe for '{sheet_name}': {e}")
@@ -476,6 +589,8 @@ def admin_upload():
         # Invalidate cache
         data_cache[file_type] = {'data': None, 'timestamp': None}
         file_mod_times[file_type] = get_file_mod_time(target_path)
+        if file_type == 'resin':
+            invalidate_resin_cache()
         
         flash(f'{file.filename} uploaded successfully!', 'success')
         logger.info(f"File uploaded: {file.filename} → {target_path}")
@@ -1203,6 +1318,7 @@ def api_import_resin_prices():
                 rt: merge_stats[rt]['new_rows'] for rt in new_entries
             }
 
+        invalidate_resin_cache()
         return jsonify(response_data)
 
     except Exception as e:
@@ -1441,22 +1557,37 @@ def api_check_file_updates():
 
 @app.route("/api/resin_load", methods=["POST"])
 def api_resin_load():
-    """Load resin data"""
+    """Load resin data — fast path using metadata reader (skips date columns)"""
     try:
         data = request.json
         is_valid, error_msg = validate_json_input(data, ['sheet'])
         if not is_valid:
             return jsonify({"error": error_msg}), 400
         
-        df = clean_resin_df(data["sheet"])
+        meta = load_resin_meta(data["sheet"])
         
         return jsonify({
-            "locations": sorted(df["Location"].dropna().unique().tolist()),
-            "grades": sorted(df["Grade"].dropna().unique().tolist())
+            "locations": meta['locations'],
+            "grades": meta['grades']
         })
     except Exception as e:
         logger.error(f"Error in resin_load: {e}")
         return jsonify({"error": str(e)}), 500
+
+@app.route("/api/resin_preload", methods=["POST"])
+def api_resin_preload():
+    """Pre-warm the full sheet cache in the background.
+    Called by frontend fire-and-forget so resin_generate is instant."""
+    try:
+        data = request.json
+        sheet = data.get('sheet', '') if data else ''
+        if not sheet:
+            return jsonify({"ok": False}), 400
+        clean_resin_df(sheet)  # Populates _resin_sheet_cache
+        return jsonify({"ok": True})
+    except Exception as e:
+        logger.warning(f"Preload failed: {e}")
+        return jsonify({"ok": False}), 200
 
 @app.route("/api/resin_generate", methods=["POST"])
 def api_resin_generate():
@@ -1488,15 +1619,20 @@ def api_resin_generate():
                 except: 
                     continue
         
+        # Sort chronologically before trimming
+        iso_all, labels_all, values_all = sort_date_series(all_dates, all_values)
+        
         duration = d.get("duration", "12")
-        if duration != "all" and all_dates:
+        if duration != "all" and iso_all:
             months_to_keep = int(duration)
-            keep_count = min(months_to_keep, len(all_dates))
-            dates = all_dates[-keep_count:]
-            values = all_values[-keep_count:]
+            keep_count = min(months_to_keep, len(iso_all))
+            iso_dates = iso_all[-keep_count:]
+            labels = labels_all[-keep_count:]
+            values = values_all[-keep_count:]
         else:
-            dates = all_dates
-            values = all_values
+            iso_dates = iso_all
+            labels = labels_all
+            values = values_all
         
         if not values:
             return jsonify({"error": "No price data available"}), 404
@@ -1516,7 +1652,7 @@ def api_resin_generate():
         status = "BULLISH" if diff > 1.2 else "BEARISH" if diff < -1.2 else "STABLE"
         
         return jsonify({
-            "series": {"dates": dates, "values": values},
+            "series": {"dates": iso_dates, "labels": labels, "values": values},
             "insights": {
                 "curr": f"₹{curr:,.0f}", 
                 "last": f"₹{values[0]:,.0f}", 
@@ -1709,10 +1845,10 @@ def api_resin_grades():
         if "Price History" not in xl.sheet_names:
             if resin_type not in xl.sheet_names:
                 return jsonify({"error": f"Resin type {resin_type} not found"}), 404
-            df = clean_resin_df(resin_type)
+            meta = load_resin_meta(resin_type)
             return jsonify({
-                "grades": sorted(df["Grade"].dropna().unique().tolist()),
-                "locations": sorted(df["Location"].dropna().unique().tolist())
+                "grades": meta['grades'],
+                "locations": meta['locations']
             })
         
         df = xl.parse("Price History", header=0)
@@ -1779,6 +1915,14 @@ def api_resin_compare():
         if not all_price_cols:
             return jsonify({"error": "No price columns found"}), 500
 
+        # Sort price columns chronologically
+        col_date_pairs = []
+        for c in all_price_cols:
+            dt_obj = parse_date_col(c)
+            col_date_pairs.append((c, dt_obj if dt_obj else datetime.max))
+        col_date_pairs.sort(key=lambda x: x[1])
+        all_price_cols = [p[0] for p in col_date_pairs]
+
         comparison = []
 
         for loc in locations:
@@ -1803,16 +1947,24 @@ def api_resin_compare():
                 continue
 
             collected.reverse()
-            dates = [c[0] for c in collected]
+            dates = [str(c[0]) for c in collected]
             prices = [c[1] for c in collected]
 
-            curr = prices[-1]
-            avg_p = sum(prices) / len(prices)
-            min_p = min(prices)
-            max_p = max(prices)
+            # Sort and format dates
+            iso_dates, date_labels, sorted_prices = sort_date_series(dates, prices)
 
-            change = ((curr - prices[0]) / prices[0] * 100) if len(prices) > 1 else 0
+            curr = sorted_prices[-1]
+            avg_p = sum(sorted_prices) / len(sorted_prices)
+            min_p = min(sorted_prices)
+            max_p = max(sorted_prices)
+
+            change = ((curr - sorted_prices[0]) / sorted_prices[0] * 100) if len(sorted_prices) > 1 else 0
             trend = "Rising" if change > 2 else "Falling" if change < -2 else "Stable"
+
+            # Apply ts_limit if needed
+            final_iso = iso_dates[::max(1, len(iso_dates)//ts_limit)] if ts_limit and len(iso_dates) > ts_limit else iso_dates
+            final_labels = date_labels[::max(1, len(date_labels)//ts_limit)] if ts_limit and len(date_labels) > ts_limit else date_labels
+            final_prices = sorted_prices[::max(1, len(sorted_prices)//ts_limit)] if ts_limit and len(sorted_prices) > ts_limit else sorted_prices
 
             comparison.append({
                 "location": loc,
@@ -1822,13 +1974,10 @@ def api_resin_compare():
                 "max_price": f"₹{max_p:,.2f}",
                 "price_change": f"{change:+.2f}%",
                 "trend": trend,
-                "data_points": len(prices),
+                "data_points": len(sorted_prices),
                 "time_series": [
-                    {"date": d, "price": p}
-                    for d, p in zip(
-                        dates[::max(1, len(dates)//ts_limit)] if ts_limit and len(dates) > ts_limit else dates,
-                        prices[::max(1, len(prices)//ts_limit)] if ts_limit and len(prices) > ts_limit else prices
-                    )
+                    {"date": iso, "label": lbl, "price": p}
+                    for iso, lbl, p in zip(final_iso, final_labels, final_prices)
                 ],
                 "current_price_raw": curr
             })
@@ -2556,6 +2705,8 @@ def api_calc_carton_advanced():
 
             # Margin
             'margin': round(margin, 2),
+            'margin_pct_input': margin_pct,
+            'margin_calc_type': '% of Conversion Cost',
 
             # Distribution
             'packing_cost': round(packing_per_1000, 2),
@@ -3323,6 +3474,8 @@ def api_calc_ebm():
             'mat_pct': round(mat_pct, 1),
             'conv_pct': round(conv_pct, 1),
             'margin_pct_total': round(margin_pct_total, 1),
+            'margin_pct_input': margin_pct,
+            'margin_calc_type': margin_calc,
             'pkg_pct': round(pkg_pct, 1),
             'freight_pct': round(freight_pct, 1),
             
@@ -5374,6 +5527,12 @@ async function loadResSub() {
     const sheet = document.getElementById('resSheet').value;
     if (!sheet) return;
     
+    // Fire-and-forget: pre-warm full sheet cache so Generate is instant
+    fetch("/api/resin_preload", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({sheet})
+    }).catch(() => {});
+    
     try {
         const r = await fetch("/api/resin_load", {
             method:"POST", 
@@ -5455,10 +5614,12 @@ async function genRes() {
             type: 'scatter',
             mode: 'lines+markers',
             marker: {color: '#E8601C', size: 8},
-            line: {color: '#E8601C', width: 3}
+            line: {color: '#E8601C', width: 3},
+            text: d.series.labels || d.series.dates,
+            hovertemplate: '%{text}<br>₹%{y:,.0f}<extra></extra>'
         }], {
             title: {text: 'Price Trend', font: {color: 'white', size: 18, family: 'Outfit'}},
-            xaxis: {title: 'Date', color: 'white', gridcolor: 'rgba(255,255,255,0.1)'},
+            xaxis: {title: 'Date', color: 'white', gridcolor: 'rgba(255,255,255,0.1)', type: 'date', tickformat: '%b %Y'},
             yaxis: {title: 'Price (₹)', color: 'white', gridcolor: 'rgba(255,255,255,0.1)'},
             plot_bgcolor: 'rgba(0,0,0,0)',
             paper_bgcolor: 'rgba(0,0,0,0)',
@@ -5478,6 +5639,12 @@ async function genRes() {
 async function loadGradesCompare() {
     const rt = document.getElementById('cmp_rt').value;
     if (!rt) return;
+    
+    // Fire-and-forget: pre-warm full sheet cache so Compare is instant
+    fetch("/api/resin_preload", {
+        method:"POST", headers:{"Content-Type":"application/json"},
+        body:JSON.stringify({sheet: rt})
+    }).catch(() => {});
     
     try {
         const r = await fetch("/api/resin_grades", {
@@ -7197,7 +7364,14 @@ function updateWhatIf() {
         const newLabour = (dlCost + ilCost) * (1 + labourChg) * volFactor;
         const otherConv = base.conversion_cost - elecCost - dlCost - ilCost;
         newConv = newElec + newLabour + otherConv * volFactor;
-        newMargin = base.margin * (1 + marginChg);
+        // Margin = margin_pct * conversion_cost (dynamic), then apply margin slider
+        const mPctInput = base.margin_pct_input || (base.conversion_cost > 0 ? (base.margin / base.conversion_cost) : 0.20);
+        const mCalcType = base.margin_calc_type || '% of Conversion Cost';
+        if (mCalcType === '% of Conversion Cost') {
+            newMargin = newConv * mPctInput * (1 + marginChg);
+        } else {
+            newMargin = (newMaterial + newConv) * mPctInput * (1 + marginChg);
+        }
         newPacking = base.packing_cost;
         newFreight = base.freight_cost;
         newTotal = newMaterial + newConv + newMargin + newPacking + newFreight;
