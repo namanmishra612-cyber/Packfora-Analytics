@@ -106,6 +106,32 @@ COUNTRY_LOCATION_MAP = {
     ],
 }
 
+# Country → currency mapping for TCO/ROI display
+COUNTRY_CURRENCY_MAP = {
+    'India': {'symbol': '₹', 'code': 'INR'},
+    'China': {'symbol': '¥', 'code': 'CNY'},
+    'Indonesia': {'symbol': 'Rp', 'code': 'IDR'},
+    'Brazil': {'symbol': 'R$', 'code': 'BRL'},
+    'United States': {'symbol': '$', 'code': 'USD'},
+    'United Kingdom': {'symbol': '£', 'code': 'GBP'},
+    'Germany': {'symbol': '€', 'code': 'EUR'},
+    'France': {'symbol': '€', 'code': 'EUR'},
+    'Spain': {'symbol': '€', 'code': 'EUR'},
+    'Turkey': {'symbol': '₺', 'code': 'TRY'},
+    'Vietnam': {'symbol': '₫', 'code': 'VND'},
+    'Mexico': {'symbol': 'MX$', 'code': 'MXN'},
+    'Pakistan': {'symbol': 'Rs', 'code': 'PKR'},
+    'Philippines': {'symbol': '₱', 'code': 'PHP'},
+    'South Africa': {'symbol': 'R', 'code': 'ZAR'},
+    'Poland': {'symbol': 'zł', 'code': 'PLN'},
+    'Thailand': {'symbol': '฿', 'code': 'THB'},
+    'Bangladesh': {'symbol': '৳', 'code': 'BDT'},
+    'Sri Lanka': {'symbol': 'Rs', 'code': 'LKR'},
+    'Argentina': {'symbol': 'AR$', 'code': 'ARS'},
+    'Canada': {'symbol': 'C$', 'code': 'CAD'},
+    'Costa Rica': {'symbol': '₡', 'code': 'CRC'},
+}
+
 def detect_resin_type(text):
     """Detect resin type from text using regex patterns.
     Returns (resin_type, confidence) tuple."""
@@ -450,35 +476,35 @@ def analyze_machines_ai(machines):
     """AI-powered machine recommendation"""
     if not machines or len(machines) == 0:
         return None
-    
+
     valid_machines = [m for m in machines if m['cost_raw'] > 0 and m['power_raw'] > 0]
-    
+
     if not valid_machines:
         return None
-    
+
     costs = [m['cost_raw'] for m in valid_machines]
     powers = [m['power_raw'] for m in valid_machines]
-    
+
     min_cost, max_cost = min(costs), max(costs)
     min_power, max_power = min(powers), max(powers)
-    
+
     for machine in valid_machines:
         cost_score = ((machine['cost_raw'] - min_cost) / (max_cost - min_cost) * 100) if max_cost > min_cost else 0
         power_score = ((machine['power_raw'] - min_power) / (max_power - min_power) * 100) if max_power > min_power else 0
         machine['ai_score'] = (cost_score * 0.5) + (power_score * 0.5)
-    
+
     valid_machines.sort(key=lambda x: x['ai_score'])
     best = valid_machines[0]
-    
+
     reasons = []
     if best['cost_raw'] == min(costs):
         reasons.append("lowest cost")
     if best['power_raw'] == min(powers):
         reasons.append("most energy efficient")
-    
+
     if not reasons:
         reasons.append("best balance of cost and energy efficiency")
-    
+
     return {
         "make": best['make'],
         "model": best['model'],
@@ -488,6 +514,56 @@ def analyze_machines_ai(machines):
         "reason": " and ".join(reasons),
         "total_analyzed": len(valid_machines)
     }
+
+
+def get_country_geo_data(country):
+    """Extract electricity rate, labour monthly, euro exchange rate from variables-geo.xlsx.
+    Returns dict with keys: electricity_rate, labour_monthly, euro_rate, currency_symbol, currency_code."""
+    result = {
+        'electricity_rate': 0, 'labour_monthly': 0, 'euro_rate': 1,
+        'currency_symbol': '€', 'currency_code': 'EUR'
+    }
+    if not country:
+        return result
+
+    # Currency lookup
+    cur = COUNTRY_CURRENCY_MAP.get(country, {'symbol': '€', 'code': 'EUR'})
+    result['currency_symbol'] = cur['symbol']
+    result['currency_code'] = cur['code']
+
+    try:
+        df = load_excel_cached('cost', sheet_name="Data", header=9)
+        df.columns = [str(c).strip() for c in df.columns]
+        row = df[df.iloc[:, 0] == country]
+        if row.empty:
+            return result
+        row = row.iloc[0]
+
+        for col in df.columns:
+            cl = col.lower()
+            if 'electricity' in cl:
+                v = row[col]
+                if not pd.isna(v):
+                    try: result['electricity_rate'] = float(v)
+                    except: pass
+            elif any(k in cl for k in ['labour', 'operator']) and 'engineer' not in cl and 'manager' not in cl:
+                v = row[col]
+                if not pd.isna(v):
+                    try: result['labour_monthly'] = float(v)
+                    except: pass
+            elif 'euro' in cl:
+                # Match any "Euro Rate" / "Euro Exchange Rate" column
+                v = row[col]
+                if not pd.isna(v):
+                    try:
+                        rate = float(v)
+                        if rate > 0:
+                            result['euro_rate'] = rate
+                    except: pass
+    except Exception as ex:
+        logger.warning(f"Geo data lookup failed for {country}: {ex}")
+
+    return result
 
 # ================= ADMIN ROUTES =================
 
@@ -1536,9 +1612,16 @@ def api_dashboard_stats():
         df_costs = load_excel_cached('cost', sheet_name="Data", header=9)
         total_countries = len(df_costs)
         
+        # Marketing-friendly display: 100+ / 200+ for counts >= 100, exact otherwise
+        if total_machines >= 100:
+            machines_display = f"{(total_machines // 100) * 100}+"
+        else:
+            machines_display = str(total_machines)
+
         return jsonify({
             "resin_types": total_resin_types,
             "machines": total_machines,
+            "machines_display": machines_display,
             "countries": total_countries,
             "last_updated": datetime.now().strftime("%B %d, %Y at %I:%M %p")
         })
@@ -1698,6 +1781,18 @@ def api_mach_res():
             power = r.get("Power Consumption")
             sqm = r.get("Machine Footprint SQM")
             
+            # Extract speed/output if column exists
+            speed = 0
+            for col in df.columns:
+                if 'speed' in str(col).lower() or 'output' in str(col).lower():
+                    val = r.get(col)
+                    if not pd.isna(val):
+                        try:
+                            speed = float(val)
+                        except:
+                            speed = 0
+                    break
+            
             res.append({
                 "make": str(r.get("Make", "")), 
                 "model": str(r.get("Model", "")), 
@@ -1706,7 +1801,9 @@ def api_mach_res():
                 "power": format_num("power", power), 
                 "power_raw": float(power) if not pd.isna(power) else 0,
                 "sqm": format_num("sqm", sqm),
-                "sqm_raw": float(sqm) if not pd.isna(sqm) else 0
+                "sqm_raw": float(sqm) if not pd.isna(sqm) else 0,
+                "speed": format_num("speed", speed),
+                "speed_raw": float(speed) if speed else 0
             })
         
         recommendation = analyze_machines_ai(res)
@@ -1743,6 +1840,192 @@ def api_export_machines():
     except Exception as e:
         logger.error(f"Error in export_machines: {e}")
         return jsonify({"error": str(e)}), 500
+
+# ================= ADVANCED ANALYTICS APIs =================
+
+@app.route("/api/tco_simulate", methods=["POST"])
+def api_tco_simulate():
+    """TCO Simulator — 5yr/10yr Total Cost of Ownership with local currency conversion"""
+    try:
+        d = request.json or {}
+        machine_cost_eur = float(d.get('machine_cost', 0))  # Always in EUR from machine DB
+        power_kw     = float(d.get('power_kw', 0))
+        uptime_pct   = float(d.get('uptime_pct', 75)) / 100
+        maint_pct    = float(d.get('maintenance_pct', 5)) / 100
+        depr_pct     = float(d.get('depreciation_pct', 10)) / 100
+        country      = d.get('country', '')
+        annual_pcs   = float(d.get('annual_production', 1000000))
+        hours_per_yr = 8760  # 365 * 24
+
+        # Pull geo data: electricity, labour (already local), euro exchange rate
+        geo = get_country_geo_data(country)
+        electricity_rate = float(d.get('electricity_rate', 0)) or geo['electricity_rate']
+        labour_monthly   = float(d.get('labour_monthly', 0)) or geo['labour_monthly']
+        euro_rate         = geo['euro_rate']
+        currency_symbol   = geo['currency_symbol']
+        currency_code     = geo['currency_code']
+
+        # Convert machine cost EUR → local currency
+        machine_cost_local = machine_cost_eur * euro_rate
+        capex = machine_cost_local
+
+        # Annual OPEX components (all in local currency)
+        running_hours   = hours_per_yr * uptime_pct
+        energy_annual   = power_kw * running_hours * electricity_rate
+        labour_annual   = labour_monthly * 12 * 3  # 3 operators (3 shifts)
+        maint_annual    = machine_cost_local * maint_pct
+        depr_annual     = machine_cost_local * depr_pct
+
+        opex_annual = energy_annual + labour_annual + maint_annual + depr_annual
+
+        years = {}
+        for yr in [5, 10]:
+            total = capex + (opex_annual * yr)
+            per_year = total / yr
+            per_1000 = (per_year / annual_pcs * 1000) if annual_pcs > 0 else 0
+            years[str(yr)] = {
+                'capex': round(capex, 2),
+                'opex_total': round(opex_annual * yr, 2),
+                'total': round(total, 2),
+                'per_year': round(per_year, 2),
+                'per_1000_pcs': round(per_1000, 2),
+            }
+
+        breakdown = {
+            'energy_annual': round(energy_annual, 2),
+            'labour_annual': round(labour_annual, 2),
+            'maintenance_annual': round(maint_annual, 2),
+            'depreciation_annual': round(depr_annual, 2),
+            'opex_annual': round(opex_annual, 2),
+            'electricity_rate': round(electricity_rate, 4),
+            'labour_monthly': round(labour_monthly, 2),
+            'euro_rate': round(euro_rate, 4),
+            'machine_cost_eur': round(machine_cost_eur, 2),
+            'machine_cost_local': round(machine_cost_local, 2),
+        }
+
+        return jsonify({
+            'years': years,
+            'breakdown': breakdown,
+            'currency_symbol': currency_symbol,
+            'currency_code': currency_code,
+            'euro_rate': round(euro_rate, 4),
+        })
+    except Exception as e:
+        logger.error(f"TCO simulate error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/machine_compare", methods=["POST"])
+def api_machine_compare():
+    """Side-by-side comparison of 2-4 machines"""
+    try:
+        d = request.json or {}
+        machines = d.get('machines', [])
+        if len(machines) < 2 or len(machines) > 4:
+            return jsonify({"error": "Select 2–4 machines to compare"}), 400
+
+        # Compute a simple efficiency score for each
+        costs  = [m.get('cost_raw', 0) for m in machines]
+        powers = [m.get('power_raw', 0) for m in machines]
+        min_c  = min(costs) if costs else 1
+        max_c  = max(costs) if costs else 1
+        min_p  = min(powers) if powers else 1
+        max_p  = max(powers) if powers else 1
+
+        for m in machines:
+            # Normalised 0-100 (lower=better)
+            c_s = ((m.get('cost_raw', 0) - min_c) / (max_c - min_c) * 100) if max_c > min_c else 50
+            p_s = ((m.get('power_raw', 0) - min_p) / (max_p - min_p) * 100) if max_p > min_p else 50
+            m['efficiency_score'] = round(100 - (c_s * 0.5 + p_s * 0.5), 1)
+
+        return jsonify({"machines": machines})
+    except Exception as e:
+        logger.error(f"Machine compare error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/roi_calculate", methods=["POST"])
+def api_roi_calculate():
+    """ROI / Payback Calculator with breakeven chart data — local currency"""
+    try:
+        d = request.json or {}
+        machine_cost_eur = float(d.get('machine_cost', 0))  # Always EUR
+        hourly_revenue   = float(d.get('hourly_revenue', 0))  # Local currency
+        power_kw         = float(d.get('power_kw', 0))
+        electricity_rate = float(d.get('electricity_rate', 0))  # Local
+        labour_monthly   = float(d.get('labour_monthly', 0))   # Local
+        uptime_pct       = float(d.get('uptime_pct', 75)) / 100
+        maint_pct        = float(d.get('maintenance_pct', 5)) / 100
+        euro_rate         = float(d.get('euro_rate', 1))
+        country          = d.get('country', '')
+
+        # If country provided but no euro_rate given, look it up
+        if country and euro_rate <= 1:
+            geo = get_country_geo_data(country)
+            euro_rate = geo['euro_rate']
+            currency_symbol = geo['currency_symbol']
+            currency_code = geo['currency_code']
+        else:
+            cur = COUNTRY_CURRENCY_MAP.get(country, {'symbol': '€', 'code': 'EUR'})
+            currency_symbol = cur['symbol']
+            currency_code = cur['code']
+
+        # Convert machine cost EUR → local
+        machine_cost_local = machine_cost_eur * euro_rate
+
+        hours_per_month = 730 * uptime_pct  # ~365*24/12 * uptime
+        monthly_revenue = hourly_revenue * hours_per_month
+
+        energy_monthly  = power_kw * hours_per_month * electricity_rate
+        maint_monthly   = machine_cost_local * maint_pct / 12
+        monthly_cost    = energy_monthly + labour_monthly + maint_monthly
+        monthly_profit  = monthly_revenue - monthly_cost
+
+        payback_months = round(machine_cost_local / monthly_profit, 1) if monthly_profit > 0 else -1
+
+        # Build breakeven chart series (month, cumulative_profit)
+        chart_months = min(max(int(payback_months * 1.5), 12), 120) if payback_months > 0 else 60
+        chart = []
+        for m in range(chart_months + 1):
+            cumulative = (monthly_profit * m) - machine_cost_local
+            chart.append({'month': m, 'cumulative': round(cumulative, 2)})
+
+        annual_profit = monthly_profit * 12
+        roi_pct = round((annual_profit / machine_cost_local) * 100, 1) if machine_cost_local > 0 else 0
+
+        return jsonify({
+            'payback_months': payback_months,
+            'monthly_revenue': round(monthly_revenue, 2),
+            'monthly_cost': round(monthly_cost, 2),
+            'monthly_profit': round(monthly_profit, 2),
+            'annual_roi_pct': roi_pct,
+            'chart': chart,
+            'machine_cost_local': round(machine_cost_local, 2),
+            'currency_symbol': currency_symbol,
+            'currency_code': currency_code,
+            'euro_rate': round(euro_rate, 4),
+        })
+    except Exception as e:
+        logger.error(f"ROI calculate error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/geo_currency_data", methods=["POST"])
+def api_geo_currency_data():
+    """Return exchange rate, electricity, labour, currency info for a country.
+    Used by TCO/ROI frontend when user changes country dropdown."""
+    try:
+        d = request.json or {}
+        country = d.get('country', '')
+        if not country:
+            return jsonify({"error": "Country required"}), 400
+        geo = get_country_geo_data(country)
+        return jsonify(geo)
+    except Exception as e:
+        logger.error(f"geo_currency_data error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 
 @app.route("/api/cost_res", methods=["POST"])
 def api_cost_res():
@@ -4829,10 +5112,13 @@ BASE_HTML = """
         .navbar { 
             background: rgba(0,0,0,0.3); 
             backdrop-filter: blur(10px); 
-            padding: 20px 40px; 
+            padding: 0 40px; 
             display: flex; 
             align-items: center; 
-            border-bottom: 1px solid rgba(255,255,255,0.1); 
+            border-bottom: 1px solid rgba(255,255,255,0.1);
+            height: 64px;
+            position: relative;
+            z-index: 100;
         }
         .navbar-logo {
             margin-right: 40px;
@@ -4846,23 +5132,99 @@ BASE_HTML = """
         .nav-links { 
             margin-left: auto; 
             display: flex; 
-            gap: 20px; 
+            gap: 4px;
+            align-items: center;
+            height: 100%;
         }
-        .nav-links a { 
+        .nav-links > a, .nav-group > .nav-group-toggle { 
             color: white; 
             text-decoration: none; 
             font-weight: 600; 
-            padding: 12px 18px; 
+            padding: 10px 16px; 
             border-radius: 10px; 
-            font-size: 0.8rem; 
+            font-size: 0.78rem; 
             text-transform: uppercase; 
-            transition: all 0.3s; 
+            transition: all 0.3s;
+            cursor: pointer;
+            border: none;
+            background: transparent;
+            font-family: 'Outfit', sans-serif;
+            display: flex;
+            align-items: center;
+            gap: 5px;
+            white-space: nowrap;
         }
-        .nav-links a:hover { background: rgba(255,255,255,0.1); }
-        .nav-links a.active { background: var(--orange); }
+        .nav-links > a:hover, .nav-group:hover > .nav-group-toggle { background: rgba(255,255,255,0.1); }
+        .nav-links > a.active, .nav-group-toggle.active { background: var(--orange); }
+        .nav-group { position: relative; height: 100%; display: flex; align-items: center; }
+        .nav-group-toggle svg { width: 12px; height: 12px; transition: transform 0.2s; }
+        .nav-group:hover .nav-group-toggle svg { transform: rotate(180deg); }
+        .nav-dropdown {
+            display: none;
+            position: absolute;
+            top: 100%;
+            left: 0;
+            background: rgba(15, 23, 42, 0.96);
+            backdrop-filter: blur(20px);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 12px;
+            min-width: 220px;
+            padding: 8px;
+            box-shadow: 0 12px 36px rgba(0,0,0,0.4);
+            z-index: 200;
+        }
+        .nav-group:hover .nav-dropdown { display: block; }
+        .nav-dropdown a {
+            display: block;
+            color: rgba(255,255,255,0.85);
+            text-decoration: none;
+            padding: 10px 14px;
+            font-size: 0.82rem;
+            font-weight: 600;
+            border-radius: 8px;
+            transition: all 0.2s;
+        }
+        .nav-dropdown a:hover { background: rgba(232, 96, 28, 0.2); color: white; }
+        .nav-dropdown a.active { background: var(--orange); color: white; }
         .nav-links .admin-link {
             background: rgba(232, 96, 28, 0.2);
             border: 1px solid var(--orange);
+        }
+        /* Hamburger */
+        .hamburger { display: none; background: none; border: none; cursor: pointer; padding: 8px; }
+        .hamburger span { display: block; width: 24px; height: 2px; background: white; margin: 5px 0; border-radius: 2px; transition: all 0.3s; }
+        .hamburger.open span:nth-child(1) { transform: rotate(45deg) translate(5px, 5px); }
+        .hamburger.open span:nth-child(2) { opacity: 0; }
+        .hamburger.open span:nth-child(3) { transform: rotate(-45deg) translate(5px, -5px); }
+        @media (max-width: 900px) {
+            .hamburger { display: block; margin-left: auto; }
+            .nav-links {
+                display: none;
+                position: absolute;
+                top: 64px;
+                left: 0; right: 0;
+                background: rgba(15, 23, 42, 0.97);
+                backdrop-filter: blur(20px);
+                flex-direction: column;
+                padding: 16px;
+                gap: 4px;
+                border-bottom: 1px solid rgba(255,255,255,0.1);
+                height: auto;
+            }
+            .nav-links.mobile-open { display: flex; }
+            .nav-group { height: auto; flex-direction: column; width: 100%; }
+            .nav-group-toggle { width: 100%; justify-content: space-between; }
+            .nav-dropdown {
+                display: none;
+                position: static;
+                background: rgba(255,255,255,0.05);
+                box-shadow: none;
+                border: none;
+                min-width: 100%;
+                padding: 4px 12px;
+                border-radius: 8px;
+            }
+            .nav-group.mobile-expanded .nav-dropdown { display: block; }
         }
         .container { max-width: 1400px; margin: 40px auto; padding: 0 20px; }
         .card { 
@@ -5100,8 +5462,7 @@ BASE_HTML = """
         }
         @media (max-width: 768px) {
             .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; }
-            .navbar { padding: 15px 20px; }
-            .nav-links { flex-direction: column; gap: 10px; }
+            .navbar { padding: 0 15px; }
             .spec-grid { grid-template-columns: 1fr; }
         }
     </style>
@@ -5113,12 +5474,29 @@ BASE_HTML = """
     </div>
     <nav class="navbar">
         <div class="navbar-logo"><img src="/static/logo.png" alt="Packfora Logo"></div>
-        <div class="nav-links">
+        <button class="hamburger" id="hamburgerBtn" onclick="toggleMobileNav()">
+            <span></span><span></span><span></span>
+        </button>
+        <div class="nav-links" id="mainNav">
             <a href="/" class="{{ 'active' if active == 'Dashboard' else '' }}">Dashboard</a>
-            <a href="/resin" class="{{ 'active' if active == 'Resin' else '' }}">Resin Tracker</a>
-            <a href="/machines" class="{{ 'active' if active == 'Machines' else '' }}">Machine Database</a>
-            <a href="/costs" class="{{ 'active' if active == 'Costs' else '' }}">Global Variable Cost Database</a>
-            <a href="/calculator" class="{{ 'active' if active == 'Calculator' else '' }}">Cost Calculator</a>
+            <div class="nav-group" onclick="toggleMobileDropdown(event, this)">
+                <button class="nav-group-toggle {{ 'active' if active == 'Resin' else '' }}">
+                    Analytics <svg viewBox="0 0 12 12" fill="none"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                </button>
+                <div class="nav-dropdown">
+                    <a href="/resin" class="{{ 'active' if active == 'Resin' else '' }}">Resin Tracker</a>
+                </div>
+            </div>
+            <div class="nav-group" onclick="toggleMobileDropdown(event, this)">
+                <button class="nav-group-toggle {{ 'active' if active in ['Machines','Costs'] else '' }}">
+                    Database <svg viewBox="0 0 12 12" fill="none"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                </button>
+                <div class="nav-dropdown">
+                    <a href="/machines" class="{{ 'active' if active == 'Machines' else '' }}">Machine Database</a>
+                    <a href="/costs" class="{{ 'active' if active == 'Costs' else '' }}">Global Variable Costs</a>
+                </div>
+            </div>
+            <a href="/calculator" class="{{ 'active' if active == 'Calculator' else '' }}">Calculator</a>
             <a href="/admin/login" class="admin-link">Admin</a>
         </div>
     </nav>
@@ -5215,6 +5593,19 @@ BASE_HTML = """
             el.innerHTML = `<div class="error-card"><h3>Error</h3><p>${message}</p></div>`;
         }
     }
+
+    function toggleMobileNav() {
+        const nav = document.getElementById('mainNav');
+        const btn = document.getElementById('hamburgerBtn');
+        nav.classList.toggle('mobile-open');
+        btn.classList.toggle('open');
+    }
+    function toggleMobileDropdown(e, group) {
+        if (window.innerWidth > 900) return;
+        if (e.target.closest('.nav-dropdown')) return;
+        e.stopPropagation();
+        group.classList.toggle('mobile-expanded');
+    }
     </script>
 </body>
 </html>
@@ -5288,7 +5679,7 @@ async function loadDashboardData() {
         const stats = await statsRes.json();
         
         document.getElementById('stat-resin').textContent = stats.resin_types;
-        document.getElementById('stat-machines').textContent = stats.machines;
+        document.getElementById('stat-machines').textContent = stats.machines_display;
         document.getElementById('stat-countries').textContent = stats.countries;
         document.getElementById('last-updated').textContent = 'Last updated: ' + stats.last_updated;
         
@@ -5858,8 +6249,156 @@ MACH_HTML = """
 </div>
 <div id="ai_recommendation"></div>
 <div id="m_res"></div>
+
+<!-- ========== COMPARE PANEL ========== -->
+<div id="comparePanel" style="display:none;">
+<div class="card" style="margin-top:18px; border:2px solid var(--orange);">
+    <h3 style="color:var(--orange);margin-bottom:12px;">Side-by-Side Comparison</h3>
+    <div id="compareBody"></div>
+</div>
+</div>
+
+<!-- ========== TCO SIMULATOR ========== -->
+<div class="card" style="margin-top:24px;">
+    <h3 style="margin-bottom:14px;">TCO Simulator (5yr / 10yr)</h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+        <div>
+            <label class="lbl-sm">Machine Cost (€)</label>
+            <input id="tco_cost" type="number" placeholder="e.g. 350000" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm">Power (kW)</label>
+            <input id="tco_power" type="number" placeholder="e.g. 65" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm">Country (for costs)</label>
+            <select id="tco_country" onchange="onTCOCountryChange()">
+                <option value="">Select…</option>
+            </select>
+            <div id="tco_fx_hint" style="font-size:.65rem;color:rgba(255,255,255,0.45);margin-top:3px;"></div>
+        </div>
+        <div>
+            <label class="lbl-sm">Uptime %</label>
+            <input id="tco_uptime" type="number" value="75" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm">Maintenance %/yr</label>
+            <input id="tco_maint" type="number" value="5" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm">Depreciation %/yr</label>
+            <input id="tco_depr" type="number" value="10" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm">Annual Production (pcs)</label>
+            <input id="tco_pcs" type="number" value="1000000" class="theme-input">
+        </div>
+    </div>
+    <button class="btn-analyze" style="margin-top:14px;" onclick="runTCO()">Calculate TCO</button>
+    <div id="tco_result"></div>
+</div>
+
+<!-- ========== ROI / PAYBACK CALCULATOR ========== -->
+<div class="card" style="margin-top:24px;">
+    <h3 style="margin-bottom:14px;"><span id="roi_title">ROI / Payback Calculator</span></h3>
+    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+        <div>
+            <label class="lbl-sm">Machine Cost (€)</label>
+            <input id="roi_cost" type="number" placeholder="350000" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm">Power (kW)</label>
+            <input id="roi_power" type="number" placeholder="65" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm" id="roi_rev_lbl">Expected Hourly Revenue (€)</label>
+            <input id="roi_revenue" type="number" placeholder="e.g. 150" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm" id="roi_elec_lbl">Electricity Rate (€/kWh)</label>
+            <input id="roi_elec" type="number" step="0.01" placeholder="0.10" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm" id="roi_labour_lbl">Labour Monthly (€)</label>
+            <input id="roi_labour" type="number" placeholder="2500" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm">Uptime % / Maintenance %</label>
+            <div style="display:flex;gap:6px;">
+                <input id="roi_uptime" type="number" value="75" class="theme-input" style="width:50%;">
+                <input id="roi_maint" type="number" value="5" class="theme-input" style="width:50%;">
+            </div>
+        </div>
+    </div>
+    <input type="hidden" id="roi_euro_rate" value="1">
+    <input type="hidden" id="roi_country" value="">
+    <button class="btn-analyze" style="margin-top:14px;" onclick="runROI()">Calculate ROI</button>
+    <div id="roi_result"></div>
+</div>
+
+<style>
+.lbl-sm{display:block;font-size:.7rem;font-weight:800;opacity:.85;margin-bottom:4px;color:rgba(255,255,255,0.9);}
+.theme-input{width:100%;padding:12px 14px;border-radius:12px;border:1px solid rgba(255,255,255,0.4);background:rgba(255,255,255,0.15);backdrop-filter:blur(6px);color:white;font-family:'Outfit',sans-serif;font-size:.95rem;transition:border-color .2s;}
+.theme-input:focus{outline:none;border-color:var(--orange);background:rgba(255,255,255,0.22);}
+.theme-input::placeholder{color:rgba(255,255,255,0.45);}
+.cmp-tbl{width:100%;border-collapse:collapse;font-size:.85rem;color:white;}
+.cmp-tbl th,.cmp-tbl td{padding:10px 12px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.12);}
+.cmp-tbl th{background:rgba(255,255,255,0.08);font-weight:800;font-size:.72rem;text-transform:uppercase;color:rgba(255,255,255,0.65);}
+.cmp-tbl td.best{color:var(--orange);font-weight:800;text-shadow:0 0 8px rgba(232,96,28,0.3);}
+.tco-box{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px;}
+.tco-card{background:rgba(255,255,255,0.1);backdrop-filter:blur(12px);border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,0.18);}
+.tco-card h4{margin:0 0 10px;color:var(--orange);font-size:.9rem;text-transform:uppercase;letter-spacing:.5px;}
+.tco-row{display:flex;justify-content:space-between;padding:5px 0;font-size:.82rem;color:rgba(255,255,255,0.85);}
+.tco-row.total{border-top:2px solid var(--orange);margin-top:6px;padding-top:8px;font-weight:800;color:white;}
+.roi-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0;}
+.roi-stat{text-align:center;padding:18px 14px;background:rgba(255,255,255,0.1);backdrop-filter:blur(12px);border-radius:14px;border:1px solid rgba(255,255,255,0.18);}
+.roi-stat .val{font-size:1.5rem;font-weight:800;color:var(--orange);}
+.roi-stat .lbl{font-size:.7rem;color:rgba(255,255,255,0.6);margin-top:4px;text-transform:uppercase;letter-spacing:.5px;}
+.roi-chart-wrap{position:relative;height:240px;margin-top:14px;background:rgba(0,0,0,0.2);backdrop-filter:blur(12px);border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,0.12);}
+.mach-cb{width:18px;height:18px;cursor:pointer;accent-color:var(--orange);}
+@media(max-width:768px){.tco-box,.roi-summary{grid-template-columns:1fr 1fr;}}
+@media(max-width:480px){.roi-summary{grid-template-columns:1fr;}}
+</style>
+
 <script>
 let currentResults = [];
+let selectedForCompare = [];
+let currentGeo = {currency_symbol:'€', currency_code:'EUR', euro_rate:1, electricity_rate:0, labour_monthly:0};
+
+// Called when TCO country dropdown changes
+async function onTCOCountryChange() {
+    const country = document.getElementById('tco_country').value;
+    if (!country) {
+        currentGeo = {currency_symbol:'€', currency_code:'EUR', euro_rate:1, electricity_rate:0, labour_monthly:0};
+        updateCurrencyLabels();
+        return;
+    }
+    try {
+        const r = await fetch('/api/geo_currency_data', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({country})});
+        const d = await r.json();
+        if (!d.error) {
+            currentGeo = d;
+            // Show FX hint
+            const hint = document.getElementById('tco_fx_hint');
+            if (hint) hint.textContent = '1 € = ' + d.euro_rate + ' ' + d.currency_code;
+            // Auto-fill ROI fields from geo data
+            if (d.electricity_rate > 0) document.getElementById('roi_elec').value = d.electricity_rate;
+            if (d.labour_monthly > 0) document.getElementById('roi_labour').value = Math.round(d.labour_monthly);
+            document.getElementById('roi_euro_rate').value = d.euro_rate;
+            document.getElementById('roi_country').value = country;
+            updateCurrencyLabels();
+        }
+    } catch(e) { console.warn('Geo data fetch failed', e); }
+}
+
+function updateCurrencyLabels() {
+    const sym = currentGeo.currency_symbol || '€';
+    const code = currentGeo.currency_code || 'EUR';
+    const el = (id, txt) => { const e = document.getElementById(id); if(e) e.textContent = txt; };
+    el('roi_rev_lbl', 'Expected Hourly Revenue (' + sym + ')');
+    el('roi_elec_lbl', 'Electricity Rate (' + sym + '/kWh)');
+    el('roi_labour_lbl', 'Labour Monthly (' + sym + ')');
+}
 
 async function loadProcs(cat) {
     if (!cat) return;
@@ -5918,28 +6457,42 @@ async function loadMachs() {
         
         const d = await r.json();
         currentResults = d.results;
-        
-        // Display all machines
+        selectedForCompare = [];
+        document.getElementById('comparePanel').style.display = 'none';
+
         let h = '<div class="card">';
-        h += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px;">';
-        h += `<h3>Found ${d.results.length} Machines</h3>`;
+        h += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:10px;">';
+        h += '<h3>Found ' + d.results.length + ' Machines</h3>';
+        h += '<div style="display:flex;gap:8px;">';
+        h += '<button class="btn-secondary" id="compareBtn" onclick="compareSelected()" disabled>Compare Selected (0)</button>';
         h += '<button class="btn-secondary" onclick="exportMachines()">Export to Excel</button>';
-        h += '</div>';
-        h += '<div class="spec-grid" style="border-bottom: 2px solid var(--orange); font-weight: 800; padding-bottom: 15px; margin-bottom: 10px;"><div>Machine Model</div><div>Price (€)</div><div>Power (kWh)</div><div>Footprint (SQM)</div></div>';
-        
-        d.results.forEach(m => {
-            // FIX: Smart Name Display
-            // If model starts with make (e.g. "Jomar 65" starts with "Jomar"), don't repeat Make
+        h += '</div></div>';
+
+        h += '<div class="spec-grid" style="grid-template-columns:40px 2fr 1fr 1fr 1fr 1fr;border-bottom:2px solid var(--orange);font-weight:800;padding-bottom:15px;margin-bottom:10px;">';
+        h += '<div></div><div>Machine Model</div><div>Price (€)</div><div>Power (kWh)</div><div>Footprint</div><div>Speed</div></div>';
+
+        d.results.forEach((m, idx) => {
             let displayName = m.model;
             if (m.make && !m.model.toLowerCase().trim().startsWith(m.make.toLowerCase().trim())) {
-                displayName = `${m.make} ${m.model}`;
+                displayName = m.make + ' ' + m.model;
             }
-
-            h += `<div class="spec-grid"><div><strong>${displayName}</strong></div><div>${m.cost}</div><div>${m.power}</div><div>${m.sqm}</div></div>`;
+            h += '<div class="spec-grid" style="grid-template-columns:40px 2fr 1fr 1fr 1fr 1fr;cursor:pointer;" onclick="toggleMachCompare(' + idx + ',event)">';
+            h += '<div><input type="checkbox" class="mach-cb" id="cb_' + idx + '" data-idx="' + idx + '" onclick="toggleMachCompare(' + idx + ',event)"></div>';
+            h += '<div><strong>' + displayName + '</strong></div><div>' + m.cost + '</div><div>' + m.power + '</div><div>' + m.sqm + '</div><div>' + (m.speed || '—') + '</div></div>';
         });
-        
+
         h += '</div>';
         document.getElementById('m_res').innerHTML = h;
+
+        // Show AI recommendation
+        if (d.recommendation) {
+            const rec = d.recommendation;
+            let dispName = rec.model;
+            if (rec.make && !rec.model.toLowerCase().startsWith(rec.make.toLowerCase())) dispName = rec.make + ' ' + rec.model;
+            document.getElementById('ai_recommendation').innerHTML =
+                '<div class="card" style="border-left:4px solid var(--orange);margin-bottom:0;"><strong style="color:var(--orange);">AI Recommendation:</strong> ' +
+                dispName + ' — ' + rec.reason + ' (analysed ' + rec.total_analyzed + ' machines)</div>';
+        }
     } catch (error) {
         console.error('Error loading machines:', error);
         showError('m_res', 'Failed to load machines. Please try again.');
@@ -5947,6 +6500,281 @@ async function loadMachs() {
         btn.disabled = false;
         btn.innerHTML = 'Search Machines';
     }
+}
+
+function toggleMachCompare(idx, e) {
+    if (e) e.stopPropagation();
+    const cb = document.getElementById('cb_' + idx);
+    if (!cb) return;
+    // If click was on the row but NOT the checkbox itself, toggle it
+    if (e && e.target !== cb) cb.checked = !cb.checked;
+
+    if (cb.checked) {
+        if (!selectedForCompare.includes(idx)) selectedForCompare.push(idx);
+        if (selectedForCompare.length > 4) {
+            const removed = selectedForCompare.shift();
+            const oldCb = document.getElementById('cb_' + removed);
+            if (oldCb) oldCb.checked = false;
+        }
+    } else {
+        selectedForCompare = selectedForCompare.filter(i => i !== idx);
+    }
+    const btn = document.getElementById('compareBtn');
+    if (btn) {
+        btn.textContent = 'Compare Selected (' + selectedForCompare.length + ')';
+        btn.disabled = selectedForCompare.length < 2;
+    }
+}
+
+// ====== COMPARE ======
+async function compareSelected() {
+    if (selectedForCompare.length < 2) { alert('Select at least 2 machines'); return; }
+    const machines = selectedForCompare.map(i => currentResults[i]);
+    try {
+        const r = await fetch("/api/machine_compare", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({machines})
+        });
+        const d = await r.json();
+        if (d.error) { alert(d.error); return; }
+        renderCompare(d.machines);
+    } catch(err) { alert('Compare failed'); }
+}
+
+function renderCompare(machines) {
+    const metrics = [
+        {key:'cost',label:'Price (€)',raw:'cost_raw',best:'min'},
+        {key:'power',label:'Power (kWh)',raw:'power_raw',best:'min'},
+        {key:'sqm',label:'Footprint (SQM)',raw:'sqm_raw',best:'min'},
+        {key:'speed',label:'Speed / Output',raw:'speed_raw',best:'max'},
+        {key:'efficiency_score',label:'Efficiency Score',raw:'efficiency_score',best:'max'},
+    ];
+    let h = '<table class="cmp-tbl"><thead><tr><th>Metric</th>';
+    machines.forEach(m => {
+        let nm = m.model; if (m.make && !m.model.toLowerCase().startsWith(m.make.toLowerCase())) nm = m.make+' '+m.model;
+        h += '<th>'+nm+'</th>';
+    });
+    h += '</tr></thead><tbody>';
+    metrics.forEach(mt => {
+        const vals = machines.map(m => m[mt.raw] || 0);
+        const bestVal = mt.best === 'min' ? Math.min(...vals.filter(v=>v>0)) : Math.max(...vals);
+        h += '<tr><td style="font-weight:700;">'+mt.label+'</td>';
+        machines.forEach(m => {
+            const v = m[mt.raw] || 0;
+            const display = mt.raw === 'efficiency_score' ? v.toFixed(1) + '/100' : (m[mt.key] || v.toLocaleString());
+            const cls = v === bestVal && v > 0 ? ' class="best"' : '';
+            h += '<td'+cls+'>'+display+'</td>';
+        });
+        h += '</tr>';
+    });
+    h += '</tbody></table>';
+    h += '<p style="font-size:.72rem;color:rgba(255,255,255,0.5);margin-top:8px;">Highlighted values indicate best-in-class for each metric.</p>';
+    document.getElementById('compareBody').innerHTML = h;
+    document.getElementById('comparePanel').style.display = 'block';
+    document.getElementById('comparePanel').scrollIntoView({behavior:'smooth'});
+}
+
+// ====== TCO SIMULATOR ======
+async function runTCO() {
+    const body = {
+        machine_cost: parseFloat(document.getElementById('tco_cost').value) || 0,
+        power_kw:     parseFloat(document.getElementById('tco_power').value) || 0,
+        country:      document.getElementById('tco_country').value,
+        uptime_pct:   parseFloat(document.getElementById('tco_uptime').value) || 75,
+        maintenance_pct: parseFloat(document.getElementById('tco_maint').value) || 5,
+        depreciation_pct: parseFloat(document.getElementById('tco_depr').value) || 10,
+        annual_production: parseFloat(document.getElementById('tco_pcs').value) || 1000000,
+    };
+    if (!body.machine_cost) { alert('Enter machine cost'); return; }
+    try {
+        const r = await fetch("/api/tco_simulate", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body:JSON.stringify(body)
+        });
+        const d = await r.json();
+        if (d.error) { alert(d.error); return; }
+        renderTCO(d);
+    } catch(err) { alert('TCO calculation failed'); }
+}
+
+function renderTCO(d) {
+    const b = d.breakdown;
+    const sym = d.currency_symbol || '€';
+    const code = d.currency_code || 'EUR';
+    const rate = d.euro_rate || 1;
+    const fmt = (v) => fmtCur(v, sym);
+    let h = '';
+    // Conversion banner
+    if (rate !== 1) {
+        h += '<div style="margin-bottom:12px;padding:10px 14px;background:rgba(232,96,28,0.15);border:1px solid rgba(232,96,28,0.3);border-radius:10px;font-size:.78rem;">';
+        h += '<strong style="color:var(--orange);">Currency:</strong> Machine €' + Number(b.machine_cost_eur).toLocaleString() + ' → ' + fmt(b.machine_cost_local) + ' <span style="opacity:.6;">(1 € = ' + rate + ' ' + code + ')</span>';
+        h += '</div>';
+    }
+    h += '<div class="tco-box">';
+    ['5','10'].forEach(yr => {
+        const y = d.years[yr];
+        h += '<div class="tco-card"><h4>'+yr+'-Year TCO ('+code+')</h4>';
+        h += tcoRow('CAPEX (Machine)', fmt(y.capex));
+        h += tcoRow('Energy ('+yr+'yr)', fmt(b.energy_annual * parseInt(yr)));
+        h += tcoRow('Labour ('+yr+'yr)', fmt(b.labour_annual * parseInt(yr)));
+        h += tcoRow('Maintenance ('+yr+'yr)', fmt(b.maintenance_annual * parseInt(yr)));
+        h += tcoRow('Depreciation ('+yr+'yr)', fmt(b.depreciation_annual * parseInt(yr)));
+        h += '<div class="tco-row total"><span>Total Cost</span><span>'+fmt(y.total)+'</span></div>';
+        h += '<div class="tco-row total"><span>Per Year</span><span>'+fmt(y.per_year)+'</span></div>';
+        h += '<div class="tco-row total"><span>Per 1,000 pcs</span><span>'+fmt(y.per_1000_pcs)+'</span></div>';
+        h += '</div>';
+    });
+    h += '</div>';
+    if (b.electricity_rate) h += '<p style="font-size:.72rem;color:rgba(255,255,255,0.5);margin-top:8px;">Geo data: electricity '+b.electricity_rate+' '+sym+'/kWh, operator '+fmt(b.labour_monthly)+'/mo</p>';
+    document.getElementById('tco_result').innerHTML = h;
+}
+
+function tcoRow(l,v){return '<div class="tco-row"><span>'+l+'</span><span>'+v+'</span></div>';}
+function fmtCur(v,sym){return (sym||'€')+' '+Number(v).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});}
+function fmtEur(v){return fmtCur(v,'€');}
+
+// ====== ROI / PAYBACK ======
+async function runROI() {
+    const body = {
+        machine_cost:   parseFloat(document.getElementById('roi_cost').value) || 0,
+        hourly_revenue: parseFloat(document.getElementById('roi_revenue').value) || 0,
+        power_kw:       parseFloat(document.getElementById('roi_power').value) || 0,
+        electricity_rate: parseFloat(document.getElementById('roi_elec').value) || 0,
+        labour_monthly: parseFloat(document.getElementById('roi_labour').value) || 0,
+        uptime_pct:     parseFloat(document.getElementById('roi_uptime').value) || 75,
+        maintenance_pct: parseFloat(document.getElementById('roi_maint').value) || 5,
+        euro_rate:      parseFloat(document.getElementById('roi_euro_rate').value) || currentGeo.euro_rate || 1,
+        country:        document.getElementById('roi_country').value || document.getElementById('tco_country').value || '',
+    };
+    if (!body.machine_cost || !body.hourly_revenue) { alert('Enter machine cost and hourly revenue'); return; }
+    try {
+        const r = await fetch("/api/roi_calculate", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body:JSON.stringify(body)
+        });
+        const d = await r.json();
+        if (d.error) { alert(d.error); return; }
+        renderROI(d);
+    } catch(err) { alert('ROI calculation failed'); }
+}
+
+function renderROI(d) {
+    const sym = d.currency_symbol || currentGeo.currency_symbol || '€';
+    const code = d.currency_code || currentGeo.currency_code || 'EUR';
+    const rate = d.euro_rate || 1;
+    const fmt = (v) => fmtCur(v, sym);
+    let h = '';
+    // Conversion banner for ROI
+    if (rate !== 1 && d.machine_cost_local) {
+        h += '<div style="margin:12px 0 4px;padding:8px 12px;background:rgba(232,96,28,0.12);border:1px solid rgba(232,96,28,0.25);border-radius:8px;font-size:.75rem;">';
+        h += '<strong style="color:var(--orange);">'+code+'</strong> — Machine cost converted: ' + fmt(d.machine_cost_local);
+        h += '</div>';
+    }
+    h += '<div class="roi-summary">';
+    h += roiStat(d.payback_months > 0 ? d.payback_months + ' mo' : 'N/A', 'Payback Period');
+    h += roiStat(d.annual_roi_pct + '%', 'Annual ROI');
+    h += roiStat(fmt(d.monthly_profit), 'Monthly Profit');
+    h += roiStat(fmt(d.monthly_revenue), 'Monthly Revenue');
+    h += '</div>';
+
+    // Canvas breakeven chart
+    h += '<div class="roi-chart-wrap"><canvas id="roiChart" style="width:100%;height:100%;"></canvas></div>';
+    document.getElementById('roi_result').innerHTML = h;
+    setTimeout(() => drawBreakevenChart(d.chart, d.payback_months, sym), 50);
+}
+
+function roiStat(v,l){return '<div class="roi-stat"><div class="val">'+v+'</div><div class="lbl">'+l+'</div></div>';}
+
+function drawBreakevenChart(data, payback, sym) {
+    sym = sym || '€';
+    const canvas = document.getElementById('roiChart');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.parentElement.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = (rect.height - 32) * dpr;
+    ctx.scale(dpr, dpr);
+    const W = rect.width, H = rect.height - 32;
+    const pad = {l:70,r:20,t:10,b:30};
+    const gW = W-pad.l-pad.r, gH = H-pad.t-pad.b;
+
+    const xs = data.map(d=>d.month), ys = data.map(d=>d.cumulative);
+    const minY = Math.min(...ys, 0), maxY = Math.max(...ys, 0);
+    const rangeY = maxY - minY || 1;
+
+    function px(m,v){return [pad.l + (m/Math.max(...xs))*gW, pad.t + gH - ((v-minY)/rangeY)*gH];}
+
+    // Grid
+    ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=0.5;
+    for(let i=0;i<=4;i++){const y=pad.t+gH*(i/4);ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+gW,y);ctx.stroke();}
+
+    // Zero line
+    const [,zeroY]=px(0,0);
+    ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(pad.l,zeroY); ctx.lineTo(pad.l+gW,zeroY); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Profit line
+    ctx.beginPath(); ctx.strokeStyle='#ff8f5e'; ctx.lineWidth=2.5;
+    data.forEach((d,i)=>{const[x,y]=px(d.month,d.cumulative);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+    ctx.stroke();
+
+    // Fill under zero = red, above zero = green
+    // Simplified: fill entire area with gradient
+    const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t+gH);
+    grad.addColorStop(0, 'rgba(34,197,94,0.25)');
+    grad.addColorStop((maxY/(rangeY)), 'rgba(34,197,94,0.08)');
+    grad.addColorStop(1, 'rgba(239,68,68,0.15)');
+    ctx.fillStyle = grad;
+    ctx.beginPath();
+    data.forEach((d,i)=>{const[x,y]=px(d.month,d.cumulative);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
+    const[lastX]=px(data[data.length-1].month,0);
+    ctx.lineTo(pad.l+gW,zeroY); ctx.lineTo(pad.l,zeroY); ctx.closePath(); ctx.fill();
+
+    // Breakeven marker
+    if(payback>0){
+        const[bx,by]=px(payback,0);
+        ctx.fillStyle='#e85d04';ctx.beginPath();ctx.arc(bx,by,5,0,Math.PI*2);ctx.fill();
+        ctx.fillStyle='rgba(255,255,255,0.95)';ctx.font='bold 11px sans-serif';ctx.textAlign='center';
+        ctx.fillText('Breakeven: '+payback+' mo',bx,by-12);
+    }
+
+    // Axes labels
+    ctx.fillStyle='rgba(255,255,255,0.55)';ctx.font='10px sans-serif';ctx.textAlign='center';
+    ctx.fillText('Months',pad.l+gW/2,H);
+    ctx.textAlign='right';
+    for(let i=0;i<=4;i++){
+        const v=maxY-rangeY*(i/4);
+        ctx.fillText(fmtCur(v,sym),pad.l-6,pad.t+gH*(i/4)+4);
+    }
+}
+
+// ====== PREFILL FROM MACHINE ROW ======
+function prefillTCO(idx) {
+    const m = currentResults[idx];
+    if (!m) return;
+    document.getElementById('tco_cost').value = m.cost_raw || '';
+    document.getElementById('tco_power').value = m.power_raw || '';
+}
+
+function prefillROI(idx) {
+    const m = currentResults[idx];
+    if (!m) return;
+    document.getElementById('roi_cost').value = m.cost_raw || '';
+    document.getElementById('roi_power').value = m.power_raw || '';
+}
+
+// ====== LOAD TCO COUNTRY DROPDOWN ======
+async function loadTCOCountries() {
+    try {
+        const r = await fetch("/api/init", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({module:"costs"})});
+        const countries = await r.json();
+        const sel = document.getElementById('tco_country');
+        if (sel && Array.isArray(countries)) {
+            countries.forEach(c => { const o=document.createElement('option');o.value=c;o.text=c;sel.add(o); });
+        }
+    } catch(e) { console.warn('Could not load TCO countries'); }
 }
 
 async function exportMachines() {
@@ -5968,7 +6796,7 @@ async function exportMachines() {
         const url = window.URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
-        a.download = `machine_export_${new Date().getTime()}.xlsx`;
+        a.download = 'machine_export_' + new Date().getTime() + '.xlsx';
         document.body.appendChild(a);
         a.click();
         window.URL.revokeObjectURL(url);
@@ -5978,6 +6806,10 @@ async function exportMachines() {
         alert('Failed to export data. Please try again.');
     }
 }
+
+// Init TCO countries on page load
+if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', loadTCOCountries); }
+else { loadTCOCountries(); }
 </script>
 """
 COST_HTML = """
