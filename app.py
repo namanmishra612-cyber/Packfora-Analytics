@@ -1764,7 +1764,13 @@ def api_mach_res():
         df = load_excel_cached('machine', sheet_name="Database", header=2)
         f = df[(df["Category"] == data["cat"]) & (df["Process"] == data["proc"])]
         
-        if len(f) > MAX_MACHINES_TO_DISPLAY:
+        # Deduplicate by Make+Model (keep first occurrence)
+        total_before_dedup = len(f)
+        if 'Make' in f.columns and 'Model' in f.columns:
+            f = f.drop_duplicates(subset=['Make', 'Model'], keep='first')
+        
+        show_100_plus = len(f) > MAX_MACHINES_TO_DISPLAY
+        if show_100_plus:
             logger.warning(f"Limiting results from {len(f)} to {MAX_MACHINES_TO_DISPLAY}")
             f = f.head(MAX_MACHINES_TO_DISPLAY)
         
@@ -1808,7 +1814,9 @@ def api_mach_res():
         
         recommendation = analyze_machines_ai(res)
         
-        return jsonify({"results": res, "recommendation": recommendation})
+        display_count = "100+" if show_100_plus else str(len(res))
+        
+        return jsonify({"results": res, "recommendation": recommendation, "display_count": display_count, "total_unique": total_before_dedup})
     except Exception as e:
         logger.error(f"Error in mach_res: {e}")
         return jsonify({"error": str(e)}), 500
@@ -2024,6 +2032,370 @@ def api_geo_currency_data():
         return jsonify(geo)
     except Exception as e:
         logger.error(f"geo_currency_data error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/resin_latest_price", methods=["POST"])
+def api_resin_latest_price():
+    """Return the latest resin price (per kg) for a given resin type from resin-data.xlsx.
+    Reads the sheet matching resin_type, finds the most recent date column with data,
+    and returns the average price across all grades/locations."""
+    try:
+        d = request.json or {}
+        resin_type = d.get('resin_type', '')
+        if not resin_type:
+            return jsonify({"error": "resin_type required"}), 400
+
+        xl = load_excel_cached('resin')
+        if xl is None:
+            return jsonify({"error": "Resin database not available"}), 500
+
+        # Find matching sheet
+        target_sheet = None
+        for sname in xl.sheet_names:
+            if sname.strip().upper() == resin_type.strip().upper():
+                target_sheet = sname
+                break
+        if not target_sheet:
+            # Try partial match
+            for sname in xl.sheet_names:
+                if resin_type.strip().upper() in sname.strip().upper():
+                    target_sheet = sname
+                    break
+        if not target_sheet:
+            return jsonify({"error": f"Sheet for {resin_type} not found", "price": 0}), 200
+
+        df = clean_resin_df(target_sheet)
+        meta_cols = ["Supplier", "Country", "Location", "Grade", "Unit"]
+        date_cols = [c for c in df.columns if c not in meta_cols and not str(c).startswith("Unnamed")]
+
+        # Parse and sort date columns to find latest
+        dated = []
+        for c in date_cols:
+            dt = parse_date_col(c)
+            if dt:
+                dated.append((dt, c))
+        dated.sort(key=lambda x: x[0], reverse=True)
+
+        # Walk from newest date backward until we find valid prices
+        latest_price = 0
+        latest_date = ''
+        prices = []
+        for dt_obj, col in dated:
+            vals = pd.to_numeric(df[col], errors='coerce').dropna()
+            vals = vals[vals > 0]
+            if len(vals) > 0:
+                latest_price = round(float(vals.mean()), 2)
+                prices = vals.tolist()
+                latest_date = dt_obj.strftime('%Y-%m-%d')
+                break
+
+        # Determine unit from sheet
+        unit = 'per MT'
+        if 'Unit' in df.columns:
+            u = df['Unit'].dropna().astype(str).str.strip().iloc[0] if len(df['Unit'].dropna()) > 0 else ''
+            if u:
+                unit = u
+
+        # Convert per MT → per kg if needed
+        price_per_kg = latest_price
+        if 'mt' in unit.lower() or 'ton' in unit.lower():
+            price_per_kg = round(latest_price / 1000, 4)
+
+        return jsonify({
+            "resin_type": resin_type,
+            "latest_price_per_mt": latest_price,
+            "price_per_kg": price_per_kg,
+            "latest_date": latest_date,
+            "unit": unit,
+            "sample_count": len(prices),
+            "min_price": round(min(prices), 2) if prices else 0,
+            "max_price": round(max(prices), 2) if prices else 0,
+        })
+    except Exception as e:
+        logger.error(f"resin_latest_price error: {e}")
+        return jsonify({"error": str(e), "price_per_kg": 0}), 200
+
+
+@app.route("/api/procurement_tco", methods=["POST"])
+def api_procurement_tco():
+    """Full Procurement TCO — machine + material + tooling + freight + inventory.
+    All monetary values are in local currency (converted from EUR via geo rate)."""
+    try:
+        d = request.json or {}
+        # --- Machine inputs ---
+        machine_cost_eur = float(d.get('machine_cost', 0))
+        power_kw         = float(d.get('power_kw', 0))
+        uptime_pct       = float(d.get('uptime_pct', 75)) / 100
+        maint_pct        = float(d.get('maintenance_pct', 5)) / 100
+        depr_pct         = float(d.get('depreciation_pct', 10)) / 100
+        country          = d.get('country', '')
+        annual_pcs       = float(d.get('annual_production', 1000000))
+
+        # --- New procurement inputs ---
+        resin_price_per_kg = float(d.get('resin_price_per_kg', 0))
+        part_weight_kg     = float(d.get('part_weight_kg', 0.05))
+        cycle_time_sec     = float(d.get('cycle_time_sec', 10))
+        scrap_pct          = float(d.get('scrap_pct', 3)) / 100
+        tooling_amort_yr   = float(d.get('tooling_amort_yr', 0))
+        freight_duty_per_kg = float(d.get('freight_duty_per_kg', 0))
+        moq_holding_pct    = float(d.get('moq_holding_pct', 2)) / 100
+        labour_override    = d.get('labour_override', None)
+
+        hours_per_yr = 8760
+
+        # Geo data
+        geo = get_country_geo_data(country)
+        electricity_rate = float(d.get('electricity_rate', 0)) or geo['electricity_rate']
+        labour_monthly   = float(labour_override) if labour_override and float(labour_override) > 0 else (float(d.get('labour_monthly', 0)) or geo['labour_monthly'])
+        euro_rate         = geo['euro_rate']
+        currency_symbol   = geo['currency_symbol']
+        currency_code     = geo['currency_code']
+
+        # Convert machine cost EUR → local
+        machine_cost_local = machine_cost_eur * euro_rate
+
+        # --- Compute annual parts from cycle time ---
+        running_hours = hours_per_yr * uptime_pct
+        if cycle_time_sec > 0:
+            parts_per_hour = 3600 / cycle_time_sec
+            annual_parts_from_cycle = parts_per_hour * running_hours
+        else:
+            annual_parts_from_cycle = annual_pcs
+
+        # Use the smaller of user-provided annual_pcs and capacity
+        annual_parts = min(annual_pcs, annual_parts_from_cycle) if annual_pcs > 0 else annual_parts_from_cycle
+
+        # --- Machine cost per part ---
+        energy_annual = power_kw * running_hours * electricity_rate
+        labour_annual = labour_monthly * 12 * 3  # 3 shifts
+        maint_annual  = machine_cost_local * maint_pct
+        depr_annual   = machine_cost_local * depr_pct
+        annual_machine_tco = energy_annual + labour_annual + maint_annual + depr_annual
+        machine_cost_per_part = (annual_machine_tco / annual_parts) if annual_parts > 0 else 0
+
+        # --- Material cost per part ---
+        material_cost_per_part = resin_price_per_kg * part_weight_kg * (1 + scrap_pct)
+
+        # --- Tooling amortization per part ---
+        tooling_per_part = (tooling_amort_yr / annual_parts) if annual_parts > 0 else 0
+
+        # --- Freight + duty per part ---
+        freight_per_part = freight_duty_per_kg * part_weight_kg
+
+        # --- MOQ inventory holding cost per part ---
+        material_cost_annual = material_cost_per_part * annual_parts
+        inventory_per_part = (material_cost_annual * moq_holding_pct / annual_parts) if annual_parts > 0 else 0
+
+        # --- Total cost per part ---
+        total_cost_per_part = machine_cost_per_part + material_cost_per_part + tooling_per_part + freight_per_part + inventory_per_part
+
+        # --- Cost per kg ---
+        cost_per_kg = (total_cost_per_part / part_weight_kg) if part_weight_kg > 0 else 0
+
+        # --- 5yr / 10yr TCO ---
+        capex = machine_cost_local
+        opex_annual = annual_machine_tco
+        material_annual = material_cost_per_part * annual_parts
+        tooling_annual = tooling_amort_yr
+        freight_annual = freight_per_part * annual_parts
+        inventory_annual = inventory_per_part * annual_parts
+
+        total_annual_procurement = opex_annual + material_annual + tooling_annual + freight_annual + inventory_annual
+
+        years = {}
+        for yr in [5, 10]:
+            total = capex + (total_annual_procurement * yr)
+            per_year = total / yr
+            per_1000 = (per_year / annual_parts * 1000) if annual_parts > 0 else 0
+            years[str(yr)] = {
+                'capex': round(capex, 2),
+                'opex_total': round(total_annual_procurement * yr, 2),
+                'total': round(total, 2),
+                'per_year': round(per_year, 2),
+                'per_1000_pcs': round(per_1000, 2),
+            }
+
+        # --- ROI / Payback ---
+        hourly_revenue = float(d.get('hourly_revenue', 0))
+        if hourly_revenue > 0:
+            hours_per_month = 730 * uptime_pct
+            monthly_revenue = hourly_revenue * hours_per_month
+            monthly_cost = total_annual_procurement / 12
+            monthly_profit = monthly_revenue - monthly_cost
+            payback_months = round(machine_cost_local / monthly_profit, 1) if monthly_profit > 0 else -1
+            annual_profit = monthly_profit * 12
+            roi_pct = round((annual_profit / machine_cost_local) * 100, 1) if machine_cost_local > 0 else 0
+            chart_months = min(max(int(payback_months * 1.5), 12), 120) if payback_months > 0 else 60
+            chart = [{'month': m, 'cumulative': round((monthly_profit * m) - machine_cost_local, 2)} for m in range(chart_months + 1)]
+        else:
+            payback_months = -1
+            roi_pct = 0
+            monthly_revenue = 0
+            monthly_profit = 0
+            chart = []
+
+        return jsonify({
+            'cost_per_part': {
+                'machine': round(machine_cost_per_part, 6),
+                'material': round(material_cost_per_part, 6),
+                'tooling': round(tooling_per_part, 6),
+                'freight': round(freight_per_part, 6),
+                'inventory': round(inventory_per_part, 6),
+                'total': round(total_cost_per_part, 6),
+            },
+            'cost_per_kg': round(cost_per_kg, 4),
+            'annual_parts': round(annual_parts),
+            'annual_procurement': {
+                'machine_opex': round(opex_annual, 2),
+                'material': round(material_annual, 2),
+                'tooling': round(tooling_annual, 2),
+                'freight': round(freight_annual, 2),
+                'inventory': round(inventory_annual, 2),
+                'total': round(total_annual_procurement, 2),
+            },
+            'years': years,
+            'breakdown': {
+                'energy_annual': round(energy_annual, 2),
+                'labour_annual': round(labour_annual, 2),
+                'maintenance_annual': round(maint_annual, 2),
+                'depreciation_annual': round(depr_annual, 2),
+                'opex_annual': round(opex_annual, 2),
+                'electricity_rate': round(electricity_rate, 4),
+                'labour_monthly': round(labour_monthly, 2),
+                'euro_rate': round(euro_rate, 4),
+                'machine_cost_eur': round(machine_cost_eur, 2),
+                'machine_cost_local': round(machine_cost_local, 2),
+            },
+            'roi': {
+                'payback_months': payback_months,
+                'annual_roi_pct': roi_pct,
+                'monthly_revenue': round(monthly_revenue, 2),
+                'monthly_profit': round(monthly_profit, 2),
+                'chart': chart,
+            },
+            'currency_symbol': currency_symbol,
+            'currency_code': currency_code,
+            'euro_rate': round(euro_rate, 4),
+        })
+    except Exception as e:
+        logger.error(f"Procurement TCO error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/procurement_region_compare", methods=["POST"])
+def api_procurement_region_compare():
+    """Compare procurement TCO across multiple countries."""
+    try:
+        d = request.json or {}
+        countries = d.get('countries', [])
+        base_params = d.get('base_params', {})
+        if not countries or len(countries) < 2:
+            return jsonify({"error": "Select 2+ countries"}), 400
+
+        results = []
+        for country in countries:
+            geo = get_country_geo_data(country)
+            euro_rate = geo['euro_rate']
+            elec = geo['electricity_rate']
+            labour = geo['labour_monthly']
+            sym = geo['currency_symbol']
+            code = geo['currency_code']
+
+            machine_local = float(base_params.get('machine_cost', 0)) * euro_rate
+            running_hours = 8760 * (float(base_params.get('uptime_pct', 75)) / 100)
+            annual_parts = float(base_params.get('annual_production', 1000000))
+            power_kw = float(base_params.get('power_kw', 0))
+            part_weight = float(base_params.get('part_weight_kg', 0.05))
+            scrap = float(base_params.get('scrap_pct', 3)) / 100
+            resin_price = float(base_params.get('resin_price_per_kg', 0))
+            tooling = float(base_params.get('tooling_amort_yr', 0))
+            freight = float(base_params.get('freight_duty_per_kg', 0))
+            moq_pct = float(base_params.get('moq_holding_pct', 2)) / 100
+
+            energy_ann = power_kw * running_hours * elec
+            labour_ann = labour * 12 * 3
+            maint_ann = machine_local * float(base_params.get('maintenance_pct', 5)) / 100
+            depr_ann = machine_local * float(base_params.get('depreciation_pct', 10)) / 100
+            machine_opex = energy_ann + labour_ann + maint_ann + depr_ann
+            machine_per_part = (machine_opex / annual_parts) if annual_parts > 0 else 0
+            mat_per_part = resin_price * part_weight * (1 + scrap)
+            tooling_per_part = (tooling / annual_parts) if annual_parts > 0 else 0
+            freight_per_part = freight * part_weight
+            inv_per_part = (mat_per_part * annual_parts * moq_pct / annual_parts) if annual_parts > 0 else 0
+            total_per_part = machine_per_part + mat_per_part + tooling_per_part + freight_per_part + inv_per_part
+
+            # Convert to EUR for comparison
+            total_per_part_eur = (total_per_part / euro_rate) if euro_rate > 0 else total_per_part
+
+            results.append({
+                'country': country,
+                'currency_symbol': sym,
+                'currency_code': code,
+                'euro_rate': euro_rate,
+                'electricity_rate': elec,
+                'labour_monthly': labour,
+                'cost_per_part_local': round(total_per_part, 6),
+                'cost_per_part_eur': round(total_per_part_eur, 6),
+                'machine_per_part': round(machine_per_part, 6),
+                'material_per_part': round(mat_per_part, 6),
+                'annual_total_eur': round(total_per_part_eur * annual_parts, 2),
+            })
+
+        # Sort by EUR cost
+        results.sort(key=lambda x: x['cost_per_part_eur'])
+        return jsonify({"regions": results})
+    except Exception as e:
+        logger.error(f"Region compare error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/procurement_export", methods=["POST"])
+def api_procurement_export():
+    """Export procurement TCO results to Excel."""
+    try:
+        d = request.json or {}
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Cost per part breakdown
+            cpp = d.get('cost_per_part', {})
+            df1 = pd.DataFrame([{
+                'Component': k.replace('_', ' ').title(),
+                'Cost/Part': v
+            } for k, v in cpp.items()])
+            df1.to_excel(writer, sheet_name='Cost Per Part', index=False)
+
+            # Annual costs
+            ann = d.get('annual_procurement', {})
+            df2 = pd.DataFrame([{
+                'Category': k.replace('_', ' ').title(),
+                'Annual Cost': v
+            } for k, v in ann.items()])
+            df2.to_excel(writer, sheet_name='Annual Costs', index=False)
+
+            # 5yr/10yr TCO
+            years = d.get('years', {})
+            rows = []
+            for yr, vals in years.items():
+                for k, v in vals.items():
+                    rows.append({'Period': f'{yr} Year', 'Metric': k.replace('_', ' ').title(), 'Value': v})
+            if rows:
+                pd.DataFrame(rows).to_excel(writer, sheet_name='TCO Summary', index=False)
+
+            # Region comparison if present
+            regions = d.get('regions', [])
+            if regions:
+                pd.DataFrame(regions).to_excel(writer, sheet_name='Region Comparison', index=False)
+
+        output.seek(0)
+        return send_file(
+            output,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=f'procurement_tco_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        )
+    except Exception as e:
+        logger.error(f"Procurement export error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -4411,6 +4783,7 @@ ADMIN_LOGIN_HTML = """
             padding: 50px;
             border: 1px solid rgba(255,255,255,0.25);
             width: 400px;
+            max-width: calc(100% - 30px);
             box-shadow: 0 10px 40px rgba(0,0,0,0.3);
         }
         h2 {
@@ -4717,6 +5090,57 @@ ADMIN_DASHBOARD_HTML = """
             .upload-section {
                 grid-template-columns: 1fr;
             }
+            .navbar {
+                padding: 12px 15px;
+                flex-wrap: wrap;
+                gap: 10px;
+            }
+            .navbar h1 {
+                font-size: 1.1rem;
+                flex: 1;
+            }
+            .nav-links {
+                gap: 8px;
+                flex-wrap: wrap;
+                width: 100%;
+                justify-content: flex-end;
+            }
+            .nav-links a, .nav-links span {
+                font-size: 0.8rem;
+                padding: 8px 12px;
+            }
+            .container {
+                margin: 16px auto;
+                padding: 0 10px;
+            }
+            .card {
+                padding: 18px;
+                border-radius: 14px;
+            }
+            .admin-table-wrap {
+                overflow-x: auto;
+                -webkit-overflow-scrolling: touch;
+            }
+            .admin-table-wrap table {
+                min-width: 500px;
+            }
+            th, td {
+                padding: 10px 8px;
+                font-size: 0.85rem;
+            }
+            h2 {
+                font-size: 1.2rem;
+                margin-bottom: 18px;
+            }
+            .upload-card {
+                padding: 18px;
+            }
+        }
+        @media (max-width: 480px) {
+            .navbar h1 { font-size: 1rem; }
+            .nav-links a { padding: 6px 10px; font-size: 0.75rem; }
+            .upload-card h4 { font-size: 0.95rem; }
+            .file-label { padding: 10px 18px; font-size: 0.82rem; }
         }
     </style>
 </head>
@@ -4818,6 +5242,7 @@ ADMIN_DASHBOARD_HTML = """
 
         <div class="card">
             <h2>Current Files</h2>
+            <div class="admin-table-wrap">
             <table>
                 <thead>
                     <tr>
@@ -4850,12 +5275,14 @@ ADMIN_DASHBOARD_HTML = """
                     {% endfor %}
                 </tbody>
             </table>
+            </div>
         </div>
         
         <div class="card">
             <h2>Recent Backups</h2>
             <p style="opacity:0.8; margin-bottom:15px;">Last 10 backups (old backups are automatically deleted)</p>
             {% if backups %}
+            <div class="admin-table-wrap">
             <table>
                 <thead>
                     <tr>
@@ -4874,6 +5301,7 @@ ADMIN_DASHBOARD_HTML = """
                     {% endfor %}
                 </tbody>
             </table>
+            </div>
             {% else %}
             <p style="opacity:0.6; text-align:center; padding:20px;">No backups yet</p>
             {% endif %}
@@ -5191,27 +5619,36 @@ BASE_HTML = """
             border: 1px solid var(--orange);
         }
         /* Hamburger */
-        .hamburger { display: none; background: none; border: none; cursor: pointer; padding: 8px; }
+        .hamburger { display: none; background: none; border: none; cursor: pointer; padding: 8px; z-index: 101; }
         .hamburger span { display: block; width: 24px; height: 2px; background: white; margin: 5px 0; border-radius: 2px; transition: all 0.3s; }
         .hamburger.open span:nth-child(1) { transform: rotate(45deg) translate(5px, 5px); }
         .hamburger.open span:nth-child(2) { opacity: 0; }
         .hamburger.open span:nth-child(3) { transform: rotate(-45deg) translate(5px, -5px); }
-        @media (max-width: 900px) {
+        @media (max-width: 768px) {
             .hamburger { display: block; margin-left: auto; }
             .nav-links {
                 display: none;
                 position: absolute;
-                top: 64px;
+                top: 56px;
                 left: 0; right: 0;
                 background: rgba(15, 23, 42, 0.97);
                 backdrop-filter: blur(20px);
                 flex-direction: column;
-                padding: 16px;
+                padding: 12px;
                 gap: 4px;
                 border-bottom: 1px solid rgba(255,255,255,0.1);
                 height: auto;
+                max-height: 80vh;
+                overflow-y: auto;
+                z-index: 200;
             }
             .nav-links.mobile-open { display: flex; }
+            .nav-links > a, .nav-group > .nav-group-toggle { 
+                padding: 12px 16px; 
+                font-size: 0.9rem; 
+                width: 100%; 
+                justify-content: flex-start;
+            }
             .nav-group { height: auto; flex-direction: column; width: 100%; }
             .nav-group-toggle { width: 100%; justify-content: space-between; }
             .nav-dropdown {
@@ -5225,6 +5662,7 @@ BASE_HTML = """
                 border-radius: 8px;
             }
             .nav-group.mobile-expanded .nav-dropdown { display: block; }
+            .nav-dropdown a { padding: 10px 20px; }
         }
         .container { max-width: 1400px; margin: 40px auto; padding: 0 20px; }
         .card { 
@@ -5452,18 +5890,44 @@ BASE_HTML = """
             letter-spacing: 2px; 
         }
         .grid-2 { display: grid; grid-template-columns: repeat(2, 1fr); gap: 20px; }
-        .grid-3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 20px; }
-        .grid-4 { display: grid; grid-template-columns: repeat(4, 1fr); gap: 20px; }
+        .grid-3 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+        .grid-4 { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 20px; }
+        
+        /* Responsive table wrapper */
+        .table-responsive { overflow-x: auto; -webkit-overflow-scrolling: touch; margin: 0 -8px; padding: 0 8px; }
+        .table-responsive table { min-width: 600px; }
+
+        /* KPI clamp scaling */
+        .stat-number { font-size: clamp(1.8rem, 5vw, 3rem); }
+        .section-title { font-size: clamp(1rem, 3vw, 1.5rem); }
+        h1 { font-size: clamp(1.4rem, 4vw, 2.2rem); }
+        h2 { font-size: clamp(1.1rem, 3.5vw, 1.8rem); }
         
         @media (max-width: 1024px) {
-            .grid-4 { grid-template-columns: repeat(2, 1fr); }
-            .grid-3 { grid-template-columns: repeat(2, 1fr); }
+            .grid-2 { grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); }
             .spec-grid { grid-template-columns: 2fr 1fr 1fr; }
         }
         @media (max-width: 768px) {
-            .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; }
-            .navbar { padding: 0 15px; }
+            .navbar { padding: 0 12px; height: 56px; }
+            .navbar-logo img { height: 32px; }
+            .container { margin: 16px auto; padding: 0 10px; }
+            .card { padding: 18px; border-radius: 14px; margin-bottom: 16px; }
+            .card:hover { transform: none; box-shadow: none; }
+            .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; gap: 12px; }
             .spec-grid { grid-template-columns: 1fr; }
+            .stat-card { padding: 20px 15px; }
+            .quick-action { padding: 18px 15px; }
+            .quick-action-title { font-size: 1rem; }
+            .section-header { margin-bottom: 16px; }
+            select { padding: 12px; font-size: 0.9rem; }
+            .btn-analyze { padding: 14px; font-size: 0.95rem; }
+            .btn-secondary { padding: 10px 16px; font-size: 0.85rem; }
+            .row { padding: 12px 0; flex-wrap: wrap; gap: 4px; }
+        }
+        @media (max-width: 480px) {
+            .container { padding: 0 8px; margin: 10px auto; }
+            .card { padding: 14px; border-radius: 12px; margin-bottom: 12px; }
+            h2 { margin-bottom: 12px; }
         }
     </style>
 </head>
@@ -5601,11 +6065,26 @@ BASE_HTML = """
         btn.classList.toggle('open');
     }
     function toggleMobileDropdown(e, group) {
-        if (window.innerWidth > 900) return;
+        if (window.innerWidth > 768) return;
         if (e.target.closest('.nav-dropdown')) return;
         e.stopPropagation();
         group.classList.toggle('mobile-expanded');
     }
+    // Close mobile nav on link click
+    document.addEventListener('click', function(e) {
+        if (window.innerWidth > 768) return;
+        if (e.target.matches('.nav-dropdown a')) {
+            document.getElementById('mainNav').classList.remove('mobile-open');
+            document.getElementById('hamburgerBtn').classList.remove('open');
+        }
+    });
+    // Close mobile nav on resize to desktop
+    window.addEventListener('resize', function() {
+        if (window.innerWidth > 768) {
+            document.getElementById('mainNav').classList.remove('mobile-open');
+            document.getElementById('hamburgerBtn').classList.remove('open');
+        }
+    });
     </script>
 </body>
 </html>
@@ -5816,6 +6295,24 @@ label.checkbox-label {
 label.checkbox-label:hover {
     background: rgba(232, 96, 28, 0.1);
 }
+/* Resin responsive */
+.resin-form-grid { display: grid; gap: 20px; }
+.resin-form-grid-4 { grid-template-columns: repeat(4, 1fr); }
+.resin-form-grid-3 { grid-template-columns: repeat(3, 1fr); }
+@media (max-width: 768px) {
+    .tabs { gap: 0; flex-wrap: nowrap; }
+    .tab { flex: 1; padding: 10px 8px; font-size: 0.82rem; text-align: center; white-space: nowrap; }
+    .resin-form-grid-4, .resin-form-grid-3 { grid-template-columns: 1fr; gap: 12px; }
+    .comparison-grid { grid-template-columns: 1fr; }
+    #location-checkboxes { grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)) !important; }
+    #priceChart { min-height: 250px; }
+    .resin-kpi-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
+}
+@media (max-width: 480px) {
+    .tab { font-size: 0.78rem; padding: 8px 6px; }
+    .comparison-grid { grid-template-columns: 1fr; }
+    #location-checkboxes { grid-template-columns: 1fr !important; }
+}
 </style>
 
 <div class="tabs">
@@ -5827,7 +6324,7 @@ label.checkbox-label:hover {
 <div id="search-tab" class="tab-content active">
 <h2>Resin Price Tracker</h2>
 <div class="card">
-    <div style="display:grid; grid-template-columns: repeat(4, 1fr); gap: 20px;">
+    <div class="resin-form-grid resin-form-grid-4">
         <div>
             <label style="display:block; font-size:.75rem; margin-bottom:10px; font-weight:800; opacity:0.9">RESIN TYPE</label>
             <select id="resSheet" onchange="loadResSub()">
@@ -5862,7 +6359,7 @@ label.checkbox-label:hover {
 <div id="compare-tab" class="tab-content">
     <h2>Compare Regions</h2>
     <div class="card">
-        <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px;">
+        <div class="resin-form-grid resin-form-grid-3">
             <div>
                 <label style="display:block; font-size:.75rem; margin-bottom:10px; font-weight:800; opacity:0.9">RESIN TYPE</label>
                 <select id="cmp_rt" onchange="loadGradesCompare()">
@@ -5982,12 +6479,12 @@ async function genRes() {
         
         let h = `<div class="card">
             <div style="background: linear-gradient(135deg, rgba(232, 96, 28, 0.2) 0%, rgba(232, 96, 28, 0.05) 100%); border: 2px solid var(--orange); border-radius: 15px; padding: 25px; margin-bottom: 25px;">
-                <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 20px;">
-                    <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">CURRENT PRICE</div><div style="font-size:2rem; font-weight:900; color:var(--orange);">${i.curr}</div></div>
-                    <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">PERIOD CHANGE</div><div style="font-size:2rem; font-weight:900; ${parseFloat(i.diff) > 0 ? 'color:#dc3545;' : 'color:#10b981;'}">${i.diff}</div></div>
+                <div class="resin-kpi-grid" style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 20px;">
+                    <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">CURRENT PRICE</div><div style="font-size:clamp(1.3rem,4vw,2rem); font-weight:900; color:var(--orange);">${i.curr}</div></div>
+                    <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">PERIOD CHANGE</div><div style="font-size:clamp(1.3rem,4vw,2rem); font-weight:900; ${parseFloat(i.diff) > 0 ? 'color:#dc3545;' : 'color:#10b981;'}">${i.diff}</div></div>
                     <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">MARKET STATUS</div><div><span class="badge ${i.badge}" style="font-size:0.9rem; padding:8px 15px;">${i.status}</span></div></div>
                 </div>
-                <div style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2);">
+                <div class="resin-kpi-grid" style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2);">
                     <div><div style="opacity:0.7; font-size:0.8rem;">Average Price</div><div style="font-weight:800; font-size:1.1rem;">${i.avg}</div></div>
                     <div><div style="opacity:0.7; font-size:0.8rem;">Min Price</div><div style="font-weight:800; font-size:1.1rem; color:#10b981;">${i.min}</div></div>
                     <div><div style="opacity:0.7; font-size:0.8rem;">Max Price</div><div style="font-weight:800; font-size:1.1rem; color:#dc3545;">${i.max}</div></div>
@@ -6171,7 +6668,7 @@ function displayComparison(data) {
     let html = '<div class="card" style="background: linear-gradient(135deg, rgba(232, 96, 28, 0.15) 0%, rgba(232, 96, 28, 0.05) 100%); border: 2px solid var(--orange); margin-bottom: 20px;">';
     html += '<h3 style="margin-bottom: 10px;">Regional Price Comparison</h3>';
     html += `<p style="opacity: 0.8; margin-bottom: 15px;">${data.resin_type} - ${data.grade} | ${data.duration}</p>`;
-    html += '<div style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; padding: 15px; background: rgba(255,255,255,0.1); border-radius: 8px;">';
+    html += '<div class="resin-kpi-grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; padding: 15px; background: rgba(255,255,255,0.1); border-radius: 8px;">';
     html += `<div><div style="opacity: 0.7; font-size: 0.8rem;">BEST PRICE</div><div style="font-size: 1.2rem; font-weight: 800; color: #28a745;">${data.summary.best_price_location}</div></div>`;
     html += `<div><div style="opacity: 0.7; font-size: 0.8rem;">HIGHEST PRICE</div><div style="font-size: 1.2rem; font-weight: 800; color: #dc3545;">${data.summary.worst_price_location}</div></div>`;
     html += `<div><div style="opacity: 0.7; font-size: 0.8rem;">PRICE SPREAD</div><div style="font-size: 1.2rem; font-weight: 800;">${data.summary.price_spread}</div></div>`;
@@ -6234,8 +6731,14 @@ async function exportComparison() {
 
 MACH_HTML = """
 <h2>Machine Database</h2>
+<div style="display:flex;gap:8px;margin-bottom:20px;background:rgba(255,255,255,0.1);padding:8px;border-radius:12px;">
+    <button class="mach-tab-btn active" onclick="switchMachTab('search')" data-mtab="search" style="flex:1;padding:12px 20px;background:var(--orange);border:none;border-radius:8px;color:white;font-family:'Outfit',sans-serif;font-size:0.9rem;font-weight:700;cursor:pointer;transition:all 0.3s;box-shadow:0 4px 12px rgba(232,96,28,0.4);">Machine Search</button>
+    <button class="mach-tab-btn" onclick="switchMachTab('tcoRoi')" data-mtab="tcoRoi" style="flex:1;padding:12px 20px;background:rgba(255,255,255,0.15);border:none;border-radius:8px;color:white;font-family:'Outfit',sans-serif;font-size:0.9rem;font-weight:700;cursor:pointer;transition:all 0.3s;">TCO &amp; ROI</button>
+</div>
+
+<div id="mach-tab-search" class="mach-tab-content" style="display:block;">
 <div class="card">
-    <div style="display:grid; grid-template-columns: 1fr 1fr; gap: 20px;">
+    <div class="mach-form-grid">
         <div>
             <label style="display:block; font-size:.75rem; margin-bottom:10px; font-weight:800; opacity:0.9">CATEGORY</label>
             <select id="cat" onchange="loadProcs(this.value)"><option value="">Select...</option></select>
@@ -6257,11 +6760,13 @@ MACH_HTML = """
     <div id="compareBody"></div>
 </div>
 </div>
+</div>
 
-<!-- ========== TCO SIMULATOR ========== -->
-<div class="card" style="margin-top:24px;">
-    <h3 style="margin-bottom:14px;">TCO Simulator (5yr / 10yr)</h3>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+<div id="mach-tab-tcoRoi" class="mach-tab-content" style="display:none;">
+<!-- ========== TCO Simulator ========== -->
+<div class="card">
+    <h3 style="margin-bottom:14px;">TCO Simulator</h3>
+    <div class="mach-input-grid">
         <div>
             <label class="lbl-sm">Machine Cost (€)</label>
             <input id="tco_cost" type="number" placeholder="e.g. 350000" class="theme-input">
@@ -6293,15 +6798,110 @@ MACH_HTML = """
             <label class="lbl-sm">Annual Production (pcs)</label>
             <input id="tco_pcs" type="number" value="1000000" class="theme-input">
         </div>
+        <div>
+            <label class="lbl-sm">Part Weight (kg)</label>
+            <input id="tco_part_weight" type="number" value="0.05" step="0.001" class="theme-input">
+        </div>
+        <div>
+            <label class="lbl-sm">Cycle Time (sec)</label>
+            <input id="tco_cycle_time" type="number" value="10" step="0.1" class="theme-input">
+        </div>
     </div>
-    <button class="btn-analyze" style="margin-top:14px;" onclick="runTCO()">Calculate TCO</button>
+    <!-- Material & Logistics row -->
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.12);">
+        <div style="font-size:.72rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">Material & Logistics</div>
+        <div class="mach-input-grid">
+            <div>
+                <label class="lbl-sm">Resin Type</label>
+                <select id="tco_resin_type" class="theme-input" onchange="fetchResinPrice()" style="padding:11px 14px;">
+                    <option value="">Select…</option>
+                    <option value="HDPE">HDPE</option>
+                    <option value="LDPE">LDPE</option>
+                    <option value="LLDPE">LLDPE</option>
+                    <option value="PP">PP</option>
+                    <option value="PET">PET</option>
+                    <option value="PVC">PVC</option>
+                    <option value="PS">PS</option>
+                    <option value="EVA">EVA</option>
+                    <option value="ABS">ABS</option>
+                    <option value="PA">PA (Nylon)</option>
+                </select>
+                <div id="tco_resin_hint" style="font-size:.62rem;color:rgba(255,255,255,0.4);margin-top:3px;"></div>
+            </div>
+            <div>
+                <label class="lbl-sm" id="tco_resin_lbl">Resin Price (€/kg)</label>
+                <input id="tco_resin_price" type="number" step="0.01" placeholder="auto-fetch or enter" class="theme-input">
+            </div>
+            <div>
+                <label class="lbl-sm">Scrap %</label>
+                <input id="tco_scrap" type="number" value="3" step="0.1" class="theme-input">
+            </div>
+            <div>
+                <label class="lbl-sm">Tooling Amortization (€/yr)</label>
+                <input id="tco_tooling" type="number" value="0" class="theme-input">
+            </div>
+            <div>
+                <label class="lbl-sm">Freight + Duty (€/kg)</label>
+                <input id="tco_freight" type="number" value="0" step="0.01" class="theme-input">
+            </div>
+            <div>
+                <label class="lbl-sm">MOQ Inv. Holding %</label>
+                <input id="tco_moq" type="number" value="2" step="0.1" class="theme-input">
+            </div>
+            <div>
+                <label class="lbl-sm" id="tco_labour_lbl">Labour Override (€/mo, optional)</label>
+                <input id="tco_labour_override" type="number" placeholder="leave blank for geo default" class="theme-input">
+            </div>
+            <div>
+                <label class="lbl-sm" id="tco_revenue_lbl">Hourly Revenue (€, for ROI)</label>
+                <input id="tco_hourly_revenue" type="number" placeholder="optional" class="theme-input">
+            </div>
+        </div>
+    </div>
+    <!-- What-If Sliders -->
+    <div style="margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.12);">
+        <div style="font-size:.72rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">What-If Analysis</div>
+        <div class="mach-input-grid">
+            <div>
+                <label class="lbl-sm">Resin Price Δ: <span id="ptco_wi_resin_val">0%</span></label>
+                <input id="ptco_wi_resin" type="range" min="-30" max="30" value="0" step="1" class="wi-slider" oninput="updateProcWhatIf()">
+            </div>
+            <div>
+                <label class="lbl-sm">Cycle Time Δ: <span id="ptco_wi_cycle_val">0%</span></label>
+                <input id="ptco_wi_cycle" type="range" min="-30" max="30" value="0" step="1" class="wi-slider" oninput="updateProcWhatIf()">
+            </div>
+            <div>
+                <label class="lbl-sm">Scrap Δ: <span id="ptco_wi_scrap_val">0%</span></label>
+                <input id="ptco_wi_scrap" type="range" min="-50" max="100" value="0" step="5" class="wi-slider" oninput="updateProcWhatIf()">
+            </div>
+        </div>
+        <div id="ptco_wi_impact" style="margin-top:8px;font-size:.78rem;color:rgba(255,255,255,0.6);"></div>
+    </div>
+    <div style="display:flex;gap:10px;margin-top:14px;">
+        <button class="btn-analyze" onclick="runProcurementTCO()">Calculate Full TCO</button>
+        <button class="btn-secondary" onclick="exportProcurement()" style="font-size:.82rem;">Export to Excel</button>
+    </div>
     <div id="tco_result"></div>
+</div>
+
+<!-- ========== SUPPLIER COMPARISON ========== -->
+<div class="card" style="margin-top:18px;display:none;" id="supplierCompareCard">
+    <h3 style="margin-bottom:12px;">Supplier Cost Comparison</h3>
+    <div id="supplierCompareBody"></div>
+</div>
+
+<!-- ========== REGION COMPARISON ========== -->
+<div class="card" style="margin-top:18px;">
+    <h3 style="margin-bottom:12px;">Region Cost Comparison</h3>
+    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;" id="regionCheckboxes"></div>
+    <button class="btn-secondary" onclick="runRegionCompare()" style="font-size:.82rem;">Compare Regions</button>
+    <div id="regionCompareBody" style="margin-top:12px;"></div>
 </div>
 
 <!-- ========== ROI / PAYBACK CALCULATOR ========== -->
 <div class="card" style="margin-top:24px;">
     <h3 style="margin-bottom:14px;"><span id="roi_title">ROI / Payback Calculator</span></h3>
-    <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;">
+    <div class="mach-input-grid">
         <div>
             <label class="lbl-sm">Machine Cost (€)</label>
             <input id="roi_cost" type="number" placeholder="350000" class="theme-input">
@@ -6335,6 +6935,7 @@ MACH_HTML = """
     <button class="btn-analyze" style="margin-top:14px;" onclick="runROI()">Calculate ROI</button>
     <div id="roi_result"></div>
 </div>
+</div>
 
 <style>
 .lbl-sm{display:block;font-size:.7rem;font-weight:800;opacity:.85;margin-bottom:4px;color:rgba(255,255,255,0.9);}
@@ -6352,15 +6953,72 @@ MACH_HTML = """
 .tco-row.total{border-top:2px solid var(--orange);margin-top:6px;padding-top:8px;font-weight:800;color:white;}
 .roi-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0;}
 .roi-stat{text-align:center;padding:18px 14px;background:rgba(255,255,255,0.1);backdrop-filter:blur(12px);border-radius:14px;border:1px solid rgba(255,255,255,0.18);}
-.roi-stat .val{font-size:1.5rem;font-weight:800;color:var(--orange);}
+.roi-stat .val{font-size:clamp(1rem,3vw,1.5rem);font-weight:800;color:var(--orange);}
 .roi-stat .lbl{font-size:.7rem;color:rgba(255,255,255,0.6);margin-top:4px;text-transform:uppercase;letter-spacing:.5px;}
 .roi-chart-wrap{position:relative;height:240px;margin-top:14px;background:rgba(0,0,0,0.2);backdrop-filter:blur(12px);border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,0.12);}
 .mach-cb{width:18px;height:18px;cursor:pointer;accent-color:var(--orange);}
-@media(max-width:768px){.tco-box,.roi-summary{grid-template-columns:1fr 1fr;}}
-@media(max-width:480px){.roi-summary{grid-template-columns:1fr;}}
+.wi-slider{width:100%;accent-color:var(--orange);cursor:pointer;height:6px;-webkit-appearance:none;appearance:none;background:rgba(255,255,255,0.15);border-radius:3px;outline:none;}
+.wi-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--orange);cursor:pointer;}
+.wi-slider::-moz-range-thumb{width:16px;height:16px;border-radius:50%;background:var(--orange);cursor:pointer;border:none;}
+.region-cb{display:inline-flex;align-items:center;gap:4px;padding:6px 12px;background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.18);border-radius:8px;font-size:.78rem;cursor:pointer;color:rgba(255,255,255,0.8);transition:all .2s;}
+.region-cb:hover{border-color:var(--orange);background:rgba(232,96,28,0.1);}
+.region-cb input{accent-color:var(--orange);cursor:pointer;}
+.cpp-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px;}
+.cpp-card{background:rgba(255,255,255,0.1);backdrop-filter:blur(12px);border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,0.18);}
+.cpp-card h4{margin:0 0 10px;color:var(--orange);font-size:.85rem;text-transform:uppercase;letter-spacing:.5px;}
+/* Responsive grid class for TCO/ROI 3-col inputs */
+.mach-input-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
+.mach-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;}
+/* Machine spec-grid scroll wrapper */
+.mach-results-scroll{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+.mach-results-scroll .spec-grid{min-width:650px;}
+/* Compare table scroll */
+.cmp-tbl-wrap{overflow-x:auto;-webkit-overflow-scrolling:touch;}
+.cmp-tbl-wrap .cmp-tbl{min-width:500px;}
+
+/* Machine tab responsive */
+.mach-tab-btn:hover{opacity:0.9;transform:translateY(-1px);}
+.mach-tab-content{animation:fadeInMach 0.3s ease;}
+@keyframes fadeInMach{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:translateY(0);}}
+
+@media(max-width:768px){
+    .tco-box{grid-template-columns:1fr;}
+    .roi-summary{grid-template-columns:repeat(2,1fr);}
+    .cpp-grid{grid-template-columns:1fr;}
+    .mach-input-grid{grid-template-columns:1fr;}
+    .mach-form-grid{grid-template-columns:1fr;}
+    .tco-card{padding:14px;}
+    .cpp-card{padding:14px;}
+    .roi-chart-wrap{height:200px;padding:12px;}
+    .roi-stat{padding:14px 10px;}
+    .theme-input{padding:10px 12px;font-size:.9rem;}
+}
+@media(max-width:480px){
+    .roi-summary{grid-template-columns:1fr;}
+    .tco-row{font-size:.78rem;flex-wrap:wrap;gap:2px;}
+    .roi-chart-wrap{height:180px;padding:10px;}
+}
 </style>
 
 <script>
+// ====== MACHINE DATABASE TAB SWITCHING ======
+function switchMachTab(tab) {
+    document.querySelectorAll('.mach-tab-content').forEach(c => c.style.display = 'none');
+    document.querySelectorAll('.mach-tab-btn').forEach(b => {
+        b.style.background = 'rgba(255,255,255,0.15)';
+        b.style.boxShadow = 'none';
+        b.classList.remove('active');
+    });
+    const target = document.getElementById('mach-tab-' + tab);
+    if (target) target.style.display = 'block';
+    const btn = document.querySelector('.mach-tab-btn[data-mtab="' + tab + '"]');
+    if (btn) {
+        btn.style.background = 'var(--orange)';
+        btn.style.boxShadow = '0 4px 12px rgba(232,96,28,0.4)';
+        btn.classList.add('active');
+    }
+}
+
 let currentResults = [];
 let selectedForCompare = [];
 let currentGeo = {currency_symbol:'€', currency_code:'EUR', euro_rate:1, electricity_rate:0, labour_monthly:0};
@@ -6398,6 +7056,9 @@ function updateCurrencyLabels() {
     el('roi_rev_lbl', 'Expected Hourly Revenue (' + sym + ')');
     el('roi_elec_lbl', 'Electricity Rate (' + sym + '/kWh)');
     el('roi_labour_lbl', 'Labour Monthly (' + sym + ')');
+    el('tco_resin_lbl', 'Resin Price (' + sym + '/kg)');
+    el('tco_labour_lbl', 'Labour Override (' + sym + '/mo, optional)');
+    el('tco_revenue_lbl', 'Hourly Revenue (' + sym + ', for ROI)');
 }
 
 async function loadProcs(cat) {
@@ -6462,12 +7123,13 @@ async function loadMachs() {
 
         let h = '<div class="card">';
         h += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:10px;">';
-        h += '<h3>Found ' + d.results.length + ' Machines</h3>';
+        h += '<h3>Found ' + (d.display_count || d.results.length) + ' Machines</h3>';
         h += '<div style="display:flex;gap:8px;">';
         h += '<button class="btn-secondary" id="compareBtn" onclick="compareSelected()" disabled>Compare Selected (0)</button>';
         h += '<button class="btn-secondary" onclick="exportMachines()">Export to Excel</button>';
         h += '</div></div>';
 
+        h += '<div class="mach-results-scroll">';
         h += '<div class="spec-grid" style="grid-template-columns:40px 2fr 1fr 1fr 1fr 1fr;border-bottom:2px solid var(--orange);font-weight:800;padding-bottom:15px;margin-bottom:10px;">';
         h += '<div></div><div>Machine Model</div><div>Price (€)</div><div>Power (kWh)</div><div>Footprint</div><div>Speed</div></div>';
 
@@ -6481,6 +7143,7 @@ async function loadMachs() {
             h += '<div><strong>' + displayName + '</strong></div><div>' + m.cost + '</div><div>' + m.power + '</div><div>' + m.sqm + '</div><div>' + (m.speed || '—') + '</div></div>';
         });
 
+        h += '</div>';
         h += '</div>';
         document.getElementById('m_res').innerHTML = h;
 
@@ -6549,7 +7212,7 @@ function renderCompare(machines) {
         {key:'speed',label:'Speed / Output',raw:'speed_raw',best:'max'},
         {key:'efficiency_score',label:'Efficiency Score',raw:'efficiency_score',best:'max'},
     ];
-    let h = '<table class="cmp-tbl"><thead><tr><th>Metric</th>';
+    let h = '<div class="cmp-tbl-wrap"><table class="cmp-tbl"><thead><tr><th>Metric</th>';
     machines.forEach(m => {
         let nm = m.model; if (m.make && !m.model.toLowerCase().startsWith(m.make.toLowerCase())) nm = m.make+' '+m.model;
         h += '<th>'+nm+'</th>';
@@ -6567,15 +7230,68 @@ function renderCompare(machines) {
         });
         h += '</tr>';
     });
-    h += '</tbody></table>';
+    h += '</tbody></table></div>';
     h += '<p style="font-size:.72rem;color:rgba(255,255,255,0.5);margin-top:8px;">Highlighted values indicate best-in-class for each metric.</p>';
     document.getElementById('compareBody').innerHTML = h;
     document.getElementById('comparePanel').style.display = 'block';
     document.getElementById('comparePanel').scrollIntoView({behavior:'smooth'});
 }
 
-// ====== TCO SIMULATOR ======
-async function runTCO() {
+// ====== RESIN PRICE AUTO-FETCH ======
+async function fetchResinPrice() {
+    const resinType = document.getElementById('tco_resin_type').value;
+    const hint = document.getElementById('tco_resin_hint');
+    if (!resinType) { if(hint) hint.textContent=''; return; }
+    try {
+        if(hint) hint.textContent='Fetching latest price…';
+        const r = await fetch('/api/resin_latest_price', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({resin_type:resinType})});
+        const d = await r.json();
+        if (d.price_per_kg > 0) {
+            document.getElementById('tco_resin_price').value = d.price_per_kg;
+            if(hint) hint.innerHTML = resinType + ' latest: ₹' + Number(d.latest_price_per_mt).toLocaleString() + '/MT (' + d.latest_date + ')';
+        } else {
+            if(hint) hint.textContent = 'No price data — enter manually';
+        }
+    } catch(e) { if(hint) hint.textContent = 'Fetch failed — enter manually'; }
+}
+
+// ====== WHAT-IF ANALYSIS ======
+let lastProcurementResult = null;
+function updateProcWhatIf() {
+    const rv = parseInt(document.getElementById('ptco_wi_resin').value);
+    const cv = parseInt(document.getElementById('ptco_wi_cycle').value);
+    const sv = parseInt(document.getElementById('ptco_wi_scrap').value);
+    document.getElementById('ptco_wi_resin_val').textContent = (rv>=0?'+':'') + rv + '%';
+    document.getElementById('ptco_wi_cycle_val').textContent = (cv>=0?'+':'') + cv + '%';
+    document.getElementById('ptco_wi_scrap_val').textContent = (sv>=0?'+':'') + sv + '%';
+
+    if (!lastProcurementResult) {
+        document.getElementById('ptco_wi_impact').textContent = 'Calculate TCO first to see what-if impact.';
+        return;
+    }
+    const base = lastProcurementResult.cost_per_part.total;
+    const baseMat = lastProcurementResult.cost_per_part.material;
+    const baseMach = lastProcurementResult.cost_per_part.machine;
+
+    // Adjust material cost by resin % and scrap %
+    const adjResin = parseFloat(document.getElementById('tco_resin_price').value) * (1 + rv/100);
+    const adjScrap = (parseFloat(document.getElementById('tco_scrap').value) || 3) * (1 + sv/100);
+    const partWt = parseFloat(document.getElementById('tco_part_weight').value) || 0.05;
+    const newMat = adjResin * partWt * (1 + adjScrap/100);
+
+    // Adjust machine cost by cycle time (inverse: faster cycle = more parts = lower per-part)
+    const cycleFactor = 1 / (1 + cv/100);
+    const newMach = baseMach * cycleFactor;
+
+    const newTotal = newMach + newMat + lastProcurementResult.cost_per_part.tooling + lastProcurementResult.cost_per_part.freight + lastProcurementResult.cost_per_part.inventory;
+    const delta = ((newTotal - base) / base * 100);
+    const sym = lastProcurementResult.currency_symbol || '€';
+    const col = delta > 0 ? '#ef4444' : delta < 0 ? '#22c55e' : 'rgba(255,255,255,0.6)';
+    document.getElementById('ptco_wi_impact').innerHTML = 'Adjusted cost/part: <strong style="color:'+col+';">' + sym + ' ' + newTotal.toFixed(4) + '</strong> (' + (delta>=0?'+':'') + delta.toFixed(1) + '% vs base ' + sym + ' ' + base.toFixed(4) + ')';
+}
+
+// ====== FULL PROCUREMENT TCO ======
+async function runProcurementTCO() {
     const body = {
         machine_cost: parseFloat(document.getElementById('tco_cost').value) || 0,
         power_kw:     parseFloat(document.getElementById('tco_power').value) || 0,
@@ -6584,49 +7300,274 @@ async function runTCO() {
         maintenance_pct: parseFloat(document.getElementById('tco_maint').value) || 5,
         depreciation_pct: parseFloat(document.getElementById('tco_depr').value) || 10,
         annual_production: parseFloat(document.getElementById('tco_pcs').value) || 1000000,
+        resin_price_per_kg: parseFloat(document.getElementById('tco_resin_price').value) || 0,
+        part_weight_kg: parseFloat(document.getElementById('tco_part_weight').value) || 0.05,
+        cycle_time_sec: parseFloat(document.getElementById('tco_cycle_time').value) || 10,
+        scrap_pct: parseFloat(document.getElementById('tco_scrap').value) || 3,
+        tooling_amort_yr: parseFloat(document.getElementById('tco_tooling').value) || 0,
+        freight_duty_per_kg: parseFloat(document.getElementById('tco_freight').value) || 0,
+        moq_holding_pct: parseFloat(document.getElementById('tco_moq').value) || 2,
+        labour_override: document.getElementById('tco_labour_override').value || null,
+        hourly_revenue: parseFloat(document.getElementById('tco_hourly_revenue').value) || 0,
     };
     if (!body.machine_cost) { alert('Enter machine cost'); return; }
     try {
-        const r = await fetch("/api/tco_simulate", {
+        const r = await fetch("/api/procurement_tco", {
             method:"POST", headers:{"Content-Type":"application/json"},
             body:JSON.stringify(body)
         });
         const d = await r.json();
         if (d.error) { alert(d.error); return; }
-        renderTCO(d);
-    } catch(err) { alert('TCO calculation failed'); }
+        lastProcurementResult = d;
+        renderProcurementTCO(d);
+        // Reset what-if sliders
+        document.getElementById('ptco_wi_resin').value = 0;
+        document.getElementById('ptco_wi_cycle').value = 0;
+        document.getElementById('ptco_wi_scrap').value = 0;
+        updateProcWhatIf();
+    } catch(err) { alert('Procurement TCO calculation failed'); }
 }
 
-function renderTCO(d) {
+function renderProcurementTCO(d) {
     const b = d.breakdown;
+    const cpp = d.cost_per_part;
+    const ann = d.annual_procurement;
     const sym = d.currency_symbol || '€';
     const code = d.currency_code || 'EUR';
     const rate = d.euro_rate || 1;
     const fmt = (v) => fmtCur(v, sym);
+    const fmtDec = (v, dec) => (sym||'€') + ' ' + Number(v).toFixed(dec||4);
     let h = '';
+
     // Conversion banner
     if (rate !== 1) {
         h += '<div style="margin-bottom:12px;padding:10px 14px;background:rgba(232,96,28,0.15);border:1px solid rgba(232,96,28,0.3);border-radius:10px;font-size:.78rem;">';
         h += '<strong style="color:var(--orange);">Currency:</strong> Machine €' + Number(b.machine_cost_eur).toLocaleString() + ' → ' + fmt(b.machine_cost_local) + ' <span style="opacity:.6;">(1 € = ' + rate + ' ' + code + ')</span>';
         h += '</div>';
     }
+
+    // Cost per Part summary
+    h += '<div style="margin-top:14px;"><div style="font-size:.72rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Cost Per Part Breakdown</div></div>';
+    h += '<div class="cpp-grid">';
+    // Card 1: per-part breakdown
+    h += '<div class="cpp-card"><h4>Cost/Part (' + code + ')</h4>';
+    h += tcoRow('Machine', fmtDec(cpp.machine));
+    h += tcoRow('Material', fmtDec(cpp.material));
+    h += tcoRow('Tooling', fmtDec(cpp.tooling));
+    h += tcoRow('Freight + Duty', fmtDec(cpp.freight));
+    h += tcoRow('Inventory Holding', fmtDec(cpp.inventory));
+    h += '<div class="tco-row total"><span>Total/Part</span><span>' + fmtDec(cpp.total) + '</span></div>';
+    h += '<div class="tco-row total"><span>Cost/kg</span><span>' + fmtDec(d.cost_per_kg, 2) + '</span></div>';
+    h += '<div class="tco-row" style="opacity:.6;"><span>Annual Parts</span><span>' + Number(d.annual_parts).toLocaleString() + '</span></div>';
+    h += '</div>';
+    // Card 2: annual costs
+    h += '<div class="cpp-card"><h4>Annual Costs (' + code + ')</h4>';
+    h += tcoRow('Machine OPEX', fmt(ann.machine_opex));
+    h += tcoRow('Material', fmt(ann.material));
+    h += tcoRow('Tooling', fmt(ann.tooling));
+    h += tcoRow('Freight', fmt(ann.freight));
+    h += tcoRow('Inventory', fmt(ann.inventory));
+    h += '<div class="tco-row total"><span>Total Annual</span><span>' + fmt(ann.total) + '</span></div>';
+    h += '</div>';
+    h += '</div>';
+
+    // Cost breakdown bar
+    const parts = [
+        {l:'Machine',v:cpp.machine,c:'#2196F3'},{l:'Material',v:cpp.material,c:'#4CAF50'},
+        {l:'Tooling',v:cpp.tooling,c:'#FF9800'},{l:'Freight',v:cpp.freight,c:'#9C27B0'},
+        {l:'Inventory',v:cpp.inventory,c:'#F44336'}
+    ];
+    const maxV = cpp.total || 1;
+    h += '<div style="margin-top:14px;background:rgba(255,255,255,0.06);border-radius:10px;padding:14px;">';
+    h += '<div style="font-size:.7rem;font-weight:800;color:rgba(255,255,255,0.6);text-transform:uppercase;margin-bottom:8px;">Cost Structure</div>';
+    h += '<div style="display:flex;height:22px;border-radius:6px;overflow:hidden;">';
+    parts.forEach(p => { const pct = (p.v/maxV*100); if(pct>0.5) h += '<div title="'+p.l+': '+pct.toFixed(1)+'%" style="width:'+pct+'%;background:'+p.c+';"></div>'; });
+    h += '</div>';
+    h += '<div style="display:flex;gap:12px;margin-top:6px;flex-wrap:wrap;">';
+    parts.forEach(p => { const pct = (p.v/maxV*100); h += '<div style="font-size:.65rem;color:rgba(255,255,255,0.6);display:flex;align-items:center;gap:3px;"><span style="width:8px;height:8px;border-radius:2px;background:'+p.c+';display:inline-block;"></span>'+p.l+' '+pct.toFixed(0)+'%</div>'; });
+    h += '</div></div>';
+
+    // 5yr / 10yr TCO cards
     h += '<div class="tco-box">';
     ['5','10'].forEach(yr => {
         const y = d.years[yr];
-        h += '<div class="tco-card"><h4>'+yr+'-Year TCO ('+code+')</h4>';
+        h += '<div class="tco-card"><h4>'+yr+'-Year Total Procurement TCO ('+code+')</h4>';
         h += tcoRow('CAPEX (Machine)', fmt(y.capex));
-        h += tcoRow('Energy ('+yr+'yr)', fmt(b.energy_annual * parseInt(yr)));
-        h += tcoRow('Labour ('+yr+'yr)', fmt(b.labour_annual * parseInt(yr)));
-        h += tcoRow('Maintenance ('+yr+'yr)', fmt(b.maintenance_annual * parseInt(yr)));
-        h += tcoRow('Depreciation ('+yr+'yr)', fmt(b.depreciation_annual * parseInt(yr)));
+        h += tcoRow('Machine OPEX ('+yr+'yr)', fmt(ann.machine_opex * parseInt(yr)));
+        h += tcoRow('Material ('+yr+'yr)', fmt(ann.material * parseInt(yr)));
+        h += tcoRow('Tooling ('+yr+'yr)', fmt(ann.tooling * parseInt(yr)));
+        h += tcoRow('Freight ('+yr+'yr)', fmt(ann.freight * parseInt(yr)));
+        h += tcoRow('Inventory ('+yr+'yr)', fmt(ann.inventory * parseInt(yr)));
         h += '<div class="tco-row total"><span>Total Cost</span><span>'+fmt(y.total)+'</span></div>';
         h += '<div class="tco-row total"><span>Per Year</span><span>'+fmt(y.per_year)+'</span></div>';
         h += '<div class="tco-row total"><span>Per 1,000 pcs</span><span>'+fmt(y.per_1000_pcs)+'</span></div>';
         h += '</div>';
     });
     h += '</div>';
+
+    // ROI / Payback (if hourly revenue was provided)
+    if (d.roi && d.roi.payback_months !== -1) {
+        h += '<div style="margin-top:18px;"><div style="font-size:.72rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">ROI & Payback</div></div>';
+        h += '<div class="roi-summary">';
+        h += roiStat(d.roi.payback_months > 0 ? d.roi.payback_months + ' mo' : 'N/A', 'Payback Period');
+        h += roiStat(d.roi.annual_roi_pct + '%', 'Annual ROI');
+        h += roiStat(fmt(d.roi.monthly_profit), 'Monthly Profit');
+        h += roiStat(fmt(d.roi.monthly_revenue), 'Monthly Revenue');
+        h += '</div>';
+        if (d.roi.chart && d.roi.chart.length > 0) {
+            h += '<div class="roi-chart-wrap"><canvas id="roiChart" style="width:100%;height:100%;"></canvas></div>';
+        }
+    }
+
     if (b.electricity_rate) h += '<p style="font-size:.72rem;color:rgba(255,255,255,0.5);margin-top:8px;">Geo data: electricity '+b.electricity_rate+' '+sym+'/kWh, operator '+fmt(b.labour_monthly)+'/mo</p>';
     document.getElementById('tco_result').innerHTML = h;
+
+    // Draw breakeven chart if applicable
+    if (d.roi && d.roi.chart && d.roi.chart.length > 0) {
+        setTimeout(() => drawBreakevenChart(d.roi.chart, d.roi.payback_months, sym), 50);
+    }
+
+    // Build supplier comparison from machine compare data if available
+    buildSupplierCompare(d);
+}
+
+// ====== SUPPLIER COMPARISON TABLE ======
+function buildSupplierCompare(d) {
+    // If user selected machines for compare, build a supplier cost table
+    if (selectedForCompare.length < 2) {
+        document.getElementById('supplierCompareCard').style.display = 'none';
+        return;
+    }
+    const machines = selectedForCompare.map(i => currentResults[i]);
+    const sym = d.currency_symbol || '€';
+    const rate = d.euro_rate || 1;
+    const resinPrice = parseFloat(document.getElementById('tco_resin_price').value) || 0;
+    const partWt = parseFloat(document.getElementById('tco_part_weight').value) || 0.05;
+    const scrapPct = (parseFloat(document.getElementById('tco_scrap').value) || 3) / 100;
+    const annualPcs = d.annual_parts || 1000000;
+    const cycleSec = parseFloat(document.getElementById('tco_cycle_time').value) || 10;
+    const uptimePct = (parseFloat(document.getElementById('tco_uptime').value) || 75) / 100;
+    const runHrs = 8760 * uptimePct;
+    const elecRate = d.breakdown.electricity_rate;
+    const labourMo = d.breakdown.labour_monthly;
+    const maintPct = (parseFloat(document.getElementById('tco_maint').value) || 5) / 100;
+    const deprPct = (parseFloat(document.getElementById('tco_depr').value) || 10) / 100;
+
+    let h = '<div class="cmp-tbl-wrap"><table class="cmp-tbl"><thead><tr><th>Metric</th>';
+    machines.forEach(m => {
+        let nm = m.model; if (m.make && !m.model.toLowerCase().startsWith(m.make.toLowerCase())) nm = m.make+' '+m.model;
+        h += '<th>'+nm+'</th>';
+    });
+    h += '</tr></thead><tbody>';
+
+    const supplierData = machines.map(m => {
+        const costLocal = (m.cost_raw || 0) * rate;
+        const powerKw = m.power_raw || 0;
+        const energyAnn = powerKw * runHrs * elecRate;
+        const labourAnn = labourMo * 12 * 3;
+        const maintAnn = costLocal * maintPct;
+        const deprAnn = costLocal * deprPct;
+        const machOpex = energyAnn + labourAnn + maintAnn + deprAnn;
+        const machPerPart = annualPcs > 0 ? machOpex / annualPcs : 0;
+        const matPerPart = resinPrice * partWt * (1 + scrapPct);
+        const totalPerPart = machPerPart + matPerPart;
+        return {machine_cost: costLocal, power: powerKw, machine_per_part: machPerPart, material_per_part: matPerPart, total_per_part: totalPerPart, annual_cost: totalPerPart * annualPcs};
+    });
+
+    const metrics = [
+        {l: 'Machine Cost (' + sym + ')', key: 'machine_cost', best: 'min', fmt: v => fmtCur(v, sym)},
+        {l: 'Machine Cost/Part', key: 'machine_per_part', best: 'min', fmt: v => sym + ' ' + v.toFixed(4)},
+        {l: 'Material Cost/Part', key: 'material_per_part', best: 'min', fmt: v => sym + ' ' + v.toFixed(4)},
+        {l: 'Total Cost/Part', key: 'total_per_part', best: 'min', fmt: v => sym + ' ' + v.toFixed(4)},
+        {l: 'Annual Total', key: 'annual_cost', best: 'min', fmt: v => fmtCur(v, sym)},
+    ];
+
+    metrics.forEach(mt => {
+        const vals = supplierData.map(s => s[mt.key]);
+        const bestVal = Math.min(...vals.filter(v => v > 0));
+        h += '<tr><td style="font-weight:700;">'+mt.l+'</td>';
+        supplierData.forEach(s => {
+            const v = s[mt.key];
+            const cls = v === bestVal && v > 0 ? ' class="best"' : '';
+            h += '<td'+cls+'>'+mt.fmt(v)+'</td>';
+        });
+        h += '</tr>';
+    });
+    h += '</tbody></table></div>';
+    document.getElementById('supplierCompareBody').innerHTML = h;
+    document.getElementById('supplierCompareCard').style.display = 'block';
+}
+
+// ====== REGION COMPARISON ======
+async function runRegionCompare() {
+    const boxes = document.querySelectorAll('#regionCheckboxes input:checked');
+    const countries = Array.from(boxes).map(b => b.value);
+    if (countries.length < 2) { alert('Select at least 2 regions'); return; }
+
+    const baseParams = {
+        machine_cost: parseFloat(document.getElementById('tco_cost').value) || 0,
+        power_kw: parseFloat(document.getElementById('tco_power').value) || 0,
+        uptime_pct: parseFloat(document.getElementById('tco_uptime').value) || 75,
+        maintenance_pct: parseFloat(document.getElementById('tco_maint').value) || 5,
+        depreciation_pct: parseFloat(document.getElementById('tco_depr').value) || 10,
+        annual_production: parseFloat(document.getElementById('tco_pcs').value) || 1000000,
+        resin_price_per_kg: parseFloat(document.getElementById('tco_resin_price').value) || 0,
+        part_weight_kg: parseFloat(document.getElementById('tco_part_weight').value) || 0.05,
+        scrap_pct: parseFloat(document.getElementById('tco_scrap').value) || 3,
+        tooling_amort_yr: parseFloat(document.getElementById('tco_tooling').value) || 0,
+        freight_duty_per_kg: parseFloat(document.getElementById('tco_freight').value) || 0,
+        moq_holding_pct: parseFloat(document.getElementById('tco_moq').value) || 2,
+    };
+    if (!baseParams.machine_cost) { alert('Enter machine cost first'); return; }
+
+    try {
+        const r = await fetch('/api/procurement_region_compare', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({countries, base_params: baseParams})
+        });
+        const d = await r.json();
+        if (d.error) { alert(d.error); return; }
+        renderRegionCompare(d.regions);
+    } catch(e) { alert('Region comparison failed'); }
+}
+
+function renderRegionCompare(regions) {
+    if (!regions || regions.length === 0) { document.getElementById('regionCompareBody').innerHTML = '<p>No data</p>'; return; }
+    let h = '<div class="cmp-tbl-wrap"><table class="cmp-tbl"><thead><tr><th>Country</th><th>Elec. Rate</th><th>Labour/mo</th><th>Cost/Part (€)</th><th>Annual Total (€)</th></tr></thead><tbody>';
+    const bestCpp = Math.min(...regions.map(r => r.cost_per_part_eur).filter(v => v > 0));
+    regions.forEach(r => {
+        const isBest = r.cost_per_part_eur === bestCpp && r.cost_per_part_eur > 0;
+        h += '<tr>';
+        h += '<td style="font-weight:700;">' + r.country + ' <span style="opacity:.5;font-size:.7rem;">(' + r.currency_code + ')</span></td>';
+        h += '<td>' + r.electricity_rate + ' ' + r.currency_symbol + '/kWh</td>';
+        h += '<td>' + r.currency_symbol + ' ' + Number(r.labour_monthly).toLocaleString() + '</td>';
+        h += '<td' + (isBest ? ' class="best"' : '') + '>€ ' + r.cost_per_part_eur.toFixed(4) + '</td>';
+        h += '<td' + (isBest ? ' class="best"' : '') + '>€ ' + Number(r.annual_total_eur).toLocaleString() + '</td>';
+        h += '</tr>';
+    });
+    h += '</tbody></table></div>';
+    document.getElementById('regionCompareBody').innerHTML = h;
+}
+
+// ====== EXPORT PROCUREMENT TCO ======
+async function exportProcurement() {
+    if (!lastProcurementResult) { alert('Calculate TCO first'); return; }
+    try {
+        const r = await fetch('/api/procurement_export', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify(lastProcurementResult)
+        });
+        if (!r.ok) throw new Error('Export failed');
+        const blob = await r.blob();
+        const url = window.URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'procurement_tco_' + new Date().getTime() + '.xlsx';
+        document.body.appendChild(a);
+        a.click();
+        window.URL.revokeObjectURL(url);
+        document.body.removeChild(a);
+    } catch(e) { alert('Export failed'); }
 }
 
 function tcoRow(l,v){return '<div class="tco-row"><span>'+l+'</span><span>'+v+'</span></div>';}
@@ -6771,8 +7712,18 @@ async function loadTCOCountries() {
         const r = await fetch("/api/init", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({module:"costs"})});
         const countries = await r.json();
         const sel = document.getElementById('tco_country');
+        const regionDiv = document.getElementById('regionCheckboxes');
         if (sel && Array.isArray(countries)) {
             countries.forEach(c => { const o=document.createElement('option');o.value=c;o.text=c;sel.add(o); });
+        }
+        // Populate region checkboxes
+        if (regionDiv && Array.isArray(countries)) {
+            countries.forEach(c => {
+                const lbl = document.createElement('label');
+                lbl.className = 'region-cb';
+                lbl.innerHTML = '<input type="checkbox" value="'+c+'"> '+c;
+                regionDiv.appendChild(lbl);
+            });
         }
     } catch(e) { console.warn('Could not load TCO countries'); }
 }
@@ -6903,8 +7854,8 @@ CALC_HTML = """
 .legend-green { background: rgba(76, 175, 80, 0.4); border: 1px solid #4CAF50; }
 .legend-grey { background: rgba(255,255,255,0.15); border: 1px solid rgba(255,255,255,0.3); }
 
-.universal-tab-navigation { display: flex; gap: 10px; margin-bottom: 20px; background: rgba(255,255,255,0.1); padding: 10px; border-radius: 15px; }
-.universal-tab-btn { flex: 1; padding: 15px 25px; background: rgba(255,255,255,0.15); border: none; border-radius: 10px; color: white; font-family: 'Outfit', sans-serif; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.3s; }
+.universal-tab-navigation { display: flex; gap: 10px; margin-bottom: 20px; background: rgba(255,255,255,0.1); padding: 10px; border-radius: 15px; flex-wrap: wrap; }
+.universal-tab-btn { flex: 1; padding: 15px 25px; background: rgba(255,255,255,0.15); border: none; border-radius: 10px; color: white; font-family: 'Outfit', sans-serif; font-size: 1rem; font-weight: 600; cursor: pointer; transition: all 0.3s; min-width: 0; }
 .universal-tab-btn:hover { background: rgba(255,255,255,0.25); }
 .universal-tab-btn.active { background: var(--orange); box-shadow: 0 5px 15px rgba(232, 96, 28, 0.4); }
 .calculator-view { display: none; }
@@ -6934,50 +7885,41 @@ CALC_HTML = """
 /* Mobile-first responsive breakpoints */
 @media screen and (max-width: 768px) {
     .container { padding: 10px !important; max-width: 100% !important; }
-    .card { margin-bottom: 15px !important; padding: 12px !important; }
-    .tab-container { flex-wrap: wrap !important; gap: 8px !important; }
-    .tab { flex: 1 1 calc(50% - 8px) !important; min-width: 120px !important; font-size: 0.85rem !important; padding: 10px 8px !important; }
-    .sub-tab-container { flex-wrap: wrap !important; gap: 6px !important; }
-    .sub-tab { flex: 1 1 calc(50% - 6px) !important; min-width: 100px !important; font-size: 0.8rem !important; padding: 8px 6px !important; }
-    .input-grid { grid-template-columns: 1fr !important; gap: 12px !important; }
-    .input-row { flex-direction: column !important; gap: 10px !important; }
-    .input-group { width: 100% !important; margin-bottom: 12px !important; }
-    .input-group label { font-size: 0.85rem !important; margin-bottom: 4px !important; }
-    .input-group input, .input-group select { font-size: 0.9rem !important; padding: 10px !important; width: 100% !important; }
-    .btn { width: 100% !important; margin-bottom: 10px !important; padding: 12px !important; font-size: 0.95rem !important; }
-    .btn-group { flex-direction: column !important; gap: 10px !important; }
-    .btn-group .btn { width: 100% !important; }
-    .summary-grid { grid-template-columns: 1fr !important; gap: 10px !important; }
-    .summary-item { padding: 10px !important; }
-    .summary-item h3 { font-size: 0.85rem !important; }
-    .summary-item .value { font-size: 1.2rem !important; }
-    .table-container { overflow-x: auto !important; -webkit-overflow-scrolling: touch !important; margin: 10px -12px !important; padding: 0 12px !important; }
-    table { min-width: 600px !important; font-size: 0.8rem !important; }
-    table th, table td { padding: 8px 6px !important; white-space: nowrap !important; }
-    .chart-container { width: 100% !important; height: auto !important; min-height: 300px !important; overflow-x: auto !important; }
-    canvas { max-width: 100% !important; height: auto !important; }
-    #whatif-controls { flex-direction: column !important; }
-    .slider-group { width: 100% !important; margin-bottom: 15px !important; }
-    #country-checkboxes { grid-template-columns: 1fr !important; max-height: 250px !important; }
-    .country-checkbox { font-size: 0.85rem !important; padding: 8px !important; }
-    #flex-layers .layer-card { padding: 10px !important; }
-    #flex-layers .input-grid { grid-template-columns: 1fr !important; }
-    #results-section { padding: 12px !important; }
-    .breakdown-section { margin-bottom: 15px !important; }
-    .cost-item { font-size: 0.85rem !important; padding: 6px !important; }
-    .modal-content { width: 95% !important; max-width: 95% !important; margin: 20px auto !important; padding: 15px !important; }
-    .modal h2 { font-size: 1.2rem !important; }
-    header h1 { font-size: 1.5rem !important; }
-    .header-actions { flex-direction: column !important; gap: 8px !important; }
-    #sku-controls-container { flex-direction: column !important; gap: 10px !important; }
-    #sku-controls-container select, #sku-controls-container input, #sku-controls-container button { width: 100% !important; }
+    .card { margin-bottom: 15px !important; padding: 14px !important; }
+    .universal-tab-navigation { gap: 6px; padding: 6px; border-radius: 10px; }
+    .universal-tab-btn { padding: 10px 8px; font-size: 0.78rem; border-radius: 8px; text-align: center; }
+    .sub-tabs { gap: 0; flex-wrap: wrap; }
+    .sub-tab-btn { flex: 1; min-width: 120px; padding: 8px 12px; font-size: 0.85rem; text-align: center; }
     .calc-layout { grid-template-columns: 1fr !important; }
+    .calc-row { grid-template-columns: 1fr 0.4fr 1fr; gap: 6px; margin-bottom: 6px; }
+    .calc-row label { font-size: 0.8rem; }
+    .calc-input { padding: 7px 10px; font-size: 0.85rem; }
+    .summary-card { padding: 16px; border-radius: 12px; }
+    .summary-row { font-size: 0.85rem; padding: 8px 0; }
+    .summary-total .value { font-size: clamp(1rem, 3vw, 1.3rem); }
+    .legend { gap: 12px; flex-wrap: wrap; font-size: 0.75rem; }
+    .flex-layer-block { padding: 12px; }
+    .login-overlay { padding: 25px 15px; }
+    .login-input { margin-right: 0; margin-bottom: 8px; width: 100%; }
+    #sku-controls-container { padding: 12px !important; }
+    #sku-controls-container > div { flex-direction: column !important; gap: 10px !important; }
+    #sku-controls-container > div > div:last-child { margin-top: 0 !important; width: 100%; }
+    #sku-controls-container > div > div:last-child button { flex: 1; }
+    .model-view .card { padding: 14px !important; }
+    /* Chart containers */
+    #carton-donut, #flex-donut, #ebm-donut, #ca-donut { min-height: 250px; }
+    /* Multi-country comparison */
+    .mc-grid { grid-template-columns: 1fr !important; }
+}
+@media screen and (max-width: 480px) {
+    .calc-row { grid-template-columns: 1fr; gap: 2px; }
+    .calc-row .unit { text-align: left; font-size: 0.7rem; }
+    .universal-tab-btn { font-size: 0.72rem; padding: 8px 4px; }
+    .sub-tab-btn { font-size: 0.78rem; padding: 8px 8px; }
 }
 @media screen and (min-width: 769px) and (max-width: 1024px) {
-    .input-grid { grid-template-columns: repeat(2, 1fr) !important; }
-    .tab { flex: 1 1 auto !important; min-width: 100px !important; }
-    .summary-grid { grid-template-columns: repeat(2, 1fr) !important; }
-    #country-checkboxes { grid-template-columns: repeat(2, 1fr) !important; }
+    .universal-tab-btn { font-size: 0.88rem; padding: 12px 15px; }
+    .calc-layout { grid-template-columns: 1fr 1fr; }
 }
 </style>
 
@@ -8229,7 +9171,7 @@ function updateWhatIf() {
     
     let h = '<div class="card">';
     h += '<h3 style="margin-bottom:15px;">Scenario Impact</h3>';
-    h += '<div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:15px;text-align:center;margin-bottom:20px;">';
+    h += '<div class="mc-grid" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:15px;text-align:center;margin-bottom:20px;">';
     h += '<div style="background:rgba(255,255,255,0.08);padding:15px;border-radius:10px;"><div style="font-size:0.75rem;opacity:0.6;">BASE COST</div><div style="font-size:1.3rem;font-weight:800;">' + unitLabel.charAt(0) + ' ' + fmt(baseTotal) + '</div></div>';
     h += '<div style="background:rgba(255,255,255,0.08);padding:15px;border-radius:10px;"><div style="font-size:0.75rem;opacity:0.6;">NEW COST</div><div style="font-size:1.3rem;font-weight:800;color:' + clr + ';">' + unitLabel.charAt(0) + ' ' + fmt(newTotal) + '</div></div>';
     h += '<div style="background:rgba(255,255,255,0.08);padding:15px;border-radius:10px;"><div style="font-size:0.75rem;opacity:0.6;">IMPACT</div><div style="font-size:1.3rem;font-weight:800;color:' + clr + ';">' + (diff>=0?'+':'') + fmt(diff) + ' (' + diffPct.toFixed(1) + '%)</div></div>';
@@ -8397,7 +9339,7 @@ function renderCartonAdvSummary(d) {
     let h = '<h3 style="margin-bottom:15px;">Advanced Carton Cost Model</h3>';
     h += '<p style="opacity:0.6; font-size:0.75rem; margin-bottom:15px;">INR per 1000 Cartons | ' + d.country + '</p>';
     
-    h += '<div style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:20px;">';
+    h += '<div class="mc-grid" style="display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-bottom:20px;">';
     h += '<div style="background:rgba(76,175,80,0.15); padding:12px; border-radius:10px; text-align:center;"><div style="font-size:0.7rem; opacity:0.7;">TOTAL COST</div><div style="font-size:1.4rem; font-weight:800; color:#4CAF50;">₹ ' + fmt(d.total_cost_per_1000) + '</div></div>';
     h += '<div style="background:rgba(33,150,243,0.15); padding:12px; border-radius:10px; text-align:center;"><div style="font-size:0.7rem; opacity:0.7;">EUR / 1000</div><div style="font-size:1.4rem; font-weight:800; color:#2196F3;">€ ' + fmt(d.total_cost_per_1000_eur) + '</div></div>';
     h += '<div style="background:rgba(255,152,0,0.15); padding:12px; border-radius:10px; text-align:center;"><div style="font-size:0.7rem; opacity:0.7;">UPS/SHEET</div><div style="font-size:1.4rem; font-weight:800; color:#FF9800;">' + d.ups_per_sheet + '</div></div>';
