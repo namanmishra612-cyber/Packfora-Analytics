@@ -1,9 +1,3 @@
-"""
-Packfora Analytics - Final Version with Admin Panel
-No external dependencies (RSS removed) - Works on FREE hosting!
-Upload Excel files via web browser - No server access needed
-"""
-
 from flask import Flask, render_template_string, request, jsonify, send_file, redirect, session, flash
 from flask_cors import CORS
 from werkzeug.utils import secure_filename
@@ -17,6 +11,11 @@ from functools import wraps
 import logging
 import shutil
 import json
+import uuid
+import hashlib
+import ast
+import operator
+import math
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 try:
@@ -35,11 +34,20 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 RESIN_EXCEL = Path(os.getenv('RESIN_DATABASE_PATH', DATA_DIR / "resin-data.xlsx"))
 MACHINE_EXCEL = Path(os.getenv('MACHINE_DATABASE_PATH', DATA_DIR / "machine-database.xlsx"))
 VAR_COST_EXCEL = Path(os.getenv('VARIABLE_COST_PATH', DATA_DIR / "variables-geo.xlsx"))
+GLOBAL_MATERIAL_EXCEL = Path(os.getenv('GLOBAL_MATERIAL_PATH', DATA_DIR / "global-material-data.xlsx"))
 
 # Backup directory
 BACKUP_DIR = DATA_DIR / "backups"
 
 BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+
+# Custom cost models directory
+MODELS_DIR = DATA_DIR / "cost_models"
+MODELS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Share links directory
+SHARES_DIR = DATA_DIR / "shares"
+SHARES_DIR.mkdir(parents=True, exist_ok=True)
 
 
 # Application constants
@@ -50,6 +58,33 @@ CACHE_EXPIRY_MINUTES = 5
 # Admin credentials (CHANGE THESE!)
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'packfora')
 ADMIN_PASSWORD = os.getenv('ADMIN_PASSWORD', 'packfora123')
+
+# ================= USERS DATABASE (JSON file) =================
+USERS_DB_PATH = DATA_DIR / "users.json"
+
+def _load_users():
+    """Load users from JSON file, create defaults if missing."""
+    defaults = {
+        "packfora":  {"password": "packfora123", "role": "admin"},
+        "analyst":   {"password": "analyst123",  "role": "analyst"},
+        "viewer":    {"password": "viewer123",   "role": "viewer"},
+    }
+    if USERS_DB_PATH.exists():
+        try:
+            with open(USERS_DB_PATH, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    # Write defaults
+    _save_users(defaults)
+    return defaults
+
+def _save_users(users):
+    with open(USERS_DB_PATH, 'w') as f:
+        json.dump(users, f, indent=2)
+
+# Roles hierarchy: admin > analyst > viewer
+ROLE_HIERARCHY = {'admin': 3, 'analyst': 2, 'viewer': 1}
 
 # File upload settings
 ALLOWED_EXTENSIONS = {'xlsx', 'xls', 'pdf'}
@@ -106,31 +141,145 @@ COUNTRY_LOCATION_MAP = {
     ],
 }
 
-# Country → currency mapping for TCO/ROI display
+# ================= GLOBAL MATERIAL TRACKER — CURRENCY & EXCHANGE RATES =================
 COUNTRY_CURRENCY_MAP = {
-    'India': {'symbol': '₹', 'code': 'INR'},
-    'China': {'symbol': '¥', 'code': 'CNY'},
-    'Indonesia': {'symbol': 'Rp', 'code': 'IDR'},
-    'Brazil': {'symbol': 'R$', 'code': 'BRL'},
-    'United States': {'symbol': '$', 'code': 'USD'},
-    'United Kingdom': {'symbol': '£', 'code': 'GBP'},
-    'Germany': {'symbol': '€', 'code': 'EUR'},
-    'France': {'symbol': '€', 'code': 'EUR'},
-    'Spain': {'symbol': '€', 'code': 'EUR'},
-    'Turkey': {'symbol': '₺', 'code': 'TRY'},
-    'Vietnam': {'symbol': '₫', 'code': 'VND'},
-    'Mexico': {'symbol': 'MX$', 'code': 'MXN'},
-    'Pakistan': {'symbol': 'Rs', 'code': 'PKR'},
-    'Philippines': {'symbol': '₱', 'code': 'PHP'},
-    'South Africa': {'symbol': 'R', 'code': 'ZAR'},
-    'Poland': {'symbol': 'zł', 'code': 'PLN'},
-    'Thailand': {'symbol': '฿', 'code': 'THB'},
-    'Bangladesh': {'symbol': '৳', 'code': 'BDT'},
-    'Sri Lanka': {'symbol': 'Rs', 'code': 'LKR'},
-    'Argentina': {'symbol': 'AR$', 'code': 'ARS'},
-    'Canada': {'symbol': 'C$', 'code': 'CAD'},
-    'Costa Rica': {'symbol': '₡', 'code': 'CRC'},
+    'India': ('INR', '₹'), 'China': ('CNY', '¥'), 'USA': ('USD', '$'),
+    'United States': ('USD', '$'), 'North America': ('USD', '$'),
+    'Germany': ('EUR', '€'), 'France': ('EUR', '€'), 'Italy': ('EUR', '€'),
+    'Spain': ('EUR', '€'), 'Netherlands': ('EUR', '€'), 'Belgium': ('EUR', '€'),
+    'Poland': ('PLN', 'zł'), 'UK': ('GBP', '£'), 'United Kingdom': ('GBP', '£'),
+    'Japan': ('JPY', '¥'), 'South Korea': ('KRW', '₩'),
+    'Indonesia': ('IDR', 'Rp'), 'Thailand': ('THB', '฿'), 'Vietnam': ('VND', '₫'),
+    'Malaysia': ('MYR', 'RM'), 'Philippines': ('PHP', '₱'), 'Phillipines': ('PHP', '₱'),
+    'Singapore': ('SGD', 'S$'), 'Taiwan': ('TWD', 'NT$'),
+    'Turkey': ('TRY', '₺'), 'Brazil': ('BRL', 'R$'), 'Mexico': ('MXN', 'Mex$'),
+    'Canada': ('CAD', 'C$'), 'Australia': ('AUD', 'A$'), 'New Zealand': ('NZD', 'NZ$'),
+    'Russia': ('RUB', '₽'), 'Saudi Arabia': ('SAR', 'SAR'), 'Dubai': ('AED', 'AED'),
+    'UAE': ('AED', 'AED'), 'Middle East': ('USD', '$'),
+    'South Africa': ('ZAR', 'R'), 'West Africa': ('USD', '$'),
+    'Egypt': ('EGP', 'E£'), 'Maghreb': ('USD', '$'),
+    'Pakistan': ('PKR', '₨'), 'Bangladesh': ('BDT', '৳'), 'Srilanka': ('LKR', 'Rs'),
+    'Argentina': ('ARS', 'AR$'), 'Colombia': ('COP', 'COL$'), 'Chile': ('CLP', 'CLP$'),
+    'Ukraine': ('UAH', '₴'), 'Ukrain': ('UAH', '₴'),
+    'SEAA': ('USD', '$'), 'PH VN ANZ': ('USD', '$'), 'NALI - Egypt': ('EGP', 'E£'),
+    'NAMETRUB': ('USD', '$'), 'North Asia': ('USD', '$'), 'North East Asia': ('USD', '$'),
 }
+
+# Fallback exchange rates (EUR as base) — used when live API unavailable
+_FALLBACK_RATES_EUR = {
+    'EUR': 1.0, 'USD': 1.08, 'GBP': 0.86, 'INR': 90.5, 'CNY': 7.85,
+    'JPY': 163.5, 'KRW': 1445.0, 'IDR': 17100.0, 'THB': 37.8,
+    'VND': 26800.0, 'MYR': 5.05, 'PHP': 60.5, 'SGD': 1.46, 'TWD': 34.5,
+    'TRY': 34.8, 'BRL': 5.55, 'MXN': 18.5, 'CAD': 1.48, 'AUD': 1.67,
+    'NZD': 1.82, 'RUB': 99.5, 'SAR': 4.05, 'AED': 3.97, 'ZAR': 20.2,
+    'EGP': 52.5, 'PLN': 4.32, 'PKR': 300.0, 'BDT': 128.0, 'LKR': 320.0,
+    'ARS': 950.0, 'COP': 4250.0, 'CLP': 1020.0, 'UAH': 44.0, 'NGN': 1650.0,
+    'CHF': 0.96, 'SEK': 11.3, 'NOK': 11.7, 'DKK': 7.46, 'HUF': 395.0,
+}
+
+_fx_cache = {'rates': None, 'ts': None}
+
+def _get_fx_rates():
+    """Get EUR-base exchange rates. Tries live API → variable-cost DB → fallback."""
+    now = datetime.now()
+    if _fx_cache['rates'] and _fx_cache['ts'] and (now - _fx_cache['ts']).total_seconds() < 21600:
+        return _fx_cache['rates']
+    rates = dict(_FALLBACK_RATES_EUR)
+    # Try free live API
+    try:
+        import urllib.request
+        with urllib.request.urlopen(
+            urllib.request.Request("https://open.er-api.com/v6/latest/EUR",
+                                  headers={'User-Agent': 'Packfora/1.0'}), timeout=5
+        ) as resp:
+            api = json.loads(resp.read().decode())
+            if api.get('result') == 'success' and 'rates' in api:
+                rates.update(api['rates'])
+                logger.info("FX rates fetched from open.er-api.com")
+    except Exception as e:
+        logger.info(f"Live FX API unavailable ({e}), using fallbacks")
+    # Enrich from variable-cost DB euro column
+    try:
+        df = load_excel_cached('cost', sheet_name="Data", header=9)
+        if df is not None:
+            df.columns = [str(c).strip() for c in df.columns]
+            for col in df.columns:
+                if 'euro' in col.lower():
+                    for _, row in df.iterrows():
+                        country = str(row.iloc[0]).strip()
+                        ci = COUNTRY_CURRENCY_MAP.get(country)
+                        if ci:
+                            try:
+                                v = float(row[col])
+                                if v > 0:
+                                    rates[ci[0]] = v
+                            except:
+                                pass
+                    break
+    except:
+        pass
+    _fx_cache['rates'] = rates
+    _fx_cache['ts'] = now
+    return rates
+
+def _country_ccy(country):
+    """Return (code, symbol) for a country/region string."""
+    ci = COUNTRY_CURRENCY_MAP.get(country)
+    if ci:
+        return ci
+    for k, v in COUNTRY_CURRENCY_MAP.items():
+        if k.upper() in country.upper() or country.upper() in k.upper():
+            return v
+    return ('EUR', '€')
+
+# ================= GLOBAL MATERIAL DATA LOADER =================
+_gm_cache = {'df': None, 'mtime': None}
+
+def _load_global_material_df():
+    """Load and cache the global material data from Excel."""
+    if not GLOBAL_MATERIAL_EXCEL.exists():
+        return None
+    mtime = GLOBAL_MATERIAL_EXCEL.stat().st_mtime
+    if _gm_cache['df'] is not None and _gm_cache['mtime'] == mtime:
+        return _gm_cache['df']
+    logger.info("Loading global material data from disk")
+    df = pd.read_excel(GLOBAL_MATERIAL_EXCEL, header=0)
+    df.columns = [str(c).strip() for c in df.columns]
+    # Standardise column names
+    rename = {}
+    for c in df.columns:
+        cl = c.lower().strip()
+        if cl == 'region/country':
+            rename[c] = 'Country'
+        elif cl == 'data source':
+            rename[c] = 'Source'
+        elif cl == 'uom':
+            rename[c] = 'UOM'
+    df = df.rename(columns=rename)
+    _gm_cache['df'] = df
+    _gm_cache['mtime'] = mtime
+    return df
+
+def _gm_quarter_cols(df):
+    """Return list of quarter column names (e.g. Q1'26, Q2'26...) in order."""
+    meta = {'Commodity', 'Portfolio', 'Country', 'Currency', 'UOM', 'Source', 'Index',
+            'Region/Country', 'Data Source'}
+    qcols = [c for c in df.columns if c not in meta and not str(c).startswith('Unnamed')]
+    # Filter to only columns that look like quarters or FY
+    result = []
+    for c in qcols:
+        cs = str(c).strip()
+        if cs.upper().startswith(('Q1', 'Q2', 'Q3', 'Q4', 'FY')):
+            result.append(c)
+        else:
+            # Try numeric — could be a date
+            try:
+                float(cs)
+                continue  # skip pure numbers that aren't quarter labels
+            except:
+                result.append(c)
+    return result if result else qcols
+
 
 def detect_resin_type(text):
     """Detect resin type from text using regex patterns.
@@ -175,25 +324,41 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # File modification tracking
-file_mod_times = {'resin': None, 'machine': None, 'cost': None}
+file_mod_times = {'resin': None, 'machine': None, 'cost': None, 'global_material': None}
 
 # In-memory cache for Excel data
 data_cache = {
     'resin': {'data': None, 'timestamp': None},
     'machine': {'data': None, 'timestamp': None},
-    'cost': {'data': None, 'timestamp': None}
+    'cost': {'data': None, 'timestamp': None},
+    'global_material': {'data': None, 'timestamp': None}
 }
 
 # ================= ADMIN AUTHENTICATION =================
 
 def login_required(f):
-    """Decorator to require admin login"""
+    """Decorator to require any authenticated user"""
     @wraps(f)
     def decorated_function(*args, **kwargs):
         if 'logged_in' not in session:
             return redirect('/admin/login')
         return f(*args, **kwargs)
     return decorated_function
+
+def role_required(*allowed_roles):
+    """Decorator to require specific roles. Usage: @role_required('admin', 'analyst')"""
+    def decorator(f):
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if 'logged_in' not in session:
+                return redirect('/admin/login')
+            user_role = session.get('role', 'viewer')
+            if user_role not in allowed_roles:
+                flash('Access denied. Insufficient permissions.', 'error')
+                return redirect('/')
+            return f(*args, **kwargs)
+        return decorated_function
+    return decorator
 
 def allowed_file(filename):
     """Check if file extension is allowed"""
@@ -252,7 +417,7 @@ def get_file_mod_time(file_path):
 
 def check_file_updated(file_type):
     """Check if Excel file has been updated"""
-    file_map = {'resin': RESIN_EXCEL, 'machine': MACHINE_EXCEL, 'cost': VAR_COST_EXCEL}
+    file_map = {'resin': RESIN_EXCEL, 'machine': MACHINE_EXCEL, 'cost': VAR_COST_EXCEL, 'global_material': GLOBAL_MATERIAL_EXCEL}
     
     file_path = file_map.get(file_type)
     if not file_path:
@@ -292,7 +457,7 @@ def load_excel_cached(file_type, sheet_name=None, header=None):
             logger.info(f"Using cached data for {file_type}")
             return data_cache[file_type]['data']
     
-    file_map = {'resin': RESIN_EXCEL, 'machine': MACHINE_EXCEL, 'cost': VAR_COST_EXCEL}
+    file_map = {'resin': RESIN_EXCEL, 'machine': MACHINE_EXCEL, 'cost': VAR_COST_EXCEL, 'global_material': GLOBAL_MATERIAL_EXCEL}
     file_path = file_map[file_type]
     
     try:
@@ -526,10 +691,8 @@ def get_country_geo_data(country):
     if not country:
         return result
 
-    # Currency lookup
-    cur = COUNTRY_CURRENCY_MAP.get(country, {'symbol': '€', 'code': 'EUR'})
-    result['currency_symbol'] = cur['symbol']
-    result['currency_code'] = cur['code']
+    result['currency_symbol'] = '€'
+    result['currency_code'] = 'EUR'
 
     try:
         df = load_excel_cached('cost', sheet_name="Data", header=9)
@@ -569,16 +732,22 @@ def get_country_geo_data(country):
 
 @app.route("/admin/login", methods=["GET", "POST"])
 def admin_login():
-    """Admin login page"""
+    """User login page (all roles)"""
     if request.method == "POST":
-        username = request.form.get('username')
-        password = request.form.get('password')
+        username = request.form.get('username', '').strip()
+        password = request.form.get('password', '')
         
-        if username == ADMIN_USERNAME and password == ADMIN_PASSWORD:
+        users = _load_users()
+        user = users.get(username)
+        
+        if user and user.get('password') == password:
             session['logged_in'] = True
             session['username'] = username
-            flash('Login successful!', 'success')
-            return redirect('/admin/dashboard')
+            session['role'] = user.get('role', 'viewer')
+            flash(f'Login successful! Role: {session["role"].title()}', 'success')
+            if session['role'] == 'admin':
+                return redirect('/admin/dashboard')
+            return redirect('/')
         else:
             flash('Invalid username or password', 'error')
     
@@ -592,14 +761,15 @@ def admin_logout():
     return redirect('/admin/login')
 
 @app.route("/admin/dashboard")
-@login_required
+@role_required('admin')
 def admin_dashboard():
     """Admin dashboard"""
     files_info = []
     for name, path in [
         ('Resin Database', RESIN_EXCEL),
         ('Machine Database', MACHINE_EXCEL),
-        ('Variable Costs', VAR_COST_EXCEL)
+        ('Variable Costs', VAR_COST_EXCEL),
+        ('Global Material Prices', GLOBAL_MATERIAL_EXCEL)
     ]:
         if path.exists():
             stat = path.stat()
@@ -631,7 +801,7 @@ def admin_dashboard():
     return render_template_string(ADMIN_DASHBOARD_HTML, files=files_info, backups=backups, username=session.get('username'))
 
 @app.route("/admin/upload", methods=["POST"])
-@login_required
+@role_required('admin')
 def admin_upload():
     """Handle file upload"""
     try:
@@ -646,7 +816,7 @@ def admin_upload():
             flash('Invalid file type. Only .xlsx and .xls allowed', 'error')
             return redirect('/admin/dashboard')
         
-        file_map = {'resin': RESIN_EXCEL, 'machine': MACHINE_EXCEL, 'cost': VAR_COST_EXCEL}
+        file_map = {'resin': RESIN_EXCEL, 'machine': MACHINE_EXCEL, 'cost': VAR_COST_EXCEL, 'global_material': GLOBAL_MATERIAL_EXCEL}
         
         if file_type not in file_map:
             flash('Invalid file type', 'error')
@@ -678,10 +848,10 @@ def admin_upload():
     return redirect('/admin/dashboard')
 
 @app.route("/admin/download/<file_type>")
-@login_required
+@role_required('admin')
 def admin_download(file_type):
     """Download current file"""
-    file_map = {'resin': RESIN_EXCEL, 'machine': MACHINE_EXCEL, 'cost': VAR_COST_EXCEL}
+    file_map = {'resin': RESIN_EXCEL, 'machine': MACHINE_EXCEL, 'cost': VAR_COST_EXCEL, 'global_material': GLOBAL_MATERIAL_EXCEL}
     
     if file_type not in file_map:
         flash('Invalid file type', 'error')
@@ -696,7 +866,7 @@ def admin_download(file_type):
     return send_file(file_path, as_attachment=True)
 
 @app.route("/api/test_import", methods=["GET"])
-@login_required
+@role_required('admin')
 def test_import_endpoint():
     """Test endpoint to verify import route is working"""
     return jsonify({
@@ -941,7 +1111,7 @@ def parse_pet_film_pdf(file_bytes, filename=""):
 
 
 @app.route("/api/import_resin_prices", methods=["POST"])
-@login_required
+@role_required('admin')
 def api_import_resin_prices():
     """Parse monthly resin price Excel files AND PET film PDF price lists
     and merge into resin database.
@@ -1542,9 +1712,395 @@ def delete_sku_api(sku_name):
         return jsonify({'success': False, 'message': str(e)}), 500
 
 
+# ================= BULK SKU UPLOAD =================
+
+BULK_COLUMN_MAP = {
+    # Friendly header → internal key (case-insensitive matching)
+    'sku_name': 'sku_name', 'sku': 'sku_name', 'name': 'sku_name', 'sku name': 'sku_name',
+    'model': 'model', 'model type': 'model', 'type': 'model',
+    'country': 'country',
+    # EBM-specific
+    'weight': 'weight', 'weight_g': 'weight', 'weight (g)': 'weight',
+    'annual_volume': 'annual_volume', 'annual volume': 'annual_volume', 'volume': 'annual_volume',
+    'cycle_time': 'mould_cycle_time', 'cycle time': 'mould_cycle_time', 'mould_cycle_time': 'mould_cycle_time',
+    'cavitation': 'mould_cavitation', 'mould_cavitation': 'mould_cavitation',
+    'machine': 'machine_model', 'machine_model': 'machine_model', 'machine model': 'machine_model',
+    'resin_type': 'l1_polymer_type', 'resin type': 'l1_polymer_type', 'resin': 'l1_polymer_type',
+    'resin_rate': 'l1_polymer_rate', 'resin rate': 'l1_polymer_rate', 'resin_price': 'l1_polymer_rate',
+    'l1_ratio': 'l1_ratio', 'l1_polymer_type': 'l1_polymer_type', 'l1_polymer_rate': 'l1_polymer_rate',
+    'l2_ratio': 'l2_ratio', 'l2_polymer_type': 'l2_polymer_type', 'l2_polymer_rate': 'l2_polymer_rate',
+    'l3_ratio': 'l3_ratio', 'l3_polymer_type': 'l3_polymer_type', 'l3_polymer_rate': 'l3_polymer_rate',
+    'l1_mb_dosage': 'l1_mb_dosage', 'l1_mb_rate': 'l1_mb_rate',
+    'l2_mb_dosage': 'l2_mb_dosage', 'l2_mb_rate': 'l2_mb_rate',
+    'l3_mb_dosage': 'l3_mb_dosage', 'l3_mb_rate': 'l3_mb_rate',
+    'l1_additive_dosage': 'l1_additive_dosage', 'l1_additive_rate': 'l1_additive_rate',
+    'l2_additive_dosage': 'l2_additive_dosage', 'l2_additive_rate': 'l2_additive_rate',
+    'l3_additive_dosage': 'l3_additive_dosage', 'l3_additive_rate': 'l3_additive_rate',
+    'margin': 'margin_pct', 'margin_pct': 'margin_pct', 'margin %': 'margin_pct',
+    'electricity_rate': 'electricity_rate', 'electricity rate': 'electricity_rate',
+    'currency': 'currency_symbol', 'currency_symbol': 'currency_symbol',
+    # Carton Essential
+    'board_gsm': 'board_gsm', 'board gsm': 'board_gsm',
+    'board_rate': 'board_rate', 'board rate': 'board_rate',
+    'layflat_length': 'layflat_length', 'layflat length': 'layflat_length',
+    'layflat_width': 'layflat_width', 'layflat width': 'layflat_width',
+    'conversion_cost': 'conversion_cost', 'conversion cost': 'conversion_cost',
+    'ink_rate': 'ink_rate', 'varnish_rate': 'varnish_rate', 'primer_rate': 'primer_rate',
+    'film_rate': 'film_rate', 'film_gsm': 'film_gsm',
+    'ups_lengthwise': 'ups_lengthwise', 'ups_widthwise': 'ups_widthwise',
+    'other_costs': 'other_costs',
+    # Carton Advanced
+    'length_1': 'length_1', 'length_2': 'length_2',
+    'width_1': 'width_1', 'width_2': 'width_2',
+    'height': 'height', 'max_flap': 'max_flap',
+    'no_of_colours': 'no_of_colours', 'no_of_designs': 'no_of_designs',
+    'no_of_shifts': 'no_of_shifts',
+    # Flexibles layers — flat columns: layer1_name, layer1_mic, layer1_rate, ...
+    'layer1_name': 'layer1_name', 'layer1_mic': 'layer1_mic', 'layer1_rate': 'layer1_rate',
+    'layer2_name': 'layer2_name', 'layer2_mic': 'layer2_mic', 'layer2_rate': 'layer2_rate',
+    'layer3_name': 'layer3_name', 'layer3_mic': 'layer3_mic', 'layer3_rate': 'layer3_rate',
+    'layer4_name': 'layer4_name', 'layer4_mic': 'layer4_mic', 'layer4_rate': 'layer4_rate',
+    'layer5_name': 'layer5_name', 'layer5_mic': 'layer5_mic', 'layer5_rate': 'layer5_rate',
+    'layer6_name': 'layer6_name', 'layer6_mic': 'layer6_mic', 'layer6_rate': 'layer6_rate',
+    'layer7_name': 'layer7_name', 'layer7_mic': 'layer7_mic', 'layer7_rate': 'layer7_rate',
+}
+
+
+def _map_bulk_columns(df):
+    """Normalise uploaded column names to internal keys."""
+    mapped = {}
+    for col in df.columns:
+        key = str(col).strip().lower().replace('-', '_')
+        if key in BULK_COLUMN_MAP:
+            mapped[col] = BULK_COLUMN_MAP[key]
+        else:
+            mapped[col] = key  # pass-through
+    return df.rename(columns=mapped)
+
+
+def _safe_json_params(params):
+    """Convert numpy/pandas types to native Python for JSON serialization."""
+    clean = {}
+    for k, v in params.items():
+        if isinstance(v, (np.integer,)):
+            clean[k] = int(v)
+        elif isinstance(v, (np.floating,)):
+            clean[k] = float(v)
+        elif isinstance(v, (np.bool_,)):
+            clean[k] = bool(v)
+        else:
+            clean[k] = v
+    return clean
+
+
+def _build_flexibles_params(params):
+    """Convert flat layer columns into the nested layers array the API expects.
+    Excel columns: layer1_name, layer1_mic, layer1_rate, layer2_name, ..."""
+    layers = []
+    for i in range(1, 8):  # up to 7 layers
+        name = params.get(f'layer{i}_name')
+        mic = params.get(f'layer{i}_mic')
+        rate = params.get(f'layer{i}_rate')
+        if name and mic and rate:
+            layers.append({
+                'name': str(name).strip(),
+                'mic': float(mic),
+                'rate': float(rate),
+            })
+    return {
+        'layers': layers,
+        'conversion_cost': float(params.get('conversion_cost', 50)),
+    }
+
+
+def _run_calc_internal(endpoint_func, params):
+    """Generic helper to call a calculator endpoint internally."""
+    clean = _safe_json_params(params)
+    with app.test_request_context(
+        json=clean,
+        method='POST',
+        content_type='application/json',
+        data=json.dumps(clean)
+    ):
+        resp = endpoint_func()
+        if isinstance(resp, tuple):
+            return resp[0].get_json()
+        return resp.get_json()
+
+
+def _extract_result_metrics(model, calc_result, params):
+    """Normalise output from any calculator model into a consistent dict for the results table."""
+    if model in ('flexibles', 'flexible'):
+        # Flexibles returns cost per kg/sqm, no per-1000 or per-piece
+        mat_cost = calc_result.get('material_cost_with_wastage', calc_result.get('material_cost_per_kg', 0))
+        conv_cost = calc_result.get('conversion_cost', 0)
+        total = calc_result.get('laminate_cost_per_kg', 0)
+        packing = calc_result.get('packing_cost', 0)
+        return {
+            'material_cost': round(float(mat_cost), 2),
+            'conversion_cost': round(float(conv_cost), 2),
+            'margin': 0,
+            'total_cost_per_1000': round(float(total), 4),  # actually cost/kg for flexibles
+            'cost_per_piece': round(float(calc_result.get('laminate_cost_per_sqm', total)), 4),
+            'margin_pct': 0,
+            'cost_label_1000': '/kg',
+            'cost_label_piece': '/sqm',
+        }
+    elif model in ('carton', 'folding_carton'):
+        # Carton Essential returns cost components but no explicit margin or cost_per_piece
+        total_1000 = calc_result.get('total_cost_per_1000', 0)
+        board = calc_result.get('board_cost', 0)
+        conv = calc_result.get('conversion_cost', 0)
+        return {
+            'material_cost': round(float(board), 2),
+            'conversion_cost': round(float(conv), 2),
+            'margin': 0,
+            'total_cost_per_1000': round(float(total_1000), 2),
+            'cost_per_piece': round(float(total_1000) / 1000, 4) if total_1000 else 0,
+            'margin_pct': 0,
+            'cost_label_1000': '/1000',
+            'cost_label_piece': '/pc',
+        }
+    elif model in ('carton_advanced', 'carton_adv'):
+        total_1000 = calc_result.get('total_cost_per_1000', 0)
+        mat_cost = calc_result.get('material_cost', calc_result.get('board_cost', 0))
+        conv_cost = calc_result.get('conversion_cost', 0)
+        margin_val = calc_result.get('margin', 0)
+        margin_pct = calc_result.get('margin_pct_input', 0)
+        if isinstance(margin_pct, float) and margin_pct < 1:
+            margin_pct = margin_pct * 100
+        return {
+            'material_cost': round(float(mat_cost), 2),
+            'conversion_cost': round(float(conv_cost), 2),
+            'margin': round(float(margin_val), 2),
+            'total_cost_per_1000': round(float(total_1000), 2),
+            'cost_per_piece': round(float(total_1000) / 1000, 4) if total_1000 else 0,
+            'margin_pct': round(float(margin_pct), 1),
+            'cost_label_1000': '/1000',
+            'cost_label_piece': '/pc',
+        }
+    else:
+        # EBM — has all keys
+        total_1000 = calc_result.get('total_cost_per_1000', 0)
+        return {
+            'material_cost': round(float(calc_result.get('material_cost', 0)), 2),
+            'conversion_cost': round(float(calc_result.get('conversion_cost', 0)), 2),
+            'margin': round(float(calc_result.get('margin', 0)), 2),
+            'total_cost_per_1000': round(float(total_1000), 2),
+            'cost_per_piece': round(float(calc_result.get('cost_per_piece', total_1000 / 1000 if total_1000 else 0)), 4),
+            'margin_pct': round(float(calc_result.get('margin_pct_total', calc_result.get('margin_pct_input', 0))), 1),
+            'cost_label_1000': '/1000',
+            'cost_label_piece': '/pc',
+        }
+
+
+@app.route('/api/upload_bulk_skus', methods=['POST'])
+def upload_bulk_skus():
+    """Parse uploaded Excel, run cost calculator for each row, return results."""
+    try:
+        if 'file' not in request.files:
+            return jsonify({'success': False, 'message': 'No file uploaded'}), 400
+
+        file = request.files['file']
+        if not file.filename:
+            return jsonify({'success': False, 'message': 'Empty filename'}), 400
+
+        ext = file.filename.rsplit('.', 1)[-1].lower()
+        if ext not in ('xlsx', 'xls'):
+            return jsonify({'success': False, 'message': 'Only .xlsx / .xls files accepted'}), 400
+
+        df = pd.read_excel(io.BytesIO(file.read()))
+        if df.empty:
+            return jsonify({'success': False, 'message': 'Excel file is empty'}), 400
+
+        df = _map_bulk_columns(df)
+
+        results = []
+        errors = []
+
+        for idx, row in df.iterrows():
+            row_num = idx + 2  # Excel row (1-indexed header + data)
+            try:
+                params = {}
+                for col in df.columns:
+                    val = row[col]
+                    if pd.isna(val):
+                        continue
+                    params[col] = val
+
+                sku_name = str(params.get('sku_name', f'Row_{row_num}'))
+                model = str(params.get('model', 'ebm')).strip().lower()
+
+                # Route to correct calculator
+                if model in ('ebm', 'rigids', 'blow_moulding'):
+                    calc_result = _run_calc_internal(api_calc_ebm, params)
+                elif model in ('carton', 'folding_carton'):
+                    calc_result = _run_calc_internal(api_calc_carton, params)
+                elif model in ('carton_advanced', 'carton_adv'):
+                    calc_result = _run_calc_internal(api_calc_carton_advanced, params)
+                elif model in ('flexibles', 'flexible', 'laminate'):
+                    flex_params = _build_flexibles_params(params)
+                    calc_result = _run_calc_internal(api_calc_flexibles, flex_params)
+                else:
+                    errors.append({'row': row_num, 'sku': sku_name,
+                                   'error': f'Unknown model "{model}". Use: ebm, carton, carton_advanced, flexibles'})
+                    continue
+
+                if 'error' in calc_result:
+                    errors.append({'row': row_num, 'sku': sku_name, 'error': calc_result['error']})
+                    continue
+
+                # Extract normalised metrics
+                metrics = _extract_result_metrics(model, calc_result, params)
+                country = params.get('country', '-')
+
+                results.append({
+                    'row': row_num,
+                    'sku_name': sku_name,
+                    'model': model,
+                    'country': str(country),
+                    **metrics,
+                    'full_result': calc_result,
+                    'inputs': _safe_json_params(params),
+                })
+
+            except Exception as row_err:
+                errors.append({'row': row_num, 'sku': str(row.get('sku_name', f'Row_{row_num}')),
+                               'error': str(row_err)})
+
+        # Find cheapest
+        if results:
+            cheapest = min(results, key=lambda r: r['cost_per_piece'])
+            for r in results:
+                r['is_cheapest'] = (r['cost_per_piece'] == cheapest['cost_per_piece'])
+        
+        return jsonify({
+            'success': True,
+            'total_rows': len(df),
+            'processed': len(results),
+            'error_count': len(errors),
+            'results': results,
+            'errors': errors,
+        })
+
+    except Exception as e:
+        logger.error(f"Bulk upload error: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/export_bulk_results', methods=['POST'])
+def export_bulk_results():
+    """Export bulk calculation results to Excel."""
+    try:
+        data = request.get_json()
+        rows = data.get('results', [])
+        if not rows:
+            return jsonify({'success': False, 'message': 'No results to export'}), 400
+
+        records = []
+        for r in rows:
+            lbl_1000 = r.get('cost_label_1000', '/1000')
+            lbl_pc = r.get('cost_label_piece', '/pc')
+            records.append({
+                'SKU Name': r.get('sku_name', ''),
+                'Model': r.get('model', ''),
+                'Country': r.get('country', ''),
+                f'Material Cost {lbl_1000}': r.get('material_cost', 0),
+                f'Conversion Cost {lbl_1000}': r.get('conversion_cost', 0),
+                f'Margin {lbl_1000}': r.get('margin', 0),
+                f'Total Cost {lbl_1000}': r.get('total_cost_per_1000', 0),
+                f'Cost {lbl_pc}': r.get('cost_per_piece', 0),
+                'Margin %': r.get('margin_pct', 0),
+                'Cheapest': '✓' if r.get('is_cheapest') else '',
+            })
+
+        out_df = pd.DataFrame(records)
+        buf = io.BytesIO()
+        with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+            out_df.to_excel(writer, index=False, sheet_name='Bulk Results')
+        buf.seek(0)
+
+        return send_file(buf, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                         as_attachment=True, download_name=f'packfora_bulk_results_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx')
+
+    except Exception as e:
+        logger.error(f"Bulk export error: {e}", exc_info=True)
+        return jsonify({'success': False, 'message': str(e)}), 500
+
+
+@app.route('/api/download_bulk_template', methods=['GET'])
+def download_bulk_template():
+    """Download a multi-sheet Excel template with examples for every model."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine='openpyxl') as writer:
+        # --- EBM sheet ---
+        pd.DataFrame([{
+            'sku_name': 'Bottle 220ml', 'model': 'ebm', 'country': 'India',
+            'weight': 19, 'annual_volume': 62975559,
+            'mould_cycle_time': 16.3, 'mould_cavitation': 12, 'machine_model': 'Jomar 65',
+            'l1_ratio': 0.48, 'l1_polymer_type': 'HDPE', 'l1_polymer_rate': 95,
+            'l1_mb_dosage': 0.02, 'l1_mb_rate': 450,
+            'l2_ratio': 0.50, 'l2_polymer_type': 'rHDPE', 'l2_polymer_rate': 107,
+            'margin_pct': 0.20, 'electricity_rate': 10.72, 'currency_symbol': 'INR',
+        }, {
+            'sku_name': 'Bottle 500ml', 'model': 'ebm', 'country': 'India',
+            'weight': 28, 'annual_volume': 40000000,
+            'mould_cycle_time': 18, 'mould_cavitation': 8, 'machine_model': 'Jomar 135',
+            'l1_ratio': 0.50, 'l1_polymer_type': 'HDPE', 'l1_polymer_rate': 95,
+            'l1_mb_dosage': 0.02, 'l1_mb_rate': 450,
+            'l2_ratio': 0.50, 'l2_polymer_type': 'rHDPE', 'l2_polymer_rate': 107,
+            'margin_pct': 0.20, 'electricity_rate': 10.72, 'currency_symbol': 'INR',
+        }]).to_excel(writer, index=False, sheet_name='EBM')
+
+        # --- Carton Essential sheet ---
+        pd.DataFrame([{
+            'sku_name': 'Carton Box A', 'model': 'carton',
+            'layflat_length': 125.2, 'layflat_width': 394.5,
+            'board_gsm': 400, 'board_rate': 55,
+            'ups_lengthwise': 5, 'ups_widthwise': 2,
+            'conversion_cost': 195, 'other_costs': 50,
+        }, {
+            'sku_name': 'Carton Box B', 'model': 'carton',
+            'layflat_length': 150, 'layflat_width': 320,
+            'board_gsm': 350, 'board_rate': 52,
+            'ups_lengthwise': 4, 'ups_widthwise': 3,
+            'conversion_cost': 180, 'other_costs': 40,
+        }]).to_excel(writer, index=False, sheet_name='Carton')
+
+        # --- Carton Advanced sheet ---
+        pd.DataFrame([{
+            'sku_name': 'Premium Box', 'model': 'carton_advanced', 'country': 'India',
+            'annual_volume': 3126950, 'length_1': 36.3, 'length_2': 37,
+            'width_1': 46, 'width_2': 46, 'height': 179, 'max_flap': 96.9,
+            'board_gsm': 350, 'board_rate': 55, 'margin_pct': 0.20,
+        }]).to_excel(writer, index=False, sheet_name='Carton Advanced')
+
+        # --- Flexibles sheet ---
+        pd.DataFrame([{
+            'sku_name': 'Laminate Pouch A', 'model': 'flexibles',
+            'layer1_name': 'PET Film', 'layer1_mic': 12, 'layer1_rate': 145,
+            'layer2_name': 'Gravure', 'layer2_mic': 3, 'layer2_rate': 1700,
+            'layer3_name': 'Lamination - Adhesive (Solvent Less)', 'layer3_mic': 10, 'layer3_rate': 750,
+            'layer4_name': '5 Layer All PE', 'layer4_mic': 145, 'layer4_rate': 125,
+            'conversion_cost': 50,
+        }, {
+            'sku_name': 'Laminate Pouch B', 'model': 'flexibles',
+            'layer1_name': 'BOPP Film', 'layer1_mic': 20, 'layer1_rate': 160,
+            'layer2_name': 'Gravure', 'layer2_mic': 3, 'layer2_rate': 1700,
+            'layer3_name': 'Lamination - Adhesive (Solvent Based)', 'layer3_mic': 8, 'layer3_rate': 800,
+            'layer4_name': 'CPP Film', 'layer4_mic': 30, 'layer4_rate': 200,
+            'conversion_cost': 55,
+        }]).to_excel(writer, index=False, sheet_name='Flexibles')
+
+    buf.seek(0)
+    return send_file(buf, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                     as_attachment=True, download_name='packfora_bulk_template.xlsx')
+
+
 # ================= PUBLIC ROUTES =================
 
 @app.route("/")
+@login_required
 def home():
     """Dashboard home"""
     files_ok, message = check_files_exist()
@@ -1560,11 +2116,12 @@ def home():
             </p>
         </div>
         """
-        return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_content), active="Dashboard")
+        return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_content), active="Dashboard", user_role=session.get('role', 'viewer'))
     
-    return render_template_string(BASE_HTML.replace("{{ content | safe }}", DASH_HTML), active="Dashboard")
+    return render_template_string(BASE_HTML.replace("{{ content | safe }}", DASH_HTML), active="Dashboard", user_role=session.get('role', 'viewer'))
 
 @app.route("/resin")
+@login_required
 def resin():
     """Resin tracker"""
     try:
@@ -1574,26 +2131,1392 @@ def resin():
         
         sheets_options = ''.join([f'<option value="{s}">{s}</option>' for s in xls.sheet_names if s.lower() != 'unknown'])
         resin_content = RESIN_UI.replace("{{SHEETS_OPTIONS}}", sheets_options)
-        return render_template_string(BASE_HTML.replace("{{ content | safe }}", resin_content), active="Resin")
+        return render_template_string(BASE_HTML.replace("{{ content | safe }}", resin_content), active="Resin", user_role=session.get('role', 'viewer'))
     except Exception as e:
         logger.error(f"Error loading resin page: {e}")
         error_msg = f"<div class='card error-card'><h3>Error Loading Resin Data</h3><p>{str(e)}</p></div>"
-        return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_msg), active="Resin")
+        return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_msg), active="Resin", user_role=session.get('role', 'viewer'))
 
 @app.route("/machines")
+@role_required('admin', 'analyst')
 def machines():
     """Machine database"""
-    return render_template_string(BASE_HTML.replace("{{ content | safe }}", MACH_HTML), active="Machines")
+    return render_template_string(BASE_HTML.replace("{{ content | safe }}", MACH_HTML), active="Machines", user_role=session.get('role', 'viewer'))
 
 @app.route("/costs")
+@role_required('admin', 'analyst')
 def costs():
     """Variable costs"""
-    return render_template_string(BASE_HTML.replace("{{ content | safe }}", COST_HTML), active="Costs")
+    return render_template_string(BASE_HTML.replace("{{ content | safe }}", COST_HTML), active="Costs", user_role=session.get('role', 'viewer'))
+
+@app.route("/global-materials")
+@login_required
+def global_materials():
+    """Global Material Price Tracker — separate from India Resin Tracker"""
+    try:
+        df = _load_global_material_df()
+        if df is None:
+            error_msg = "<div class='card error-card'><h3>Global Material Data Not Found</h3><p>Upload <code>global-material-data.xlsx</code> via Admin → Upload.</p></div>"
+            return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_msg), active="GlobalMaterials", user_role=session.get('role', 'viewer'))
+        return render_template_string(BASE_HTML.replace("{{ content | safe }}", GLOBAL_MATERIAL_UI), active="GlobalMaterials", user_role=session.get('role', 'viewer'))
+    except Exception as e:
+        logger.error(f"Error loading global materials page: {e}")
+        error_msg = f"<div class='card error-card'><h3>Error</h3><p>{str(e)}</p></div>"
+        return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_msg), active="GlobalMaterials", user_role=session.get('role', 'viewer'))
+
+
+@app.route("/materials")
+@login_required
+def materials_unified():
+    """Unified Material Price Tracker — merges Resin + Global Materials"""
+    try:
+        return render_template_string(
+            BASE_HTML.replace("{{ content | safe }}", MATERIAL_TRACKER_UI),
+            active="Materials", user_role=session.get('role', 'viewer')
+        )
+    except Exception as e:
+        logger.error(f"Error loading unified materials page: {e}")
+        error_msg = f"<div class='card error-card'><h3>Error Loading Material Tracker</h3><p>{str(e)}</p></div>"
+        return render_template_string(
+            BASE_HTML.replace("{{ content | safe }}", error_msg),
+            active="Materials", user_role=session.get('role', 'viewer')
+        )
 
 @app.route("/calculator")
+@login_required
 def calculator():
-    """Cost Calculator"""
-    return render_template_string(BASE_HTML.replace("{{ content | safe }}", CALC_HTML), active="Calculator")
+    """Cost Calculator — view param controls which tab is shown"""
+    view = request.args.get('view', 'essentials')
+    user_role = session.get('role', 'viewer')
+    # If viewer tries to access advanced, redirect to standard
+    if view == 'advanced' and user_role == 'viewer':
+        flash('Advanced Models require Analyst or Admin access.', 'error')
+        return redirect('/calculator?view=essentials')
+    # Load custom models for injection
+    custom_models = _load_custom_models()
+    ess_opts = ''.join([f'<option value="custom_{m["id"]}">{m["name"]}</option>' for m in custom_models if m.get('category') == 'essentials'])
+    adv_opts = ''.join([f'<option value="custom_{m["id"]}">{m["name"]}</option>' for m in custom_models if m.get('category') == 'advanced'])
+    # Inject a JS snippet to auto-switch to the requested view and pass role
+    view_script = f'<script>window.__calcView = "{view}"; window.__userRole = "{user_role}";</script>'
+    calc_content = view_script + CALC_HTML.replace('<!--CUSTOM_ESSENTIALS-->', ess_opts).replace('<!--CUSTOM_ADVANCED-->', adv_opts)
+    return render_template_string(BASE_HTML.replace("{{ content | safe }}", calc_content), active="Calculator", user_role=user_role)
+
+# ================= ADMIN USER MANAGEMENT =================
+
+@app.route("/admin/users", methods=["GET"])
+@role_required('admin')
+def admin_users_page():
+    """Admin user management page"""
+    users = _load_users()
+    return render_template_string(ADMIN_USERS_HTML, users=users, username=session.get('username'))
+
+@app.route("/api/admin/users", methods=["POST"])
+@role_required('admin')
+def api_admin_add_user():
+    """Add or update a user"""
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "message": "No data provided"})
+    uname = data.get('username', '').strip()
+    pwd = data.get('password', '').strip()
+    role = data.get('role', 'viewer')
+    if not uname or not pwd:
+        return jsonify({"success": False, "message": "Username and password required"})
+    if role not in ROLE_HIERARCHY:
+        return jsonify({"success": False, "message": "Invalid role"})
+    users = _load_users()
+    users[uname] = {"password": pwd, "role": role}
+    _save_users(users)
+    return jsonify({"success": True, "message": f"User '{uname}' saved with role '{role}'"})
+
+@app.route("/api/admin/users/<username>", methods=["DELETE"])
+@role_required('admin')
+def api_admin_delete_user(username):
+    """Delete a user"""
+    users = _load_users()
+    if username not in users:
+        return jsonify({"success": False, "message": "User not found"})
+    if username == session.get('username'):
+        return jsonify({"success": False, "message": "Cannot delete yourself"})
+    del users[username]
+    _save_users(users)
+    return jsonify({"success": True, "message": f"User '{username}' deleted"})
+
+# ================= COST MODEL BUILDER HELPERS =================
+
+def _load_custom_models():
+    """Load all custom cost models."""
+    models = []
+    for f in sorted(MODELS_DIR.glob("*.json")):
+        try:
+            with open(f, 'r') as fh:
+                m = json.load(fh)
+                m['_filename'] = f.name
+                models.append(m)
+        except Exception:
+            pass
+    return models
+
+def _save_custom_model(model_data):
+    """Save a custom cost model."""
+    model_id = model_data.get('id') or str(uuid.uuid4())[:8]
+    model_data['id'] = model_id
+    model_data['updated_at'] = datetime.now().isoformat()
+    path = MODELS_DIR / f"{model_id}.json"
+    with open(path, 'w') as f:
+        json.dump(model_data, f, indent=2)
+    return model_id
+
+def _load_shares():
+    """Load all share records."""
+    shares = {}
+    for f in SHARES_DIR.glob("*.json"):
+        try:
+            with open(f, 'r') as fh:
+                shares[f.stem] = json.load(fh)
+        except Exception:
+            pass
+    return shares
+
+def _save_share(token, share_data):
+    """Save a share record."""
+    path = SHARES_DIR / f"{token}.json"
+    with open(path, 'w') as f:
+        json.dump(share_data, f, indent=2)
+
+# ================= MODEL BUILDER ROUTES =================
+
+@app.route("/admin/model_builder")
+@role_required('admin')
+def admin_model_builder():
+    """Cost Model Builder page — admin only"""
+    user_role = session.get('role', 'viewer')
+    return render_template_string(BASE_HTML.replace("{{ content | safe }}", MODEL_BUILDER_HTML), active="ModelBuilder", user_role=user_role)
+
+@app.route("/api/models", methods=["GET"])
+@role_required('admin')
+def api_list_models():
+    """List all custom models."""
+    return jsonify({"success": True, "models": _load_custom_models()})
+
+@app.route("/api/models", methods=["POST"])
+@role_required('admin')
+def api_save_model():
+    """Save a custom cost model."""
+    data = request.get_json()
+    if not data or not data.get('name'):
+        return jsonify({"success": False, "message": "Model name required"})
+    model_id = _save_custom_model(data)
+    return jsonify({"success": True, "id": model_id})
+
+@app.route("/api/models/<model_id>", methods=["GET"])
+@login_required
+def api_get_model(model_id):
+    """Get a single model."""
+    path = MODELS_DIR / f"{model_id}.json"
+    if not path.exists():
+        return jsonify({"success": False, "message": "Not found"}), 404
+    with open(path, 'r') as f:
+        return jsonify({"success": True, "model": json.load(f)})
+
+@app.route("/api/models/<model_id>", methods=["DELETE"])
+@role_required('admin')
+def api_delete_model(model_id):
+    """Delete a model."""
+    path = MODELS_DIR / f"{model_id}.json"
+    if path.exists():
+        path.unlink()
+    return jsonify({"success": True})
+
+# ================= SHARE SYSTEM ROUTES =================
+
+@app.route("/api/share", methods=["POST"])
+@role_required('admin', 'analyst')
+def api_create_share():
+    """Create a share link for a model."""
+    data = request.get_json()
+    if not data or not data.get('model_id'):
+        return jsonify({"success": False, "message": "model_id required"})
+
+    token = uuid.uuid4().hex[:12]
+    share = {
+        "model_id": data['model_id'],
+        "created_at": datetime.now().isoformat(),
+        "created_by": session.get('username', 'unknown'),
+        "locked_fields": data.get('locked_fields', []),
+        "hidden_fields": data.get('hidden_fields', []),
+        "password": None,
+        "expiry": None,
+        "defaults": data.get('defaults', {})
+    }
+    if data.get('password'):
+        share['password'] = hashlib.sha256(data['password'].encode()).hexdigest()
+    if data.get('expiry'):
+        share['expiry'] = data['expiry']
+
+    _save_share(token, share)
+    return jsonify({"success": True, "token": token, "url": f"/calc/{token}"})
+
+@app.route("/api/shares", methods=["GET"])
+@role_required('admin', 'analyst')
+def api_list_shares():
+    """List all shares."""
+    shares = _load_shares()
+    out = []
+    for token, s in shares.items():
+        s['token'] = token
+        out.append(s)
+    return jsonify({"success": True, "shares": out})
+
+@app.route("/api/shares/<token>", methods=["DELETE"])
+@role_required('admin', 'analyst')
+def api_delete_share(token):
+    """Delete a share."""
+    path = SHARES_DIR / f"{token}.json"
+    if path.exists():
+        path.unlink()
+    return jsonify({"success": True})
+
+@app.route("/calc/<token>", methods=["GET", "POST"])
+def public_calculator(token):
+    """Public shared calculator page."""
+    path = SHARES_DIR / f"{token}.json"
+    if not path.exists():
+        return "<h2 style='text-align:center;margin-top:80px;font-family:sans-serif;color:#666;'>Link not found or expired.</h2>", 404
+    with open(path, 'r') as f:
+        share = json.load(f)
+    # Check expiry
+    if share.get('expiry'):
+        try:
+            exp = datetime.fromisoformat(share['expiry'])
+            if datetime.now() > exp:
+                return "<h2 style='text-align:center;margin-top:80px;font-family:sans-serif;color:#666;'>This link has expired.</h2>", 410
+        except Exception:
+            pass
+    # Check password
+    if share.get('password'):
+        if request.method == 'POST':
+            pw = request.form.get('password', '')
+            if hashlib.sha256(pw.encode()).hexdigest() != share['password']:
+                return render_template_string(SHARE_PASSWORD_HTML, token=token, error=True)
+        else:
+            return render_template_string(SHARE_PASSWORD_HTML, token=token, error=False)
+    # Load model
+    model_path = MODELS_DIR / f"{share['model_id']}.json"
+    if not model_path.exists():
+        return "<h2 style='text-align:center;margin-top:80px;font-family:sans-serif;color:#666;'>Model no longer exists.</h2>", 404
+    with open(model_path, 'r') as f:
+        model = json.load(f)
+    return render_template_string(SHARE_CALC_HTML, model=model, share=share, token=token)
+
+# ================= SAFE FORMULA EVALUATOR (P0 Security) =================
+
+# Whitelisted binary / unary / comparison operators
+_SAFE_OPS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+    ast.USub: operator.neg,
+    ast.UAdd: operator.pos,
+    ast.Gt: operator.gt,
+    ast.GtE: operator.ge,
+    ast.Lt: operator.lt,
+    ast.LtE: operator.le,
+    ast.Eq: operator.eq,
+    ast.NotEq: operator.ne,
+}
+
+# Whitelisted functions (name → callable)
+_SAFE_FUNCS = {
+    'min': min, 'max': max, 'abs': abs, 'round': round,
+    'sum': sum, 'pow': pow, 'int': int, 'float': float,
+    'sqrt': math.sqrt, 'log': math.log, 'log10': math.log10,
+    'ceil': math.ceil, 'floor': math.floor,
+}
+
+def _safe_eval_node(node, ns):
+    """Recursively evaluate an AST node against a namespace dict.
+    Only whitelisted operations are allowed — no attribute access,
+    no imports, no lambdas, no comprehensions."""
+    if isinstance(node, ast.Expression):
+        return _safe_eval_node(node.body, ns)
+
+    # Literal numbers / booleans
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (int, float, bool)):
+            return node.value
+        raise ValueError(f"Disallowed constant type: {type(node.value).__name__}")
+
+    # Variable lookup
+    if isinstance(node, ast.Name):
+        if node.id in ns:
+            return ns[node.id]
+        if node.id in _SAFE_FUNCS:
+            return _SAFE_FUNCS[node.id]
+        raise ValueError(f"Unknown identifier: {node.id}")
+
+    # Binary ops: a + b, a * b, …
+    if isinstance(node, ast.BinOp):
+        op_func = _SAFE_OPS.get(type(node.op))
+        if op_func is None:
+            raise ValueError(f"Disallowed operator: {type(node.op).__name__}")
+        left = _safe_eval_node(node.left, ns)
+        right = _safe_eval_node(node.right, ns)
+        return op_func(left, right)
+
+    # Unary ops: -x, +x
+    if isinstance(node, ast.UnaryOp):
+        op_func = _SAFE_OPS.get(type(node.op))
+        if op_func is None:
+            raise ValueError(f"Disallowed unary op: {type(node.op).__name__}")
+        return op_func(_safe_eval_node(node.operand, ns))
+
+    # Function calls: min(a, b), round(x, 2), sqrt(x), …
+    if isinstance(node, ast.Call):
+        func = _safe_eval_node(node.func, ns)
+        if not callable(func):
+            raise ValueError("Not a callable")
+        args = [_safe_eval_node(a, ns) for a in node.args]
+        return func(*args)
+
+    # Comparisons: a > b, a <= b (single comparator only for safety)
+    if isinstance(node, ast.Compare):
+        left = _safe_eval_node(node.left, ns)
+        for op, comp in zip(node.ops, node.comparators):
+            op_func = _SAFE_OPS.get(type(op))
+            if op_func is None:
+                raise ValueError(f"Disallowed comparison: {type(op).__name__}")
+            right = _safe_eval_node(comp, ns)
+            if not op_func(left, right):
+                return 0
+            left = right
+        return 1
+
+    # Ternary: x if cond else y
+    if isinstance(node, ast.IfExp):
+        cond = _safe_eval_node(node.test, ns)
+        return _safe_eval_node(node.body, ns) if cond else _safe_eval_node(node.orelse, ns)
+
+    # Boolean ops: a and b, a or b
+    if isinstance(node, ast.BoolOp):
+        if isinstance(node.op, ast.And):
+            result = True
+            for v in node.values:
+                result = _safe_eval_node(v, ns)
+                if not result:
+                    return result
+            return result
+        elif isinstance(node.op, ast.Or):
+            result = False
+            for v in node.values:
+                result = _safe_eval_node(v, ns)
+                if result:
+                    return result
+            return result
+        raise ValueError(f"Disallowed boolean op: {type(node.op).__name__}")
+
+    raise ValueError(f"Disallowed AST node: {type(node).__name__}")
+
+
+def safe_eval_formula(expr_str, ns):
+    """Parse and safely evaluate a formula string.
+    Returns (value, error_string_or_None)."""
+    if not expr_str or not expr_str.strip():
+        return 0, None
+    try:
+        tree = ast.parse(expr_str.strip(), mode='eval')
+    except SyntaxError as e:
+        return 0, f"Syntax error: {e}"
+    try:
+        result = _safe_eval_node(tree, ns)
+        if isinstance(result, bool):
+            result = int(result)
+        return float(result), None
+    except Exception as e:
+        return 0, str(e)
+
+
+@app.route("/api/validate_formula", methods=["POST"])
+@login_required
+def api_validate_formula():
+    """Validate a formula expression (for builder autocomplete)."""
+    data = request.get_json() or {}
+    expr = data.get('formula', '')
+    field_ids = data.get('field_ids', [])
+    # Build mock namespace with 1.0 for each field
+    ns = {fid: 1.0 for fid in field_ids}
+    val, err = safe_eval_formula(expr, ns)
+    return jsonify({
+        "success": err is None,
+        "error": err,
+        "test_value": val,
+        "available_functions": list(_SAFE_FUNCS.keys())
+    })
+
+
+@app.route("/api/models/<model_id>/duplicate", methods=["POST"])
+@role_required('admin')
+def api_duplicate_model(model_id):
+    """Duplicate a model."""
+    path = MODELS_DIR / f"{model_id}.json"
+    if not path.exists():
+        return jsonify({"success": False, "message": "Not found"}), 404
+    with open(path, 'r') as f:
+        model = json.load(f)
+    model['name'] = model.get('name', '') + ' (Copy)'
+    model.pop('id', None)
+    new_id = _save_custom_model(model)
+    return jsonify({"success": True, "id": new_id})
+
+
+# ================= NEW UX UPGRADE APIS =================
+
+# ── TEMPLATE LIBRARY ──
+PACKAGING_TEMPLATES = {
+    "pet_preform": {
+        "name": "PET Preform Cost Model",
+        "description": "Full cost model for PET preform manufacturing including resin, energy, conversion and overhead.",
+        "category": "essentials",
+        "packaging_type": "PET Preform",
+        "fields": [
+            {"id":"resin_price","label":"Resin Price","type":"input","input_type":"number","unit":"₹/kg","default":95,"input_group":"Material","data_source":"resin","data_key":"PET"},
+            {"id":"preform_weight","label":"Preform Weight","type":"input","input_type":"number","unit":"g","default":28,"input_group":"Material"},
+            {"id":"neck_size","label":"Neck Size","type":"input","input_type":"number","unit":"mm","default":28,"input_group":"Dimensions"},
+            {"id":"cavities","label":"No. of Cavities","type":"input","input_type":"number","unit":"pcs","default":48,"input_group":"Machine"},
+            {"id":"cycle_time","label":"Cycle Time","type":"input","input_type":"number","unit":"sec","default":12,"input_group":"Machine"},
+            {"id":"machine_cost","label":"Machine Cost","type":"input","input_type":"number","unit":"₹","default":8500000,"input_group":"Machine","data_source":"machine"},
+            {"id":"electricity_rate","label":"Electricity Rate","type":"input","input_type":"number","unit":"₹/kWh","default":8,"input_group":"Overhead","data_source":"variable_cost","data_key":"electricity"},
+            {"id":"power_kw","label":"Power Consumption","type":"input","input_type":"number","unit":"kW","default":85,"input_group":"Machine"},
+            {"id":"operators","label":"Operators/Shift","type":"input","input_type":"number","unit":"pcs","default":2,"input_group":"Labour"},
+            {"id":"operator_salary","label":"Operator Salary","type":"input","input_type":"number","unit":"₹/month","default":18000,"input_group":"Labour","data_source":"variable_cost","data_key":"labour"},
+            {"id":"rejection_pct","label":"Rejection %","type":"input","input_type":"percent","unit":"%","default":2,"input_group":"General"},
+            {"id":"margin_pct","label":"Margin %","type":"input","input_type":"percent","unit":"%","default":12,"input_group":"General"},
+            {"id":"shifts_per_day","label":"Shifts / Day","type":"input","input_type":"number","unit":"","default":3,"input_group":"Machine"},
+            {"id":"working_days","label":"Working Days / Month","type":"input","input_type":"number","unit":"days","default":26,"input_group":"General"},
+            {"id":"pcs_per_hour","label":"Output pcs/hr","type":"formula","formula":"(3600 / cycle_time) * cavities","unit":"pcs/hr","formula_section":"Cost Breakdown"},
+            {"id":"monthly_output","label":"Monthly Output","type":"formula","formula":"pcs_per_hour * 8 * shifts_per_day * working_days","unit":"pcs","formula_section":"Cost Breakdown"},
+            {"id":"material_per_1000","label":"Material / 1000 pcs","type":"formula","formula":"(preform_weight / 1000) * resin_price * 1000 * (1 + rejection_pct / 100)","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"energy_per_1000","label":"Energy / 1000 pcs","type":"formula","formula":"(power_kw * electricity_rate) / pcs_per_hour * 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"labour_per_1000","label":"Labour / 1000 pcs","type":"formula","formula":"(operators * operator_salary * shifts_per_day) / (monthly_output / 1000)","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"depreciation_per_1000","label":"Depreciation / 1000 pcs","type":"formula","formula":"(machine_cost / 60) / (monthly_output / 1000)","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"total_cost_1000","label":"Total Cost / 1000 pcs","type":"formula","formula":"material_per_1000 + energy_per_1000 + labour_per_1000 + depreciation_per_1000","unit":"₹","formula_section":"Summary"},
+            {"id":"cost_per_piece","label":"Cost / Piece","type":"formula","formula":"total_cost_1000 / 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_price","label":"Selling Price / 1000","type":"formula","formula":"total_cost_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ]
+    },
+    "shrink_sleeve": {
+        "name": "Shrink Sleeve Cost Model",
+        "description": "Gravure/Flexo printed shrink sleeve (PVC/PET-G/OPS) with printing, slitting and seaming costs.",
+        "category": "essentials",
+        "packaging_type": "Shrink Sleeve",
+        "fields": [
+            {"id":"film_price","label":"Film Price","type":"input","input_type":"number","unit":"₹/kg","default":180,"input_group":"Material","data_source":"resin","data_key":"PET"},
+            {"id":"film_gsm","label":"Film GSM","type":"input","input_type":"number","unit":"gsm","default":45,"input_group":"Material"},
+            {"id":"sleeve_height","label":"Sleeve Height","type":"input","input_type":"number","unit":"mm","default":150,"input_group":"Dimensions"},
+            {"id":"sleeve_width","label":"Sleeve Lay-flat","type":"input","input_type":"number","unit":"mm","default":110,"input_group":"Dimensions"},
+            {"id":"colors","label":"No. of Colors","type":"input","input_type":"number","unit":"","default":8,"input_group":"Material"},
+            {"id":"ink_cost_per_kg","label":"Ink Cost","type":"input","input_type":"number","unit":"₹/kg","default":850,"input_group":"Material"},
+            {"id":"ink_coverage","label":"Ink Coverage","type":"input","input_type":"number","unit":"g/sqm","default":3.5,"input_group":"Material"},
+            {"id":"print_speed","label":"Print Speed","type":"input","input_type":"number","unit":"m/min","default":120,"input_group":"Machine"},
+            {"id":"machine_cost_print","label":"Printing Machine Cost","type":"input","input_type":"number","unit":"₹","default":35000000,"input_group":"Machine","data_source":"machine"},
+            {"id":"electricity_rate","label":"Electricity Rate","type":"input","input_type":"number","unit":"₹/kWh","default":8,"input_group":"Overhead","data_source":"variable_cost","data_key":"electricity"},
+            {"id":"power_kw","label":"Power Consumption","type":"input","input_type":"number","unit":"kW","default":45,"input_group":"Machine"},
+            {"id":"waste_pct","label":"Waste %","type":"input","input_type":"percent","unit":"%","default":5,"input_group":"General"},
+            {"id":"margin_pct","label":"Margin %","type":"input","input_type":"percent","unit":"%","default":15,"input_group":"General"},
+            {"id":"order_qty","label":"Order Quantity","type":"input","input_type":"number","unit":"pcs","default":100000,"input_group":"General"},
+            {"id":"sleeve_area","label":"Sleeve Area","type":"formula","formula":"(sleeve_height * sleeve_width * 2) / 1000000","unit":"sqm","formula_section":"Cost Breakdown"},
+            {"id":"film_cost_per_pc","label":"Film Cost / pc","type":"formula","formula":"sleeve_area * film_gsm * film_price / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"ink_cost_per_pc","label":"Ink Cost / pc","type":"formula","formula":"sleeve_area * ink_coverage * ink_cost_per_kg / 1000 * colors","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"pcs_per_hour","label":"Output pcs/hr","type":"formula","formula":"(print_speed * 60 / (sleeve_height / 1000)) * 0.85","unit":"pcs","formula_section":"Cost Breakdown"},
+            {"id":"energy_per_pc","label":"Energy / pc","type":"formula","formula":"(power_kw * electricity_rate) / pcs_per_hour","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"total_cost_per_1000","label":"Total / 1000 pcs","type":"formula","formula":"(film_cost_per_pc + ink_cost_per_pc + energy_per_pc) * 1000 * (1 + waste_pct / 100)","unit":"₹","formula_section":"Summary"},
+            {"id":"cost_per_pc","label":"Cost / Piece","type":"formula","formula":"total_cost_per_1000 / 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_price","label":"Selling Price / 1000","type":"formula","formula":"total_cost_per_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ]
+    },
+    "injection_moulding": {
+        "name": "Injection Moulding Cost Model",
+        "description": "Cap/closure or container injection moulding cost model with material, cycle time and overhead.",
+        "category": "essentials",
+        "packaging_type": "Injection Moulding",
+        "fields": [
+            {"id":"resin_price","label":"Resin Price","type":"input","input_type":"number","unit":"₹/kg","default":110,"input_group":"Material","data_source":"resin","data_key":"PP"},
+            {"id":"part_weight","label":"Part Weight","type":"input","input_type":"number","unit":"g","default":5,"input_group":"Material"},
+            {"id":"cavities","label":"No. of Cavities","type":"input","input_type":"number","unit":"","default":24,"input_group":"Machine"},
+            {"id":"cycle_time","label":"Cycle Time","type":"input","input_type":"number","unit":"sec","default":8,"input_group":"Machine"},
+            {"id":"machine_tonnage","label":"Machine Tonnage","type":"input","input_type":"number","unit":"T","default":200,"input_group":"Machine"},
+            {"id":"machine_cost","label":"Machine Cost","type":"input","input_type":"number","unit":"₹","default":4500000,"input_group":"Machine","data_source":"machine"},
+            {"id":"mould_cost","label":"Mould Cost","type":"input","input_type":"number","unit":"₹","default":2500000,"input_group":"Machine"},
+            {"id":"mould_life","label":"Mould Life","type":"input","input_type":"number","unit":"million shots","default":3,"input_group":"Machine"},
+            {"id":"electricity_rate","label":"Electricity Rate","type":"input","input_type":"number","unit":"₹/kWh","default":8,"input_group":"Overhead","data_source":"variable_cost","data_key":"electricity"},
+            {"id":"power_kw","label":"Power Consumption","type":"input","input_type":"number","unit":"kW","default":35,"input_group":"Machine"},
+            {"id":"operators","label":"Operators/Shift","type":"input","input_type":"number","unit":"","default":1,"input_group":"Labour"},
+            {"id":"operator_salary","label":"Operator Salary","type":"input","input_type":"number","unit":"₹/month","default":18000,"input_group":"Labour","data_source":"variable_cost","data_key":"labour"},
+            {"id":"rejection_pct","label":"Rejection %","type":"input","input_type":"percent","unit":"%","default":1.5,"input_group":"General"},
+            {"id":"margin_pct","label":"Margin %","type":"input","input_type":"percent","unit":"%","default":10,"input_group":"General"},
+            {"id":"shifts_per_day","label":"Shifts / Day","type":"input","input_type":"number","unit":"","default":3,"input_group":"Machine"},
+            {"id":"working_days","label":"Working Days / Month","type":"input","input_type":"number","unit":"","default":26,"input_group":"General"},
+            {"id":"pcs_per_hour","label":"Output pcs/hr","type":"formula","formula":"(3600 / cycle_time) * cavities","unit":"pcs/hr","formula_section":"Cost Breakdown"},
+            {"id":"monthly_output","label":"Monthly Output","type":"formula","formula":"pcs_per_hour * 8 * shifts_per_day * working_days","unit":"pcs","formula_section":"Cost Breakdown"},
+            {"id":"material_per_1000","label":"Material / 1000 pcs","type":"formula","formula":"(part_weight / 1000) * resin_price * 1000 * (1 + rejection_pct / 100)","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"energy_per_1000","label":"Energy / 1000 pcs","type":"formula","formula":"(power_kw * electricity_rate) / pcs_per_hour * 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"labour_per_1000","label":"Labour / 1000 pcs","type":"formula","formula":"(operators * operator_salary * shifts_per_day) / (monthly_output / 1000)","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"mould_per_1000","label":"Mould Cost / 1000 pcs","type":"formula","formula":"mould_cost / (mould_life * 1000000) * 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"depreciation_per_1000","label":"Depreciation / 1000","type":"formula","formula":"(machine_cost / 60) / (monthly_output / 1000)","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"total_cost_1000","label":"Total / 1000 pcs","type":"formula","formula":"material_per_1000 + energy_per_1000 + labour_per_1000 + mould_per_1000 + depreciation_per_1000","unit":"₹","formula_section":"Summary"},
+            {"id":"cost_per_piece","label":"Cost / Piece","type":"formula","formula":"total_cost_1000 / 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_price","label":"Selling Price / 1000","type":"formula","formula":"total_cost_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ]
+    },
+    "flexible_pouch": {
+        "name": "Flexible Pouch Cost Model",
+        "description": "Multi-layer laminated pouch with printing, lamination, slitting and pouch making costs.",
+        "category": "essentials",
+        "packaging_type": "Flexible Pouch",
+        "fields": [
+            {"id":"layer1_price","label":"Layer 1 (PET) Price","type":"input","input_type":"number","unit":"₹/kg","default":185,"input_group":"Material","data_source":"resin","data_key":"PET"},
+            {"id":"layer1_gsm","label":"Layer 1 GSM","type":"input","input_type":"number","unit":"gsm","default":12,"input_group":"Material"},
+            {"id":"layer2_price","label":"Layer 2 (BOPP/Nylon) Price","type":"input","input_type":"number","unit":"₹/kg","default":170,"input_group":"Material"},
+            {"id":"layer2_gsm","label":"Layer 2 GSM","type":"input","input_type":"number","unit":"gsm","default":15,"input_group":"Material"},
+            {"id":"layer3_price","label":"Layer 3 (PE) Price","type":"input","input_type":"number","unit":"₹/kg","default":120,"input_group":"Material","data_source":"resin","data_key":"LLDPE"},
+            {"id":"layer3_gsm","label":"Layer 3 GSM","type":"input","input_type":"number","unit":"gsm","default":50,"input_group":"Material"},
+            {"id":"adhesive_cost","label":"Adhesive Cost","type":"input","input_type":"number","unit":"₹/kg","default":320,"input_group":"Material"},
+            {"id":"adhesive_gsm","label":"Adhesive GSM","type":"input","input_type":"number","unit":"gsm","default":2.5,"input_group":"Material"},
+            {"id":"pouch_length","label":"Pouch Length","type":"input","input_type":"number","unit":"mm","default":200,"input_group":"Dimensions"},
+            {"id":"pouch_width","label":"Pouch Width","type":"input","input_type":"number","unit":"mm","default":140,"input_group":"Dimensions"},
+            {"id":"colors","label":"No. of Colors","type":"input","input_type":"number","unit":"","default":8,"input_group":"Material"},
+            {"id":"ink_cost","label":"Ink Cost","type":"input","input_type":"number","unit":"₹/kg","default":850,"input_group":"Material"},
+            {"id":"ink_coverage","label":"Ink Coverage","type":"input","input_type":"number","unit":"g/sqm","default":3,"input_group":"Material"},
+            {"id":"waste_pct","label":"Waste %","type":"input","input_type":"percent","unit":"%","default":7,"input_group":"General"},
+            {"id":"margin_pct","label":"Margin %","type":"input","input_type":"percent","unit":"%","default":15,"input_group":"General"},
+            {"id":"pouch_area","label":"Pouch Area","type":"formula","formula":"(pouch_length * pouch_width * 2) / 1000000","unit":"sqm","formula_section":"Cost Breakdown"},
+            {"id":"layer1_cost","label":"Layer 1 Cost / pc","type":"formula","formula":"pouch_area * layer1_gsm * layer1_price / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"layer2_cost","label":"Layer 2 Cost / pc","type":"formula","formula":"pouch_area * layer2_gsm * layer2_price / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"layer3_cost","label":"Layer 3 Cost / pc","type":"formula","formula":"pouch_area * layer3_gsm * layer3_price / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"adhesive_total","label":"Adhesive Cost / pc","type":"formula","formula":"pouch_area * adhesive_gsm * adhesive_cost / 1000 * 2","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"ink_total","label":"Ink Cost / pc","type":"formula","formula":"pouch_area * ink_coverage * ink_cost / 1000 * colors","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"material_total","label":"Material / pc","type":"formula","formula":"(layer1_cost + layer2_cost + layer3_cost + adhesive_total + ink_total) * (1 + waste_pct / 100)","unit":"₹","formula_section":"Summary"},
+            {"id":"total_cost_1000","label":"Total / 1000 pcs","type":"formula","formula":"material_total * 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_price_1000","label":"Selling / 1000","type":"formula","formula":"total_cost_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ]
+    },
+    "carton": {
+        "name": "Folding Carton Cost Model",
+        "description": "Offset/flexo printed folding carton from SBS/FBB/duplex board.",
+        "category": "essentials",
+        "packaging_type": "Carton",
+        "fields": [
+            {"id":"board_price","label":"Board Price","type":"input","input_type":"number","unit":"₹/kg","default":65,"input_group":"Material"},
+            {"id":"board_gsm","label":"Board GSM","type":"input","input_type":"number","unit":"gsm","default":300,"input_group":"Material"},
+            {"id":"carton_length","label":"Carton Length","type":"input","input_type":"number","unit":"mm","default":200,"input_group":"Dimensions"},
+            {"id":"carton_width","label":"Carton Width","type":"input","input_type":"number","unit":"mm","default":80,"input_group":"Dimensions"},
+            {"id":"carton_height","label":"Carton Height","type":"input","input_type":"number","unit":"mm","default":60,"input_group":"Dimensions"},
+            {"id":"ups_per_sheet","label":"Ups / Sheet","type":"input","input_type":"number","unit":"","default":6,"input_group":"Machine"},
+            {"id":"sheet_size_x","label":"Sheet Size X","type":"input","input_type":"number","unit":"mm","default":720,"input_group":"Machine"},
+            {"id":"sheet_size_y","label":"Sheet Size Y","type":"input","input_type":"number","unit":"mm","default":1020,"input_group":"Machine"},
+            {"id":"colors","label":"No. of Colors","type":"input","input_type":"number","unit":"","default":4,"input_group":"Material"},
+            {"id":"print_speed","label":"Print Speed","type":"input","input_type":"number","unit":"sheets/hr","default":8000,"input_group":"Machine"},
+            {"id":"printing_rate","label":"Printing Rate","type":"input","input_type":"number","unit":"₹/hr","default":3500,"input_group":"Machine"},
+            {"id":"die_cutting_rate","label":"Die Cutting Rate","type":"input","input_type":"number","unit":"₹/hr","default":2000,"input_group":"Machine"},
+            {"id":"dc_speed","label":"Die Cutting Speed","type":"input","input_type":"number","unit":"sheets/hr","default":5000,"input_group":"Machine"},
+            {"id":"lamination_rate","label":"Lamination Rate","type":"input","input_type":"number","unit":"₹/sheet","default":0.5,"input_group":"Material"},
+            {"id":"waste_pct","label":"Waste %","type":"input","input_type":"percent","unit":"%","default":8,"input_group":"General"},
+            {"id":"margin_pct","label":"Margin %","type":"input","input_type":"percent","unit":"%","default":18,"input_group":"General"},
+            {"id":"blank_area","label":"Carton Blank Area","type":"formula","formula":"((carton_length + carton_height * 2 + 30) * (carton_width + carton_height * 2 + 20)) / 1000000","unit":"sqm","formula_section":"Cost Breakdown"},
+            {"id":"board_cost_per_pc","label":"Board Cost / pc","type":"formula","formula":"blank_area * board_gsm * board_price / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"print_cost_per_pc","label":"Print Cost / pc","type":"formula","formula":"(printing_rate / print_speed) / ups_per_sheet","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"dc_cost_per_pc","label":"Die Cut Cost / pc","type":"formula","formula":"(die_cutting_rate / dc_speed) / ups_per_sheet","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"lam_cost_per_pc","label":"Lamination / pc","type":"formula","formula":"lamination_rate / ups_per_sheet","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"total_per_pc","label":"Total / pc","type":"formula","formula":"(board_cost_per_pc + print_cost_per_pc + dc_cost_per_pc + lam_cost_per_pc) * (1 + waste_pct / 100)","unit":"₹","formula_section":"Summary"},
+            {"id":"total_per_1000","label":"Total / 1000 pcs","type":"formula","formula":"total_per_pc * 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_per_1000","label":"Selling / 1000","type":"formula","formula":"total_per_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ]
+    },
+}
+
+PACKAGING_TYPE_SUGGEST_MAP = {
+    "PET Preform": ["resin_price","preform_weight","neck_size","cavities","cycle_time"],
+    "Shrink Sleeve": ["film_price","film_gsm","sleeve_height","sleeve_width","colors","ink_cost_per_kg"],
+    "Injection Moulding": ["resin_price","part_weight","cavities","cycle_time","machine_tonnage","mould_cost"],
+    "Flexible Pouch": ["layer1_price","layer1_gsm","pouch_length","pouch_width","colors"],
+    "Carton": ["board_price","board_gsm","carton_length","carton_width","carton_height","ups_per_sheet"],
+    "Blow Moulding": ["resin_price","bottle_weight","cavities","cycle_time","machine_cost"],
+    "Thermoforming": ["sheet_price","sheet_gsm","part_area","cavities","cycle_time"],
+}
+
+# Extended suggestions with full field blocks (defaults, units, formulas)
+SMART_FIELD_BLOCKS = {
+    "PET Preform": {
+        "inputs": [
+            {"id":"resin_price","label":"Resin Price","unit":"₹/kg","default":95,"input_group":"Material","data_source":"resin","data_key":"PET"},
+            {"id":"preform_weight","label":"Preform Weight","unit":"g","default":28,"input_group":"Material"},
+            {"id":"neck_size","label":"Neck Size","unit":"mm","default":28,"input_group":"Dimensions"},
+            {"id":"cavities","label":"No. of Cavities","unit":"","default":48,"input_group":"Machine"},
+            {"id":"cycle_time","label":"Cycle Time","unit":"sec","default":10,"input_group":"Machine"},
+            {"id":"energy_rate","label":"Energy Rate","unit":"₹/kWh","default":8,"input_group":"Overhead"},
+            {"id":"machine_power","label":"Machine Power","unit":"kW","default":120,"input_group":"Machine"},
+            {"id":"labour_per_hr","label":"Labour / hr","unit":"₹","default":250,"input_group":"Labour"},
+            {"id":"waste_pct","label":"Waste %","unit":"%","default":3,"input_group":"General","input_type":"percent"},
+            {"id":"margin_pct","label":"Margin %","unit":"%","default":15,"input_group":"General","input_type":"percent"},
+        ],
+        "formulas": [
+            {"id":"pcs_per_hr","label":"Pcs / Hour","formula":"(3600 / cycle_time) * cavities","unit":"pcs","formula_section":"Cost Breakdown"},
+            {"id":"resin_cost_pc","label":"Resin Cost / pc","formula":"resin_price * preform_weight / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"energy_cost_pc","label":"Energy Cost / pc","formula":"(machine_power * energy_rate) / pcs_per_hr","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"labour_cost_pc","label":"Labour Cost / pc","formula":"labour_per_hr / pcs_per_hr","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"material_total","label":"Material / pc","formula":"resin_cost_pc * (1 + waste_pct / 100)","unit":"₹","formula_section":"Summary"},
+            {"id":"conversion_total","label":"Conversion / pc","formula":"energy_cost_pc + labour_cost_pc","unit":"₹","formula_section":"Summary"},
+            {"id":"total_per_1000","label":"Total / 1000","formula":"(material_total + conversion_total) * 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_per_1000","label":"Selling / 1000","formula":"total_per_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ],
+    },
+    "Blow Moulding": {
+        "inputs": [
+            {"id":"resin_price","label":"Resin Price","unit":"₹/kg","default":90,"input_group":"Material","data_source":"resin","data_key":"HDPE"},
+            {"id":"bottle_weight","label":"Bottle Weight","unit":"g","default":18,"input_group":"Material"},
+            {"id":"cavities","label":"No. of Cavities","unit":"","default":8,"input_group":"Machine"},
+            {"id":"cycle_time","label":"Cycle Time","unit":"sec","default":6,"input_group":"Machine"},
+            {"id":"machine_cost","label":"Machine Cost","unit":"₹","default":5000000,"input_group":"Machine"},
+            {"id":"energy_rate","label":"Energy Rate","unit":"₹/kWh","default":8,"input_group":"Overhead"},
+            {"id":"machine_power","label":"Machine Power","unit":"kW","default":80,"input_group":"Machine"},
+            {"id":"waste_pct","label":"Waste %","unit":"%","default":4,"input_group":"General","input_type":"percent"},
+            {"id":"margin_pct","label":"Margin %","unit":"%","default":12,"input_group":"General","input_type":"percent"},
+        ],
+        "formulas": [
+            {"id":"pcs_per_hr","label":"Pcs / Hour","formula":"(3600 / cycle_time) * cavities","unit":"pcs","formula_section":"Cost Breakdown"},
+            {"id":"resin_cost_pc","label":"Resin Cost / pc","formula":"resin_price * bottle_weight / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"energy_cost_pc","label":"Energy Cost / pc","formula":"(machine_power * energy_rate) / pcs_per_hr","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"total_per_1000","label":"Total / 1000","formula":"(resin_cost_pc * (1 + waste_pct / 100) + energy_cost_pc) * 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_per_1000","label":"Selling / 1000","formula":"total_per_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ],
+    },
+    "Thermoforming": {
+        "inputs": [
+            {"id":"sheet_price","label":"Sheet Price","unit":"₹/kg","default":110,"input_group":"Material"},
+            {"id":"sheet_gsm","label":"Sheet GSM","unit":"gsm","default":400,"input_group":"Material"},
+            {"id":"part_area","label":"Part Area","unit":"sqcm","default":120,"input_group":"Dimensions"},
+            {"id":"cavities","label":"Cavities","unit":"","default":12,"input_group":"Machine"},
+            {"id":"cycle_time","label":"Cycle Time","unit":"sec","default":5,"input_group":"Machine"},
+            {"id":"waste_pct","label":"Waste %","unit":"%","default":15,"input_group":"General","input_type":"percent"},
+            {"id":"margin_pct","label":"Margin %","unit":"%","default":18,"input_group":"General","input_type":"percent"},
+        ],
+        "formulas": [
+            {"id":"pcs_per_hr","label":"Pcs / Hour","formula":"(3600 / cycle_time) * cavities","unit":"pcs","formula_section":"Cost Breakdown"},
+            {"id":"sheet_cost_pc","label":"Sheet / pc","formula":"(part_area / 10000) * sheet_gsm * sheet_price / 1000000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"total_per_1000","label":"Total / 1000","formula":"sheet_cost_pc * (1 + waste_pct / 100) * 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_per_1000","label":"Selling / 1000","formula":"total_per_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ],
+    },
+    "Shrink Sleeve": {
+        "inputs": [
+            {"id":"film_price","label":"Film Price","unit":"₹/kg","default":180,"input_group":"Material"},
+            {"id":"film_gsm","label":"Film GSM","unit":"gsm","default":45,"input_group":"Material"},
+            {"id":"sleeve_height","label":"Sleeve Height","unit":"mm","default":100,"input_group":"Dimensions"},
+            {"id":"sleeve_width","label":"Sleeve Circumference","unit":"mm","default":200,"input_group":"Dimensions"},
+            {"id":"colors","label":"No. of Colors","unit":"","default":8,"input_group":"Material"},
+            {"id":"ink_cost_per_kg","label":"Ink Cost","unit":"₹/kg","default":600,"input_group":"Material"},
+            {"id":"ink_coverage","label":"Ink Coverage","unit":"g/sqm","default":3,"input_group":"Material"},
+            {"id":"waste_pct","label":"Waste %","unit":"%","default":8,"input_group":"General","input_type":"percent"},
+            {"id":"margin_pct","label":"Margin %","unit":"%","default":15,"input_group":"General","input_type":"percent"},
+        ],
+        "formulas": [
+            {"id":"sleeve_area","label":"Sleeve Area","formula":"(sleeve_height * sleeve_width) / 1000000","unit":"sqm","formula_section":"Cost Breakdown"},
+            {"id":"film_cost_pc","label":"Film / pc","formula":"sleeve_area * film_gsm * film_price / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"ink_cost_pc","label":"Ink / pc","formula":"sleeve_area * ink_coverage * ink_cost_per_kg / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"total_per_1000","label":"Total / 1000","formula":"(film_cost_pc + ink_cost_pc) * (1 + waste_pct / 100) * 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_per_1000","label":"Selling / 1000","formula":"total_per_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ],
+    },
+    "Injection Moulding": {
+        "inputs": [
+            {"id":"resin_price","label":"Resin Price","unit":"₹/kg","default":120,"input_group":"Material"},
+            {"id":"part_weight","label":"Part Weight","unit":"g","default":35,"input_group":"Material"},
+            {"id":"cavities","label":"Cavities","unit":"","default":4,"input_group":"Machine"},
+            {"id":"cycle_time","label":"Cycle Time","unit":"sec","default":20,"input_group":"Machine"},
+            {"id":"machine_tonnage","label":"Machine Tonnage","unit":"T","default":250,"input_group":"Machine"},
+            {"id":"mould_cost","label":"Mould Cost","unit":"₹","default":800000,"input_group":"Machine"},
+            {"id":"mould_life","label":"Mould Life","unit":"shots","default":500000,"input_group":"Machine"},
+            {"id":"energy_rate","label":"Energy Rate","unit":"₹/kWh","default":8,"input_group":"Overhead"},
+            {"id":"waste_pct","label":"Waste %","unit":"%","default":3,"input_group":"General","input_type":"percent"},
+            {"id":"margin_pct","label":"Margin %","unit":"%","default":15,"input_group":"General","input_type":"percent"},
+        ],
+        "formulas": [
+            {"id":"pcs_per_hr","label":"Pcs / Hour","formula":"(3600 / cycle_time) * cavities","unit":"pcs","formula_section":"Cost Breakdown"},
+            {"id":"resin_cost_pc","label":"Resin / pc","formula":"resin_price * part_weight / 1000","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"mould_cost_pc","label":"Mould / pc","formula":"mould_cost / mould_life","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"energy_cost_pc","label":"Energy / pc","formula":"(machine_tonnage * 0.08 * energy_rate) / pcs_per_hr","unit":"₹","formula_section":"Cost Breakdown"},
+            {"id":"total_per_1000","label":"Total / 1000","formula":"(resin_cost_pc * (1 + waste_pct / 100) + mould_cost_pc + energy_cost_pc) * 1000","unit":"₹","formula_section":"Summary"},
+            {"id":"selling_per_1000","label":"Selling / 1000","formula":"total_per_1000 * (1 + margin_pct / 100)","unit":"₹","formula_section":"Summary"},
+        ],
+    },
+}
+
+# ── UNIT / CURRENCY CONVERSION ENGINE ──
+UNIT_CONVERSIONS = {
+    ("gsm", "kg/sqm"):   lambda v: v / 1000,
+    ("kg/sqm", "gsm"):   lambda v: v * 1000,
+    ("g", "kg"):          lambda v: v / 1000,
+    ("kg", "g"):          lambda v: v * 1000,
+    ("kg", "MT"):         lambda v: v / 1000,
+    ("MT", "kg"):         lambda v: v * 1000,
+    ("pcs", "1000 pcs"):  lambda v: v / 1000,
+    ("1000 pcs", "pcs"):  lambda v: v * 1000,
+    ("mm", "cm"):         lambda v: v / 10,
+    ("cm", "mm"):         lambda v: v * 10,
+    ("mm", "m"):          lambda v: v / 1000,
+    ("m", "mm"):          lambda v: v * 1000,
+    ("sqm", "sqft"):      lambda v: v * 10.764,
+    ("sqft", "sqm"):      lambda v: v / 10.764,
+    ("ml", "l"):          lambda v: v / 1000,
+    ("l", "ml"):          lambda v: v * 1000,
+    ("oz", "g"):          lambda v: v * 28.3495,
+    ("g", "oz"):          lambda v: v / 28.3495,
+    ("lb", "kg"):         lambda v: v * 0.4536,
+    ("kg", "lb"):         lambda v: v / 0.4536,
+    ("in", "mm"):         lambda v: v * 25.4,
+    ("mm", "in"):         lambda v: v / 25.4,
+    ("micron", "mm"):     lambda v: v / 1000,
+    ("mm", "micron"):     lambda v: v * 1000,
+}
+
+# Approximate exchange rates against INR (base)
+CURRENCY_RATES_INR = {
+    "₹": 1, "INR": 1,
+    "$": 83.5, "USD": 83.5,
+    "€": 90.5, "EUR": 90.5,
+    "£": 106, "GBP": 106,
+    "¥": 0.58, "CNY": 0.58,
+    "Rp": 0.0054, "IDR": 0.0054,
+}
+
+
+@app.route("/api/model_templates", methods=["GET"])
+@login_required
+def api_model_templates():
+    """Return all pre-built packaging cost model templates."""
+    out = []
+    for key, tmpl in PACKAGING_TEMPLATES.items():
+        out.append({
+            "key": key,
+            "name": tmpl["name"],
+            "description": tmpl["description"],
+            "category": tmpl["category"],
+            "packaging_type": tmpl.get("packaging_type", ""),
+            "field_count": len(tmpl["fields"]),
+            "input_count": sum(1 for f in tmpl["fields"] if f["type"] == "input"),
+            "formula_count": sum(1 for f in tmpl["fields"] if f["type"] == "formula"),
+        })
+    return jsonify({"success": True, "templates": out})
+
+
+@app.route("/api/model_templates/<key>", methods=["GET"])
+@login_required
+def api_get_template(key):
+    """Return a single template's full definition."""
+    tmpl = PACKAGING_TEMPLATES.get(key)
+    if not tmpl:
+        return jsonify({"success": False, "message": "Template not found"}), 404
+    return jsonify({"success": True, "template": tmpl})
+
+
+@app.route("/api/formula_explain", methods=["POST"])
+@login_required
+def api_formula_explain():
+    """Explain a formula in plain English + detect dependencies."""
+    data = request.get_json() or {}
+    expr = data.get('formula', '').strip()
+    fields_map = {f['id']: f.get('label', f['id']) for f in data.get('fields', [])}
+
+    if not expr:
+        return jsonify({"success": True, "explanation": "Empty formula.", "dependencies": []})
+
+    # Find all identifiers used
+    try:
+        tree = ast.parse(expr, mode='eval')
+    except SyntaxError as e:
+        return jsonify({"success": False, "explanation": f"Syntax error: {e}", "dependencies": []})
+
+    deps = []
+    funcs_used = []
+    _extract_names(tree, deps, funcs_used)
+    deps = list(set(deps))
+    funcs_used = list(set(funcs_used))
+
+    # Build human-readable explanation
+    parts = []
+    explained = expr
+    for dep in deps:
+        label = fields_map.get(dep, dep)
+        explained = explained.replace(dep, f'[{label}]')
+
+    # Describe operations
+    desc_parts = []
+    if '*' in expr and '+' in expr:
+        desc_parts.append("multiplies and adds values together")
+    elif '*' in expr:
+        desc_parts.append("multiplies values together")
+    elif '+' in expr:
+        desc_parts.append("adds values together")
+    if '/' in expr:
+        desc_parts.append("with division")
+    if '-' in expr:
+        desc_parts.append("with subtraction")
+    if funcs_used:
+        desc_parts.append(f"using functions: {', '.join(funcs_used)}")
+
+    dep_labels = [fields_map.get(d, d) for d in deps]
+    explanation = f"Formula: {explained}\n"
+    explanation += f"This {'calculates by ' + ' '.join(desc_parts) if desc_parts else 'returns a value'}.\n"
+    explanation += f"Depends on: {', '.join(dep_labels) if dep_labels else 'no inputs'}."
+
+    return jsonify({
+        "success": True,
+        "explanation": explanation,
+        "readable": explained,
+        "dependencies": deps,
+        "functions": funcs_used
+    })
+
+
+def _extract_names(node, names, funcs):
+    """Walk AST to extract variable names and function calls."""
+    if isinstance(node, ast.Name):
+        if node.id in _SAFE_FUNCS:
+            funcs.append(node.id)
+        else:
+            names.append(node.id)
+    for child in ast.iter_child_nodes(node):
+        _extract_names(child, names, funcs)
+
+
+@app.route("/api/formula_deps", methods=["POST"])
+@login_required
+def api_formula_deps():
+    """Return full dependency graph for all fields in a model."""
+    data = request.get_json() or {}
+    fields = data.get('fields', [])
+
+    graph = {}  # field_id -> list of dependency ids
+    circular = []
+    missing = []
+    all_ids = {f['id'] for f in fields if f.get('id')}
+
+    for field in fields:
+        fid = field.get('id', '')
+        if field.get('type') != 'formula' or not fid:
+            continue
+        expr = field.get('formula', '')
+        deps = []
+        funcs = []
+        try:
+            tree = ast.parse(expr, mode='eval')
+            _extract_names(tree, deps, funcs)
+        except:
+            pass
+        deps = list(set(deps))
+        graph[fid] = deps
+        # Check for missing refs
+        for d in deps:
+            if d not in all_ids:
+                missing.append({"field": fid, "missing": d})
+
+    # Detect circular references via DFS
+    def has_cycle(node, visited, path):
+        if node in path:
+            return True
+        if node in visited:
+            return False
+        visited.add(node)
+        path.add(node)
+        for dep in graph.get(node, []):
+            if has_cycle(dep, visited, path):
+                circular.append({"field": node, "cycle_through": dep})
+                return True
+        path.discard(node)
+        return False
+
+    visited = set()
+    for fid in graph:
+        has_cycle(fid, visited, set())
+
+    # Build nodes + edges for visualization
+    nodes = []
+    edges = []
+    for f in fields:
+        fid = f.get('id', '')
+        if not fid:
+            continue
+        nodes.append({
+            "id": fid,
+            "label": f.get('label', fid),
+            "type": f.get('type', 'input'),
+            "group": f.get('input_group') or f.get('formula_section', ''),
+        })
+    for fid, deps in graph.items():
+        for dep in deps:
+            edges.append({"from": dep, "to": fid})
+
+    return jsonify({
+        "success": True,
+        "nodes": nodes,
+        "edges": edges,
+        "circular": circular,
+        "missing": missing,
+    })
+
+
+@app.route("/api/convert_units", methods=["POST"])
+@login_required
+def api_convert_units():
+    """Convert between units or currencies."""
+    data = request.get_json() or {}
+    value = float(data.get('value', 0))
+    from_unit = data.get('from', '')
+    to_unit = data.get('to', '')
+
+    # Try unit conversion
+    converter = UNIT_CONVERSIONS.get((from_unit, to_unit))
+    if converter:
+        return jsonify({"success": True, "result": round(converter(value), 6), "type": "unit"})
+
+    # Try currency conversion via INR base
+    from_rate = CURRENCY_RATES_INR.get(from_unit)
+    to_rate = CURRENCY_RATES_INR.get(to_unit)
+    if from_rate and to_rate:
+        inr_value = value * from_rate
+        result = inr_value / to_rate
+        return jsonify({"success": True, "result": round(result, 4), "type": "currency"})
+
+    return jsonify({"success": False, "message": f"No conversion from {from_unit} to {to_unit}"})
+
+
+@app.route("/api/db_lookup", methods=["POST"])
+@login_required
+def api_db_lookup():
+    """Lookup live values from Resin Tracker, Machine DB, or Variable Cost DB."""
+    data = request.get_json() or {}
+    source = data.get('source', '')
+    key = data.get('key', '')
+
+    if source == 'resin':
+        try:
+            xl = load_excel_cached('resin')
+            if xl is None:
+                return jsonify({"success": False, "message": "Resin DB unavailable"})
+            target_sheet = None
+            for sname in xl.sheet_names:
+                if sname.strip().upper() == key.strip().upper():
+                    target_sheet = sname
+                    break
+            if not target_sheet:
+                for sname in xl.sheet_names:
+                    if key.strip().upper() in sname.strip().upper():
+                        target_sheet = sname
+                        break
+            if not target_sheet:
+                return jsonify({"success": True, "value": 0, "message": f"Sheet '{key}' not found"})
+            df = clean_resin_df(target_sheet)
+            meta_cols = ["Supplier", "Country", "Location", "Grade", "Unit"]
+            date_cols = [c for c in df.columns if c not in meta_cols and not str(c).startswith("Unnamed")]
+            dated = []
+            for c in date_cols:
+                dt = parse_date_col(c)
+                if dt:
+                    dated.append((dt, c))
+            dated.sort(key=lambda x: x[0], reverse=True)
+            for dt_obj, col in dated:
+                vals = pd.to_numeric(df[col], errors='coerce').dropna()
+                vals = vals[vals > 0]
+                if len(vals) > 0:
+                    avg_price = round(float(vals.mean()), 2)
+                    price_per_kg = round(avg_price / 1000, 4)
+                    return jsonify({
+                        "success": True,
+                        "value": price_per_kg,
+                        "display": f"₹{price_per_kg}/kg (avg ₹{avg_price}/MT)",
+                        "date": dt_obj.strftime('%Y-%m-%d'),
+                        "source": "Resin Tracker"
+                    })
+            return jsonify({"success": True, "value": 0, "message": "No price data found"})
+        except Exception as e:
+            return jsonify({"success": False, "message": str(e)})
+
+    elif source == 'machine':
+        try:
+            df = load_excel_cached('machine', sheet_name="Database", header=2)
+            machines = []
+            for _, r in df.head(20).iterrows():
+                cost = r.get("Machine Cost In €") or r.get("Machine Cost") or 0
+                if pd.isna(cost):
+                    cost = 0
+                machines.append({
+                    "make": str(r.get("Make", "")),
+                    "model": str(r.get("Model", "")),
+                    "category": str(r.get("Category", "")),
+                    "cost_eur": float(cost) if cost else 0,
+                })
+            return jsonify({"success": True, "machines": machines, "source": "Machine DB"})
+        except Exception as e:
+            return jsonify({"success": False, "message": str(e)})
+
+    elif source == 'variable_cost':
+        try:
+            df = load_excel_cached('cost', sheet_name="Data", header=9)
+            df.columns = [str(c).strip() for c in df.columns]
+            country = data.get('country', 'India')
+            row_data = df[df.iloc[:, 0] == country]
+            if row_data.empty:
+                return jsonify({"success": True, "value": 0, "message": f"Country '{country}' not found"})
+            row = row_data.iloc[0]
+            # Search for the key in column names
+            result = {}
+            for col in df.columns[1:]:
+                if key.lower() in col.lower():
+                    val = row[col]
+                    if not pd.isna(val):
+                        try:
+                            result[col] = float(val)
+                        except:
+                            result[col] = str(val)
+            if result:
+                first_val = list(result.values())[0]
+                return jsonify({
+                    "success": True,
+                    "value": first_val if isinstance(first_val, (int, float)) else 0,
+                    "details": result,
+                    "source": "Variable Cost DB"
+                })
+            return jsonify({"success": True, "value": 0, "message": f"Key '{key}' not found for {country}"})
+        except Exception as e:
+            return jsonify({"success": False, "message": str(e)})
+
+    return jsonify({"success": False, "message": f"Unknown source: {source}"})
+
+
+@app.route("/api/field_suggest", methods=["POST"])
+@login_required
+def api_field_suggest():
+    """Suggest fields based on packaging type — returns full field blocks with defaults."""
+    data = request.get_json() or {}
+    pkg_type = data.get('packaging_type', '')
+    suggestions = PACKAGING_TYPE_SUGGEST_MAP.get(pkg_type, [])
+    # Find matching template fields (legacy)
+    result_fields = []
+    for key, tmpl in PACKAGING_TEMPLATES.items():
+        if tmpl.get('packaging_type') == pkg_type:
+            result_fields = tmpl['fields']
+            break
+    # New: return smart field blocks with full metadata
+    smart_blocks = SMART_FIELD_BLOCKS.get(pkg_type, {})
+    return jsonify({
+        "success": True,
+        "suggested_ids": suggestions,
+        "fields": result_fields,
+        "smart_blocks": smart_blocks,
+    })
+
+
+@app.route("/api/excel_to_model", methods=["POST"])
+@role_required('admin')
+def api_excel_to_model():
+    """Parse uploaded .xlsx and auto-detect inputs vs formulas.
+    Returns a model JSON with field mappings for preview."""
+    if 'file' not in request.files:
+        return jsonify({"success": False, "message": "No file uploaded"})
+    file = request.files['file']
+    if not file.filename.endswith(('.xlsx', '.xls')):
+        return jsonify({"success": False, "message": "Only .xlsx/.xls files accepted"})
+
+    try:
+        import openpyxl
+        wb = openpyxl.load_workbook(file, data_only=False)
+        ws = wb.active
+
+        cell_map = {}      # A1 -> {"value": ..., "formula": ...}
+        fields = []
+        field_id_map = {}  # A1 -> field_id
+
+        # Pass 1: read all cells
+        for row in ws.iter_rows(min_row=1, max_row=min(ws.max_row or 1, 200),
+                                max_col=min(ws.max_column or 1, 30)):
+            for cell in row:
+                if cell.value is None:
+                    continue
+                coord = cell.coordinate  # e.g. "A1"
+                val = cell.value
+                is_formula = isinstance(val, str) and val.startswith('=')
+                cell_map[coord] = {
+                    "value": val,
+                    "is_formula": is_formula,
+                    "row": cell.row,
+                    "col": cell.column,
+                    "col_letter": cell.column_letter,
+                }
+
+        # Pass 2: detect labels (text in column A or row 1) and values
+        label_cells = {}   # coord -> label text
+        value_cells = {}   # coord -> cell info
+
+        for coord, info in cell_map.items():
+            val = info['value']
+            if isinstance(val, str) and not info['is_formula']:
+                # Could be a label
+                label_cells[coord] = str(val).strip()
+            elif isinstance(val, (int, float)) or info['is_formula']:
+                value_cells[coord] = info
+
+        # Pass 3: pair labels with values (label in col A, value in col B/C)
+        used_labels = set()
+        for coord, info in sorted(value_cells.items(), key=lambda x: (x[1]['row'], x[1]['col'])):
+            row_num = info['row']
+            # Look for label in column A of same row
+            label_coord = f"A{row_num}"
+            label = label_cells.get(label_coord, '')
+            if not label:
+                # Try column to the left
+                if info['col'] > 1:
+                    prev_letter = chr(ord(info['col_letter']) - 1)
+                    label_coord = f"{prev_letter}{row_num}"
+                    label = label_cells.get(label_coord, '')
+            if not label:
+                label = f"field_{coord.lower()}"
+
+            # Generate field ID from label
+            fid = _re.sub(r'[^a-z0-9_]', '_', label.lower().strip())
+            fid = _re.sub(r'_+', '_', fid).strip('_')[:30]
+            if not fid:
+                fid = f"cell_{coord.lower()}"
+
+            # Ensure unique
+            base_fid = fid
+            counter = 2
+            while fid in field_id_map.values():
+                fid = f"{base_fid}_{counter}"
+                counter += 1
+
+            field_id_map[coord] = fid
+
+            if info['is_formula']:
+                fields.append({
+                    "id": fid,
+                    "label": label,
+                    "type": "formula",
+                    "formula": "",  # Will be resolved in pass 4
+                    "unit": "",
+                    "formula_section": "Cost Breakdown",
+                    "_raw_formula": str(info['value']),
+                    "_cell": coord,
+                })
+            else:
+                fields.append({
+                    "id": fid,
+                    "label": label,
+                    "type": "input",
+                    "input_type": "number",
+                    "default": float(info['value']) if isinstance(info['value'], (int, float)) else 0,
+                    "unit": "",
+                    "input_group": "General",
+                    "_cell": coord,
+                })
+
+        # Pass 4: convert Excel formulas to Python-style using field IDs
+        ref_pattern = _re.compile(r'\b([A-Z]{1,3})(\d{1,5})\b')
+        for f in fields:
+            if f['type'] != 'formula':
+                continue
+            raw = f.get('_raw_formula', '=0')[1:]  # strip leading =
+            def replace_ref(m):
+                ref = m.group(0)
+                mapped_id = field_id_map.get(ref)
+                if mapped_id:
+                    return mapped_id
+                return '0'  # Unknown reference
+            converted = ref_pattern.sub(replace_ref, raw)
+            # Excel → Python: SUM(a,b) already works, convert common funcs
+            converted = converted.replace('^', '**')
+            f['formula'] = converted
+
+        # Build mapping table for preview
+        mapping = []
+        for f in fields:
+            mapping.append({
+                "cell": f.get('_cell', ''),
+                "field_id": f['id'],
+                "label": f['label'],
+                "type": f['type'],
+                "formula": f.get('formula', ''),
+                "default": f.get('default', ''),
+            })
+
+        # Clean internal keys
+        for f in fields:
+            f.pop('_raw_formula', None)
+            f.pop('_cell', None)
+
+        model_json = {
+            "name": file.filename.rsplit('.', 1)[0].replace('_', ' ').title(),
+            "description": f"Auto-generated from {file.filename}",
+            "category": "essentials",
+            "fields": fields,
+        }
+
+        return jsonify({
+            "success": True,
+            "model": model_json,
+            "mapping": mapping,
+            "cell_count": len(cell_map),
+            "input_count": sum(1 for f in fields if f['type'] == 'input'),
+            "formula_count": sum(1 for f in fields if f['type'] == 'formula'),
+        })
+    except Exception as e:
+        logger.error(f"Excel→Model parse error: {e}", exc_info=True)
+        return jsonify({"success": False, "message": str(e)})
+
+
+@app.route("/api/scenarios", methods=["POST"])
+@login_required
+def api_save_scenario():
+    """Save a named scenario for comparison."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "message": "No data"})
+    scenario_dir = DATA_DIR / "scenarios"
+    scenario_dir.mkdir(exist_ok=True)
+    sid = data.get('id') or str(uuid.uuid4())[:8]
+    data['id'] = sid
+    data['saved_at'] = datetime.now().isoformat()
+    path = scenario_dir / f"{sid}.json"
+    with open(path, 'w') as f:
+        json.dump(data, f, indent=2)
+    return jsonify({"success": True, "id": sid})
+
+
+@app.route("/api/scenarios", methods=["GET"])
+@login_required
+def api_list_scenarios():
+    """List all saved scenarios."""
+    scenario_dir = DATA_DIR / "scenarios"
+    scenario_dir.mkdir(exist_ok=True)
+    scenarios = []
+    for f in sorted(scenario_dir.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True):
+        try:
+            with open(f, 'r') as fh:
+                scenarios.append(json.load(fh))
+        except Exception:
+            pass
+    return jsonify({"success": True, "scenarios": scenarios})
+
+
+@app.route("/api/scenarios/<sid>", methods=["DELETE"])
+@login_required
+def api_delete_scenario(sid):
+    """Delete a scenario."""
+    path = DATA_DIR / "scenarios" / f"{sid}.json"
+    if path.exists():
+        path.unlink()
+    return jsonify({"success": True})
+
+
+@app.route("/api/export_scenario_report", methods=["POST"])
+@login_required
+def api_export_scenario_report():
+    """Export scenario comparison as Excel report."""
+    data = request.get_json()
+    if not data or not data.get('scenarios'):
+        return jsonify({"error": "No scenarios provided"}), 400
+    try:
+        scenarios = data['scenarios']
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Comparison sheet
+            rows = []
+            for sc in scenarios:
+                r = sc.get('results', {})
+                rows.append({
+                    'Scenario': sc.get('name', 'Untitled'),
+                    'Model': sc.get('model', ''),
+                    'Material Cost': r.get('material_cost', 0),
+                    'Conversion Cost': r.get('conversion_cost', 0),
+                    'Total / 1000': r.get('total_cost_per_1000', 0),
+                    'Cost / pc': r.get('cost_per_piece', 0),
+                    'Margin %': r.get('margin_pct', 0),
+                    'Saved At': sc.get('saved_at', ''),
+                })
+            df = pd.DataFrame(rows)
+            df.to_excel(writer, sheet_name='Comparison', index=False)
+
+            # Inputs per scenario
+            for i, sc in enumerate(scenarios):
+                inp = sc.get('inputs', {})
+                inp_rows = [{'Field': k, 'Value': v} for k, v in inp.items()]
+                if inp_rows:
+                    sname = (sc.get('name', f'S{i+1}'))[:28]
+                    pd.DataFrame(inp_rows).to_excel(writer, sheet_name=sname, index=False)
+
+            # Format
+            from openpyxl.styles import Font, PatternFill
+            for sn in writer.sheets:
+                ws = writer.sheets[sn]
+                for cell in ws[1]:
+                    cell.font = Font(bold=True, color='FFFFFF')
+                    cell.fill = PatternFill(start_color='E8601C', end_color='E8601C', fill_type='solid')
+                for row in ws.iter_rows(min_row=2):
+                    for cell in row:
+                        if isinstance(cell.value, (int, float)):
+                            cell.number_format = '#,##0.00'
+                for col in ws.columns:
+                    ml = max(len(str(c.value or '')) for c in col) + 4
+                    ws.column_dimensions[col[0].column_letter].width = min(ml, 30)
+
+        output.seek(0)
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+                         as_attachment=True, download_name=f'Scenario_Comparison_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx')
+    except Exception as e:
+        logger.error(f"Scenario export error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/calculate", methods=["POST"])
+def api_calculate_custom():
+    """Calculate a custom model — used by shared calculator."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"success": False, "message": "No data"})
+    model_id = data.get('model_id')
+    inputs = data.get('inputs', {})
+    model_path = MODELS_DIR / f"{model_id}.json"
+    if not model_path.exists():
+        return jsonify({"success": False, "message": "Model not found"})
+    with open(model_path, 'r') as f:
+        model = json.load(f)
+    # Evaluate formulas
+    results = {}
+    errors = {}
+    # Build namespace from inputs
+    ns = {}
+    for field in model.get('fields', []):
+        fid = field['id']
+        if field.get('type') == 'input':
+            val = inputs.get(fid, field.get('default', 0))
+            try:
+                ns[fid] = float(val)
+            except (ValueError, TypeError):
+                ns[fid] = 0
+    # Evaluate formulas in order using SAFE parser (no eval)
+    for field in model.get('fields', []):
+        fid = field['id']
+        if field.get('type') == 'formula':
+            expr = field.get('formula', '0')
+            value, err = safe_eval_formula(expr, ns)
+            ns[fid] = value
+            results[fid] = round(value, 4)
+            if err:
+                errors[fid] = err
+    return jsonify({"success": True, "results": results, "errors": errors})
 
 # ================= API ENDPOINTS =================
 
@@ -1637,6 +3560,108 @@ def api_check_file_updates():
         "machine_updated": check_file_updated('machine'),
         "cost_updated": check_file_updated('cost')
     })
+
+
+@app.route("/api/dashboard_prices", methods=["GET"])
+def api_dashboard_prices():
+    """Return summary price data for the dashboard: latest resin prices and global material prices."""
+    result = {"resin": [], "global_materials": []}
+    try:
+        # ── Resin summary: latest price per sheet ──────────────────────────────
+        if RESIN_EXCEL.exists():
+            xls = pd.ExcelFile(RESIN_EXCEL)
+            for sheet in xls.sheet_names[:8]:  # cap at 8 resin types
+                if sheet.lower() == 'unknown':
+                    continue
+                try:
+                    df_r = clean_resin_df(sheet)
+                    if df_r is None or df_r.empty:
+                        continue
+                    meta_cols = ["Supplier", "Country", "Location", "Grade", "Unit"]
+                    price_cols = [c for c in df_r.columns if c not in meta_cols and not str(c).startswith("Unnamed")]
+                    if not price_cols:
+                        continue
+                    # sort by date
+                    col_date_pairs = [(c, parse_date_col(c) or datetime.max) for c in price_cols]
+                    col_date_pairs.sort(key=lambda x: x[1])
+                    sorted_cols = [p[0] for p in col_date_pairs]
+                    # latest valid price across all rows
+                    prices_found = []
+                    for col in reversed(sorted_cols):
+                        vals = pd.to_numeric(df_r[col], errors='coerce').dropna()
+                        vals = vals[vals > 0]
+                        if not vals.empty:
+                            avg_val = float(vals.mean())
+                            prev_col_idx = sorted_cols.index(col) - 1
+                            change_pct = 0
+                            if prev_col_idx >= 0:
+                                prev_vals = pd.to_numeric(df_r[sorted_cols[prev_col_idx]], errors='coerce').dropna()
+                                prev_vals = prev_vals[prev_vals > 0]
+                                if not prev_vals.empty:
+                                    prev_avg = float(prev_vals.mean())
+                                    change_pct = round(((avg_val - prev_avg) / prev_avg) * 100, 2) if prev_avg > 0 else 0
+                            trend = 'Rising' if change_pct > 2 else ('Falling' if change_pct < -2 else 'Stable')
+                            prices_found.append({
+                                "label": col,
+                                "avg": round(avg_val, 2),
+                                "change_pct": change_pct,
+                                "trend": trend
+                            })
+                            break
+                    if prices_found:
+                        result["resin"].append({
+                            "resin_type": sheet,
+                            "latest_label": prices_found[0]["label"],
+                            "avg_price": prices_found[0]["avg"],
+                            "change_pct": prices_found[0]["change_pct"],
+                            "trend": prices_found[0]["trend"]
+                        })
+                except Exception:
+                    continue
+    except Exception as e:
+        logger.warning(f"dashboard_prices resin error: {e}")
+
+    try:
+        # ── Global material summary: latest quarter price per commodity ─────────
+        gm_df = _load_global_material_df()
+        if gm_df is not None:
+            qcols = _gm_quarter_cols(gm_df)
+            rates = _get_fx_rates()
+            eur_to_usd = rates.get('USD', 1.08)
+            commodities = gm_df['Commodity'].dropna().astype(str).str.strip().unique()
+            for comm in list(commodities)[:10]:  # cap at 10
+                rows = gm_df[gm_df['Commodity'].astype(str).str.strip() == comm]
+                prices_eur = []
+                for qc in qcols:
+                    try:
+                        vals = pd.to_numeric(rows[qc], errors='coerce').dropna()
+                        vals = vals[vals > 0]
+                        if not vals.empty:
+                            prices_eur.append((str(qc), round(float(vals.mean()), 2)))
+                    except Exception:
+                        pass
+                if not prices_eur:
+                    continue
+                latest_q, latest_eur = prices_eur[-1]
+                change_pct = 0
+                if len(prices_eur) > 1:
+                    prev_eur = prices_eur[-2][1]
+                    change_pct = round(((latest_eur - prev_eur) / prev_eur) * 100, 2) if prev_eur > 0 else 0
+                trend = 'Rising' if change_pct > 2 else ('Falling' if change_pct < -2 else 'Stable')
+                result["global_materials"].append({
+                    "commodity": comm,
+                    "latest_quarter": latest_q,
+                    "avg_eur": latest_eur,
+                    "avg_usd": round(latest_eur * eur_to_usd, 2),
+                    "change_pct": change_pct,
+                    "trend": trend,
+                    "quarters": [p[0] for p in prices_eur],
+                    "prices_eur": [p[1] for p in prices_eur]
+                })
+    except Exception as e:
+        logger.warning(f"dashboard_prices gm error: {e}")
+
+    return jsonify(result)
 
 @app.route("/api/resin_load", methods=["POST"])
 def api_resin_load():
@@ -1807,9 +3832,7 @@ def api_mach_res():
                 "power": format_num("power", power), 
                 "power_raw": float(power) if not pd.isna(power) else 0,
                 "sqm": format_num("sqm", sqm),
-                "sqm_raw": float(sqm) if not pd.isna(sqm) else 0,
-                "speed": format_num("speed", speed),
-                "speed_raw": float(speed) if speed else 0
+                "sqm_raw": float(sqm) if not pd.isna(sqm) else 0
             })
         
         recommendation = analyze_machines_ai(res)
@@ -1851,79 +3874,6 @@ def api_export_machines():
 
 # ================= ADVANCED ANALYTICS APIs =================
 
-@app.route("/api/tco_simulate", methods=["POST"])
-def api_tco_simulate():
-    """TCO Simulator — 5yr/10yr Total Cost of Ownership with local currency conversion"""
-    try:
-        d = request.json or {}
-        machine_cost_eur = float(d.get('machine_cost', 0))  # Always in EUR from machine DB
-        power_kw     = float(d.get('power_kw', 0))
-        uptime_pct   = float(d.get('uptime_pct', 75)) / 100
-        maint_pct    = float(d.get('maintenance_pct', 5)) / 100
-        depr_pct     = float(d.get('depreciation_pct', 10)) / 100
-        country      = d.get('country', '')
-        annual_pcs   = float(d.get('annual_production', 1000000))
-        hours_per_yr = 8760  # 365 * 24
-
-        # Pull geo data: electricity, labour (already local), euro exchange rate
-        geo = get_country_geo_data(country)
-        electricity_rate = float(d.get('electricity_rate', 0)) or geo['electricity_rate']
-        labour_monthly   = float(d.get('labour_monthly', 0)) or geo['labour_monthly']
-        euro_rate         = geo['euro_rate']
-        currency_symbol   = geo['currency_symbol']
-        currency_code     = geo['currency_code']
-
-        # Convert machine cost EUR → local currency
-        machine_cost_local = machine_cost_eur * euro_rate
-        capex = machine_cost_local
-
-        # Annual OPEX components (all in local currency)
-        running_hours   = hours_per_yr * uptime_pct
-        energy_annual   = power_kw * running_hours * electricity_rate
-        labour_annual   = labour_monthly * 12 * 3  # 3 operators (3 shifts)
-        maint_annual    = machine_cost_local * maint_pct
-        depr_annual     = machine_cost_local * depr_pct
-
-        opex_annual = energy_annual + labour_annual + maint_annual + depr_annual
-
-        years = {}
-        for yr in [5, 10]:
-            total = capex + (opex_annual * yr)
-            per_year = total / yr
-            per_1000 = (per_year / annual_pcs * 1000) if annual_pcs > 0 else 0
-            years[str(yr)] = {
-                'capex': round(capex, 2),
-                'opex_total': round(opex_annual * yr, 2),
-                'total': round(total, 2),
-                'per_year': round(per_year, 2),
-                'per_1000_pcs': round(per_1000, 2),
-            }
-
-        breakdown = {
-            'energy_annual': round(energy_annual, 2),
-            'labour_annual': round(labour_annual, 2),
-            'maintenance_annual': round(maint_annual, 2),
-            'depreciation_annual': round(depr_annual, 2),
-            'opex_annual': round(opex_annual, 2),
-            'electricity_rate': round(electricity_rate, 4),
-            'labour_monthly': round(labour_monthly, 2),
-            'euro_rate': round(euro_rate, 4),
-            'machine_cost_eur': round(machine_cost_eur, 2),
-            'machine_cost_local': round(machine_cost_local, 2),
-        }
-
-        return jsonify({
-            'years': years,
-            'breakdown': breakdown,
-            'currency_symbol': currency_symbol,
-            'currency_code': currency_code,
-            'euro_rate': round(euro_rate, 4),
-        })
-    except Exception as e:
-        logger.error(f"TCO simulate error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/api/machine_compare", methods=["POST"])
 def api_machine_compare():
     """Side-by-side comparison of 2-4 machines"""
@@ -1950,88 +3900,6 @@ def api_machine_compare():
         return jsonify({"machines": machines})
     except Exception as e:
         logger.error(f"Machine compare error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/roi_calculate", methods=["POST"])
-def api_roi_calculate():
-    """ROI / Payback Calculator with breakeven chart data — local currency"""
-    try:
-        d = request.json or {}
-        machine_cost_eur = float(d.get('machine_cost', 0))  # Always EUR
-        hourly_revenue   = float(d.get('hourly_revenue', 0))  # Local currency
-        power_kw         = float(d.get('power_kw', 0))
-        electricity_rate = float(d.get('electricity_rate', 0))  # Local
-        labour_monthly   = float(d.get('labour_monthly', 0))   # Local
-        uptime_pct       = float(d.get('uptime_pct', 75)) / 100
-        maint_pct        = float(d.get('maintenance_pct', 5)) / 100
-        euro_rate         = float(d.get('euro_rate', 1))
-        country          = d.get('country', '')
-
-        # If country provided but no euro_rate given, look it up
-        if country and euro_rate <= 1:
-            geo = get_country_geo_data(country)
-            euro_rate = geo['euro_rate']
-            currency_symbol = geo['currency_symbol']
-            currency_code = geo['currency_code']
-        else:
-            cur = COUNTRY_CURRENCY_MAP.get(country, {'symbol': '€', 'code': 'EUR'})
-            currency_symbol = cur['symbol']
-            currency_code = cur['code']
-
-        # Convert machine cost EUR → local
-        machine_cost_local = machine_cost_eur * euro_rate
-
-        hours_per_month = 730 * uptime_pct  # ~365*24/12 * uptime
-        monthly_revenue = hourly_revenue * hours_per_month
-
-        energy_monthly  = power_kw * hours_per_month * electricity_rate
-        maint_monthly   = machine_cost_local * maint_pct / 12
-        monthly_cost    = energy_monthly + labour_monthly + maint_monthly
-        monthly_profit  = monthly_revenue - monthly_cost
-
-        payback_months = round(machine_cost_local / monthly_profit, 1) if monthly_profit > 0 else -1
-
-        # Build breakeven chart series (month, cumulative_profit)
-        chart_months = min(max(int(payback_months * 1.5), 12), 120) if payback_months > 0 else 60
-        chart = []
-        for m in range(chart_months + 1):
-            cumulative = (monthly_profit * m) - machine_cost_local
-            chart.append({'month': m, 'cumulative': round(cumulative, 2)})
-
-        annual_profit = monthly_profit * 12
-        roi_pct = round((annual_profit / machine_cost_local) * 100, 1) if machine_cost_local > 0 else 0
-
-        return jsonify({
-            'payback_months': payback_months,
-            'monthly_revenue': round(monthly_revenue, 2),
-            'monthly_cost': round(monthly_cost, 2),
-            'monthly_profit': round(monthly_profit, 2),
-            'annual_roi_pct': roi_pct,
-            'chart': chart,
-            'machine_cost_local': round(machine_cost_local, 2),
-            'currency_symbol': currency_symbol,
-            'currency_code': currency_code,
-            'euro_rate': round(euro_rate, 4),
-        })
-    except Exception as e:
-        logger.error(f"ROI calculate error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/geo_currency_data", methods=["POST"])
-def api_geo_currency_data():
-    """Return exchange rate, electricity, labour, currency info for a country.
-    Used by TCO/ROI frontend when user changes country dropdown."""
-    try:
-        d = request.json or {}
-        country = d.get('country', '')
-        if not country:
-            return jsonify({"error": "Country required"}), 400
-        geo = get_country_geo_data(country)
-        return jsonify(geo)
-    except Exception as e:
-        logger.error(f"geo_currency_data error: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -2115,288 +3983,6 @@ def api_resin_latest_price():
     except Exception as e:
         logger.error(f"resin_latest_price error: {e}")
         return jsonify({"error": str(e), "price_per_kg": 0}), 200
-
-
-@app.route("/api/procurement_tco", methods=["POST"])
-def api_procurement_tco():
-    """Full Procurement TCO — machine + material + tooling + freight + inventory.
-    All monetary values are in local currency (converted from EUR via geo rate)."""
-    try:
-        d = request.json or {}
-        # --- Machine inputs ---
-        machine_cost_eur = float(d.get('machine_cost', 0))
-        power_kw         = float(d.get('power_kw', 0))
-        uptime_pct       = float(d.get('uptime_pct', 75)) / 100
-        maint_pct        = float(d.get('maintenance_pct', 5)) / 100
-        depr_pct         = float(d.get('depreciation_pct', 10)) / 100
-        country          = d.get('country', '')
-        annual_pcs       = float(d.get('annual_production', 1000000))
-
-        # --- New procurement inputs ---
-        resin_price_per_kg = float(d.get('resin_price_per_kg', 0))
-        part_weight_kg     = float(d.get('part_weight_kg', 0.05))
-        cycle_time_sec     = float(d.get('cycle_time_sec', 10))
-        scrap_pct          = float(d.get('scrap_pct', 3)) / 100
-        tooling_amort_yr   = float(d.get('tooling_amort_yr', 0))
-        freight_duty_per_kg = float(d.get('freight_duty_per_kg', 0))
-        moq_holding_pct    = float(d.get('moq_holding_pct', 2)) / 100
-        labour_override    = d.get('labour_override', None)
-
-        hours_per_yr = 8760
-
-        # Geo data
-        geo = get_country_geo_data(country)
-        electricity_rate = float(d.get('electricity_rate', 0)) or geo['electricity_rate']
-        labour_monthly   = float(labour_override) if labour_override and float(labour_override) > 0 else (float(d.get('labour_monthly', 0)) or geo['labour_monthly'])
-        euro_rate         = geo['euro_rate']
-        currency_symbol   = geo['currency_symbol']
-        currency_code     = geo['currency_code']
-
-        # Convert machine cost EUR → local
-        machine_cost_local = machine_cost_eur * euro_rate
-
-        # --- Compute annual parts from cycle time ---
-        running_hours = hours_per_yr * uptime_pct
-        if cycle_time_sec > 0:
-            parts_per_hour = 3600 / cycle_time_sec
-            annual_parts_from_cycle = parts_per_hour * running_hours
-        else:
-            annual_parts_from_cycle = annual_pcs
-
-        # Use the smaller of user-provided annual_pcs and capacity
-        annual_parts = min(annual_pcs, annual_parts_from_cycle) if annual_pcs > 0 else annual_parts_from_cycle
-
-        # --- Machine cost per part ---
-        energy_annual = power_kw * running_hours * electricity_rate
-        labour_annual = labour_monthly * 12 * 3  # 3 shifts
-        maint_annual  = machine_cost_local * maint_pct
-        depr_annual   = machine_cost_local * depr_pct
-        annual_machine_tco = energy_annual + labour_annual + maint_annual + depr_annual
-        machine_cost_per_part = (annual_machine_tco / annual_parts) if annual_parts > 0 else 0
-
-        # --- Material cost per part ---
-        material_cost_per_part = resin_price_per_kg * part_weight_kg * (1 + scrap_pct)
-
-        # --- Tooling amortization per part ---
-        tooling_per_part = (tooling_amort_yr / annual_parts) if annual_parts > 0 else 0
-
-        # --- Freight + duty per part ---
-        freight_per_part = freight_duty_per_kg * part_weight_kg
-
-        # --- MOQ inventory holding cost per part ---
-        material_cost_annual = material_cost_per_part * annual_parts
-        inventory_per_part = (material_cost_annual * moq_holding_pct / annual_parts) if annual_parts > 0 else 0
-
-        # --- Total cost per part ---
-        total_cost_per_part = machine_cost_per_part + material_cost_per_part + tooling_per_part + freight_per_part + inventory_per_part
-
-        # --- Cost per kg ---
-        cost_per_kg = (total_cost_per_part / part_weight_kg) if part_weight_kg > 0 else 0
-
-        # --- 5yr / 10yr TCO ---
-        capex = machine_cost_local
-        opex_annual = annual_machine_tco
-        material_annual = material_cost_per_part * annual_parts
-        tooling_annual = tooling_amort_yr
-        freight_annual = freight_per_part * annual_parts
-        inventory_annual = inventory_per_part * annual_parts
-
-        total_annual_procurement = opex_annual + material_annual + tooling_annual + freight_annual + inventory_annual
-
-        years = {}
-        for yr in [5, 10]:
-            total = capex + (total_annual_procurement * yr)
-            per_year = total / yr
-            per_1000 = (per_year / annual_parts * 1000) if annual_parts > 0 else 0
-            years[str(yr)] = {
-                'capex': round(capex, 2),
-                'opex_total': round(total_annual_procurement * yr, 2),
-                'total': round(total, 2),
-                'per_year': round(per_year, 2),
-                'per_1000_pcs': round(per_1000, 2),
-            }
-
-        # --- ROI / Payback ---
-        hourly_revenue = float(d.get('hourly_revenue', 0))
-        if hourly_revenue > 0:
-            hours_per_month = 730 * uptime_pct
-            monthly_revenue = hourly_revenue * hours_per_month
-            monthly_cost = total_annual_procurement / 12
-            monthly_profit = monthly_revenue - monthly_cost
-            payback_months = round(machine_cost_local / monthly_profit, 1) if monthly_profit > 0 else -1
-            annual_profit = monthly_profit * 12
-            roi_pct = round((annual_profit / machine_cost_local) * 100, 1) if machine_cost_local > 0 else 0
-            chart_months = min(max(int(payback_months * 1.5), 12), 120) if payback_months > 0 else 60
-            chart = [{'month': m, 'cumulative': round((monthly_profit * m) - machine_cost_local, 2)} for m in range(chart_months + 1)]
-        else:
-            payback_months = -1
-            roi_pct = 0
-            monthly_revenue = 0
-            monthly_profit = 0
-            chart = []
-
-        return jsonify({
-            'cost_per_part': {
-                'machine': round(machine_cost_per_part, 6),
-                'material': round(material_cost_per_part, 6),
-                'tooling': round(tooling_per_part, 6),
-                'freight': round(freight_per_part, 6),
-                'inventory': round(inventory_per_part, 6),
-                'total': round(total_cost_per_part, 6),
-            },
-            'cost_per_kg': round(cost_per_kg, 4),
-            'annual_parts': round(annual_parts),
-            'annual_procurement': {
-                'machine_opex': round(opex_annual, 2),
-                'material': round(material_annual, 2),
-                'tooling': round(tooling_annual, 2),
-                'freight': round(freight_annual, 2),
-                'inventory': round(inventory_annual, 2),
-                'total': round(total_annual_procurement, 2),
-            },
-            'years': years,
-            'breakdown': {
-                'energy_annual': round(energy_annual, 2),
-                'labour_annual': round(labour_annual, 2),
-                'maintenance_annual': round(maint_annual, 2),
-                'depreciation_annual': round(depr_annual, 2),
-                'opex_annual': round(opex_annual, 2),
-                'electricity_rate': round(electricity_rate, 4),
-                'labour_monthly': round(labour_monthly, 2),
-                'euro_rate': round(euro_rate, 4),
-                'machine_cost_eur': round(machine_cost_eur, 2),
-                'machine_cost_local': round(machine_cost_local, 2),
-            },
-            'roi': {
-                'payback_months': payback_months,
-                'annual_roi_pct': roi_pct,
-                'monthly_revenue': round(monthly_revenue, 2),
-                'monthly_profit': round(monthly_profit, 2),
-                'chart': chart,
-            },
-            'currency_symbol': currency_symbol,
-            'currency_code': currency_code,
-            'euro_rate': round(euro_rate, 4),
-        })
-    except Exception as e:
-        logger.error(f"Procurement TCO error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/procurement_region_compare", methods=["POST"])
-def api_procurement_region_compare():
-    """Compare procurement TCO across multiple countries."""
-    try:
-        d = request.json or {}
-        countries = d.get('countries', [])
-        base_params = d.get('base_params', {})
-        if not countries or len(countries) < 2:
-            return jsonify({"error": "Select 2+ countries"}), 400
-
-        results = []
-        for country in countries:
-            geo = get_country_geo_data(country)
-            euro_rate = geo['euro_rate']
-            elec = geo['electricity_rate']
-            labour = geo['labour_monthly']
-            sym = geo['currency_symbol']
-            code = geo['currency_code']
-
-            machine_local = float(base_params.get('machine_cost', 0)) * euro_rate
-            running_hours = 8760 * (float(base_params.get('uptime_pct', 75)) / 100)
-            annual_parts = float(base_params.get('annual_production', 1000000))
-            power_kw = float(base_params.get('power_kw', 0))
-            part_weight = float(base_params.get('part_weight_kg', 0.05))
-            scrap = float(base_params.get('scrap_pct', 3)) / 100
-            resin_price = float(base_params.get('resin_price_per_kg', 0))
-            tooling = float(base_params.get('tooling_amort_yr', 0))
-            freight = float(base_params.get('freight_duty_per_kg', 0))
-            moq_pct = float(base_params.get('moq_holding_pct', 2)) / 100
-
-            energy_ann = power_kw * running_hours * elec
-            labour_ann = labour * 12 * 3
-            maint_ann = machine_local * float(base_params.get('maintenance_pct', 5)) / 100
-            depr_ann = machine_local * float(base_params.get('depreciation_pct', 10)) / 100
-            machine_opex = energy_ann + labour_ann + maint_ann + depr_ann
-            machine_per_part = (machine_opex / annual_parts) if annual_parts > 0 else 0
-            mat_per_part = resin_price * part_weight * (1 + scrap)
-            tooling_per_part = (tooling / annual_parts) if annual_parts > 0 else 0
-            freight_per_part = freight * part_weight
-            inv_per_part = (mat_per_part * annual_parts * moq_pct / annual_parts) if annual_parts > 0 else 0
-            total_per_part = machine_per_part + mat_per_part + tooling_per_part + freight_per_part + inv_per_part
-
-            # Convert to EUR for comparison
-            total_per_part_eur = (total_per_part / euro_rate) if euro_rate > 0 else total_per_part
-
-            results.append({
-                'country': country,
-                'currency_symbol': sym,
-                'currency_code': code,
-                'euro_rate': euro_rate,
-                'electricity_rate': elec,
-                'labour_monthly': labour,
-                'cost_per_part_local': round(total_per_part, 6),
-                'cost_per_part_eur': round(total_per_part_eur, 6),
-                'machine_per_part': round(machine_per_part, 6),
-                'material_per_part': round(mat_per_part, 6),
-                'annual_total_eur': round(total_per_part_eur * annual_parts, 2),
-            })
-
-        # Sort by EUR cost
-        results.sort(key=lambda x: x['cost_per_part_eur'])
-        return jsonify({"regions": results})
-    except Exception as e:
-        logger.error(f"Region compare error: {e}")
-        return jsonify({"error": str(e)}), 500
-
-
-@app.route("/api/procurement_export", methods=["POST"])
-def api_procurement_export():
-    """Export procurement TCO results to Excel."""
-    try:
-        d = request.json or {}
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            # Cost per part breakdown
-            cpp = d.get('cost_per_part', {})
-            df1 = pd.DataFrame([{
-                'Component': k.replace('_', ' ').title(),
-                'Cost/Part': v
-            } for k, v in cpp.items()])
-            df1.to_excel(writer, sheet_name='Cost Per Part', index=False)
-
-            # Annual costs
-            ann = d.get('annual_procurement', {})
-            df2 = pd.DataFrame([{
-                'Category': k.replace('_', ' ').title(),
-                'Annual Cost': v
-            } for k, v in ann.items()])
-            df2.to_excel(writer, sheet_name='Annual Costs', index=False)
-
-            # 5yr/10yr TCO
-            years = d.get('years', {})
-            rows = []
-            for yr, vals in years.items():
-                for k, v in vals.items():
-                    rows.append({'Period': f'{yr} Year', 'Metric': k.replace('_', ' ').title(), 'Value': v})
-            if rows:
-                pd.DataFrame(rows).to_excel(writer, sheet_name='TCO Summary', index=False)
-
-            # Region comparison if present
-            regions = d.get('regions', [])
-            if regions:
-                pd.DataFrame(regions).to_excel(writer, sheet_name='Region Comparison', index=False)
-
-        output.seek(0)
-        return send_file(
-            output,
-            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-            as_attachment=True,
-            download_name=f'procurement_tco_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
-        )
-    except Exception as e:
-        logger.error(f"Procurement export error: {e}")
-        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/api/cost_res", methods=["POST"])
@@ -4554,7 +6140,7 @@ def api_export_generic_excel():
         if not d: return jsonify({"error": "No model data"}), 400
         
         output = io.BytesIO()
-        model_names = {'carton': 'Carton Essentials', 'flexibles': 'Flexibles', 'ebm': 'EBM Rigids', 'carton-adv': 'Carton Advanced'}
+        model_names = {'carton': 'Carton Standard', 'flexibles': 'Flexibles', 'ebm': 'EBM Rigids', 'carton-adv': 'Carton Advanced'}
         model_label = model_names.get(model_type, model_type.replace('-', ' ').title())
         
         with pd.ExcelWriter(output, engine='openpyxl') as writer:
@@ -4661,7 +6247,7 @@ def api_export_generic_pdf():
         except ImportError:
             return jsonify({"error": "PDF requires reportlab. Install: pip install reportlab"}), 500
 
-        model_names = {'carton': 'Carton Essentials', 'flexibles': 'Flexibles', 'ebm': 'EBM Rigids', 'carton-adv': 'Carton Advanced'}
+        model_names = {'carton': 'Carton Standard', 'flexibles': 'Flexibles', 'ebm': 'EBM Rigids', 'carton-adv': 'Carton Advanced'}
         model_label = model_names.get(model_type, model_type.replace('-', ' ').title())
         
         output = io.BytesIO()
@@ -4762,140 +6348,420 @@ ADMIN_LOGIN_HTML = """
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Admin Login - Packfora Analytics</title>
-    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <title>Login - Packfora Analytics</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
     <style>
-        :root { --orange: #E8601C; --royal-blue: #1e40af; }
+        :root {
+            --orange: #E8601C;
+            --orange-light: #ff8a50;
+            --orange-glow: rgba(232, 96, 28, 0.35);
+            --royal-blue: #1e40af;
+            --blue-mid: #3b82f6;
+            --blue-deep: #1e3a8a;
+            --glass-bg: rgba(255,255,255,0.08);
+            --glass-border: rgba(255,255,255,0.18);
+            --glass-hover: rgba(255,255,255,0.14);
+            --input-bg: rgba(255,255,255,0.10);
+            --input-border: rgba(255,255,255,0.22);
+            --input-focus: rgba(255,255,255,0.28);
+            --text-primary: #ffffff;
+            --text-muted: rgba(255,255,255,0.60);
+            --text-faint: rgba(255,255,255,0.40);
+            --shadow-card: 0 8px 60px rgba(0,0,0,0.35), 0 2px 20px rgba(30,64,175,0.25);
+            --shadow-input: 0 2px 8px rgba(0,0,0,0.12);
+            --shadow-btn: 0 4px 20px rgba(232,96,28,0.40);
+            --radius-card: 24px;
+            --radius-input: 12px;
+            --radius-btn: 12px;
+        }
+
         * { margin: 0; padding: 0; box-sizing: border-box; }
-        body { 
-            font-family: 'Outfit', sans-serif; 
-            background: linear-gradient(135deg, var(--royal-blue) 0%, #3b82f6 50%, #1e3a8a 100%); 
-            min-height: 100vh; 
+
+        body {
+            font-family: 'Outfit', sans-serif;
+            min-height: 100vh;
             display: flex;
             align-items: center;
             justify-content: center;
-            color: white; 
+            color: var(--text-primary);
+            overflow: hidden;
+            background: var(--royal-blue);
         }
-        .login-container {
-            background: rgba(255,255,255,0.15);
-            backdrop-filter: blur(20px);
-            border-radius: 20px;
-            padding: 50px;
-            border: 1px solid rgba(255,255,255,0.25);
-            width: 400px;
-            max-width: calc(100% - 30px);
-            box-shadow: 0 10px 40px rgba(0,0,0,0.3);
+
+        /* ── Animated gradient background ── */
+        .bg-layer {
+            position: fixed; inset: 0; z-index: 0;
+            background: linear-gradient(135deg, #0f1f5e 0%, var(--royal-blue) 25%, var(--blue-mid) 50%, var(--blue-deep) 75%, #0c1845 100%);
+            background-size: 400% 400%;
+            animation: bgShift 18s ease infinite;
         }
-        h2 {
-            color: var(--orange);
-            margin-bottom: 30px;
-            text-align: center;
-            font-size: 2rem;
+        @keyframes bgShift {
+            0%   { background-position: 0% 50%; }
+            50%  { background-position: 100% 50%; }
+            100% { background-position: 0% 50%; }
         }
-        .form-group {
-            margin-bottom: 20px;
+
+        /* ── Floating orbs ── */
+        .orb {
+            position: fixed; border-radius: 50%; filter: blur(80px); opacity: 0.18; z-index: 0; pointer-events: none;
         }
-        label {
-            display: block;
-            font-size: 0.9rem;
-            margin-bottom: 8px;
-            opacity: 0.9;
-            font-weight: 600;
+        .orb-1 { width: 420px; height: 420px; background: var(--orange); top: -10%; right: -8%; animation: orbFloat1 14s ease-in-out infinite; }
+        .orb-2 { width: 340px; height: 340px; background: var(--blue-mid); bottom: -12%; left: -6%; animation: orbFloat2 18s ease-in-out infinite; }
+        .orb-3 { width: 200px; height: 200px; background: var(--orange-light); top: 55%; right: 20%; animation: orbFloat3 12s ease-in-out infinite; opacity: 0.10; }
+        @keyframes orbFloat1 { 0%,100%{ transform: translate(0,0) scale(1); } 50%{ transform: translate(-30px,40px) scale(1.08); } }
+        @keyframes orbFloat2 { 0%,100%{ transform: translate(0,0) scale(1); } 50%{ transform: translate(40px,-30px) scale(1.12); } }
+        @keyframes orbFloat3 { 0%,100%{ transform: translate(0,0); } 50%{ transform: translate(-20px,25px); } }
+
+        /* ── Glass card ── */
+        .login-card {
+            position: relative; z-index: 1;
+            width: 430px;
+            max-width: calc(100vw - 32px);
+            background: var(--glass-bg);
+            backdrop-filter: blur(28px) saturate(1.6);
+            -webkit-backdrop-filter: blur(28px) saturate(1.6);
+            border: 1px solid var(--glass-border);
+            border-radius: var(--radius-card);
+            box-shadow: var(--shadow-card);
+            padding: 44px 38px 36px;
+            animation: cardEnter 0.7s cubic-bezier(.22,.68,0,1.02) both;
         }
-        input {
+        @keyframes cardEnter {
+            0% { opacity: 0; transform: translateY(32px) scale(0.96); }
+            100% { opacity: 1; transform: translateY(0) scale(1); }
+        }
+
+        /* ── Logo / Brand ── */
+        .brand { text-align: center; margin-bottom: 28px; }
+        .brand-icon {
+            width: 56px; height: 56px;
+            margin: 0 auto 14px;
+            background: linear-gradient(135deg, var(--orange), var(--orange-light));
+            border-radius: 16px;
+            display: flex; align-items: center; justify-content: center;
+            box-shadow: 0 4px 24px var(--orange-glow);
+            animation: logoPulse 3s ease-in-out infinite;
+        }
+        @keyframes logoPulse {
+            0%,100% { box-shadow: 0 4px 24px var(--orange-glow); }
+            50%     { box-shadow: 0 4px 36px rgba(232,96,28,0.50); }
+        }
+        .brand-icon svg { width: 30px; height: 30px; fill: white; }
+        .brand h1 {
+            font-size: 1.55rem; font-weight: 800; letter-spacing: -0.3px;
+            background: linear-gradient(135deg, #fff 30%, var(--orange-light));
+            -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+        .brand .tagline {
+            font-size: 0.82rem; color: var(--text-muted); margin-top: 4px; font-weight: 400;
+        }
+
+        /* ── Alerts ── */
+        .alert {
+            padding: 12px 16px; border-radius: var(--radius-input); margin-bottom: 18px;
+            font-size: 0.85rem; font-weight: 500;
+            display: flex; align-items: center; gap: 8px;
+            animation: alertSlide 0.4s ease;
+        }
+        @keyframes alertSlide { 0%{ opacity:0; transform:translateY(-8px); } 100%{ opacity:1; transform:translateY(0); } }
+        .alert-error   { background: rgba(239,68,68,0.14); border: 1px solid rgba(239,68,68,0.40); color: #fca5a5; }
+        .alert-success  { background: rgba(16,185,129,0.14); border: 1px solid rgba(16,185,129,0.40); color: #6ee7b7; }
+        .alert-info     { background: rgba(59,130,246,0.14); border: 1px solid rgba(59,130,246,0.40); color: #93c5fd; }
+        .alert svg { width: 18px; height: 18px; flex-shrink: 0; }
+
+        /* ── Form groups ── */
+        .form-group { margin-bottom: 20px; }
+        .form-group label {
+            display: block; font-size: 0.82rem; font-weight: 600;
+            margin-bottom: 7px; color: var(--text-muted);
+            letter-spacing: 0.3px;
+        }
+
+        /* ── Input wrapper with icon ── */
+        .input-wrap {
+            position: relative; display: flex; align-items: center;
+        }
+        .input-wrap .icon-left {
+            position: absolute; left: 14px; top: 50%; transform: translateY(-50%);
+            width: 18px; height: 18px; pointer-events: none;
+            color: var(--text-faint); transition: color 0.3s;
+        }
+        .input-wrap input {
             width: 100%;
-            padding: 15px;
-            background: rgba(255,255,255,0.2);
-            border: 1px solid rgba(255,255,255,0.3);
-            border-radius: 10px;
-            color: white;
-            font-family: 'Outfit';
-            font-size: 1rem;
+            padding: 14px 14px 14px 44px;
+            background: var(--input-bg);
+            border: 1px solid var(--input-border);
+            border-radius: var(--radius-input);
+            color: var(--text-primary);
+            font-family: 'Outfit', sans-serif;
+            font-size: 0.95rem;
+            font-weight: 400;
+            transition: border-color 0.3s, background 0.3s, box-shadow 0.3s;
+            box-shadow: var(--shadow-input);
         }
-        input::placeholder {
-            color: rgba(255,255,255,0.6);
-        }
-        input:focus {
+        .input-wrap input::placeholder { color: var(--text-faint); }
+        .input-wrap input:focus {
             outline: none;
             border-color: var(--orange);
+            background: var(--input-focus);
+            box-shadow: var(--shadow-input), 0 0 0 3px var(--orange-glow);
         }
-        button {
+        .input-wrap:focus-within .icon-left { color: var(--orange); }
+
+        /* ── Password toggle ── */
+        .pw-toggle {
+            position: absolute; right: 14px; top: 50%; transform: translateY(-50%);
+            background: none; border: none; cursor: pointer; padding: 4px;
+            color: var(--text-faint); transition: color 0.25s;
+            display: flex; align-items: center; justify-content: center;
+            width: 28px; height: 28px;
+        }
+        .pw-toggle:hover { color: var(--orange-light); }
+        .pw-toggle svg { width: 20px; height: 20px; }
+
+        /* ── Remember / Forgot row ── */
+        .options-row {
+            display: flex; align-items: center; justify-content: space-between;
+            margin-bottom: 24px; font-size: 0.82rem;
+        }
+        .remember-wrap {
+            display: flex; align-items: center; gap: 8px; cursor: pointer; user-select: none;
+        }
+        .remember-wrap input[type=checkbox] {
+            width: 16px; height: 16px; accent-color: var(--orange);
+            border-radius: 4px; cursor: pointer;
+        }
+        .remember-wrap span { color: var(--text-muted); font-weight: 400; }
+        .forgot-link {
+            color: var(--orange-light); text-decoration: none; font-weight: 500;
+            transition: color 0.25s;
+        }
+        .forgot-link:hover { color: var(--orange); text-decoration: underline; }
+
+        /* ── Submit button ── */
+        .btn-login {
             width: 100%;
-            padding: 15px;
-            background: var(--orange);
+            padding: 15px 20px;
+            background: linear-gradient(135deg, var(--orange), var(--orange-light));
             border: none;
-            border-radius: 10px;
+            border-radius: var(--radius-btn);
             color: white;
-            font-weight: 800;
+            font-weight: 700;
             font-size: 1rem;
+            font-family: 'Outfit', sans-serif;
             cursor: pointer;
-            transition: all 0.3s;
-            font-family: 'Outfit';
+            transition: transform 0.25s, box-shadow 0.3s, filter 0.25s;
+            box-shadow: var(--shadow-btn);
+            letter-spacing: 0.3px;
+            display: flex; align-items: center; justify-content: center; gap: 8px;
         }
-        button:hover {
-            background: #d65519;
-            transform: scale(1.02);
+        .btn-login:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 6px 28px rgba(232,96,28,0.55);
+            filter: brightness(1.06);
         }
-        .alert {
-            padding: 15px;
-            border-radius: 10px;
-            margin-bottom: 20px;
-            font-size: 0.9rem;
+        .btn-login:active {
+            transform: translateY(0) scale(0.98);
         }
-        .alert-error {
-            background: rgba(239, 68, 68, 0.2);
-            border: 1px solid #ef4444;
+        .btn-login svg { width: 18px; height: 18px; }
+
+        /* ── Divider ── */
+        .divider {
+            display: flex; align-items: center; gap: 12px;
+            margin: 22px 0 18px; font-size: 0.75rem; color: var(--text-faint);
         }
-        .alert-success {
-            background: rgba(16, 185, 129, 0.2);
-            border: 1px solid #10b981;
+        .divider::before, .divider::after {
+            content: ''; flex: 1; height: 1px;
+            background: linear-gradient(90deg, transparent, var(--glass-border), transparent);
         }
-        .alert-info {
-            background: rgba(59, 130, 246, 0.2);
-            border: 1px solid #3b82f6;
+
+        /* ── Footer links ── */
+        .card-footer {
+            text-align: center; font-size: 0.84rem; color: var(--text-muted);
         }
-        .back-link {
-            text-align: center;
-            margin-top: 20px;
+        .card-footer a {
+            color: var(--orange-light); text-decoration: none; font-weight: 600;
+            transition: color 0.25s;
         }
-        .back-link a {
-            color: var(--orange);
-            text-decoration: none;
-            font-size: 0.9rem;
+        .card-footer a:hover { color: #fff; text-decoration: underline; }
+
+        /* ── Role chips ── */
+        .role-hints {
+            display: flex; justify-content: center; gap: 8px; margin-top: 16px; flex-wrap: wrap;
         }
-        .back-link a:hover {
-            text-decoration: underline;
+        .role-chip {
+            font-size: 0.68rem; font-weight: 600; text-transform: uppercase;
+            padding: 3px 10px; border-radius: 20px; letter-spacing: 0.5px;
+            background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.12);
+            color: var(--text-faint); cursor: default; transition: all 0.25s;
+        }
+        .role-chip:hover { background: rgba(255,255,255,0.12); color: var(--text-muted); }
+
+        /* ── Mobile responsive ── */
+        @media (max-width: 480px) {
+            .login-card {
+                padding: 32px 22px 28px;
+                border-radius: 20px;
+                max-width: calc(100vw - 24px);
+            }
+            .brand-icon { width: 48px; height: 48px; border-radius: 14px; }
+            .brand-icon svg { width: 26px; height: 26px; }
+            .brand h1 { font-size: 1.35rem; }
+            .input-wrap input { padding: 13px 13px 13px 40px; font-size: 0.9rem; }
+            .input-wrap .icon-left { left: 12px; width: 16px; height: 16px; }
+            .btn-login { padding: 14px 18px; font-size: 0.95rem; }
+            .options-row { font-size: 0.78rem; }
+            .orb-1 { width: 260px; height: 260px; }
+            .orb-2 { width: 200px; height: 200px; }
+            .orb-3 { display: none; }
+        }
+
+        @media (max-height: 640px) {
+            body { align-items: flex-start; padding-top: 20px; }
+            .login-card { padding: 28px 24px 24px; }
+            .brand { margin-bottom: 18px; }
+            .brand-icon { width: 44px; height: 44px; margin-bottom: 10px; }
         }
     </style>
 </head>
 <body>
-    <div class="login-container">
-        <h2>Admin Login</h2>
-        
+    <!-- Animated background -->
+    <div class="bg-layer"></div>
+    <div class="orb orb-1"></div>
+    <div class="orb orb-2"></div>
+    <div class="orb orb-3"></div>
+
+    <!-- Login Card -->
+    <div class="login-card">
+        <!-- Brand header -->
+        <div class="brand">
+            <div class="brand-icon">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="fill:none;stroke:white;">
+                    <path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"></path>
+                    <polyline points="3.27 6.96 12 12.01 20.73 6.96"></polyline>
+                    <line x1="12" y1="22.08" x2="12" y2="12"></line>
+                </svg>
+            </div>
+            <h1>Packfora Analytics</h1>
+            <div class="tagline">Packaging Intelligence Platform</div>
+        </div>
+
+        <!-- Flash messages -->
         {% with messages = get_flashed_messages(with_categories=true) %}
           {% if messages %}
             {% for category, message in messages %}
-              <div class="alert alert-{{ category }}">{{ message }}</div>
+              <div class="alert alert-{{ category }}">
+                {% if category == 'error' %}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg>
+                {% elif category == 'success' %}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></svg>
+                {% else %}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><line x1="12" y1="16" x2="12" y2="12"/><line x1="12" y1="8" x2="12.01" y2="8"/></svg>
+                {% endif %}
+                {{ message }}
+              </div>
             {% endfor %}
           {% endif %}
         {% endwith %}
-        
-        <form method="POST">
+
+        <!-- Login form (method + field names unchanged) -->
+        <form method="POST" id="loginForm">
             <div class="form-group">
-                <label>Username</label>
-                <input type="text" name="username" placeholder="Enter username" required autofocus>
+                <label for="username">Username</label>
+                <div class="input-wrap">
+                    <svg class="icon-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path>
+                        <circle cx="12" cy="7" r="4"></circle>
+                    </svg>
+                    <input type="text" id="username" name="username" placeholder="Enter your username" required autofocus autocomplete="username">
+                </div>
             </div>
+
             <div class="form-group">
-                <label>Password</label>
-                <input type="password" name="password" placeholder="Enter password" required>
+                <label for="password">Password</label>
+                <div class="input-wrap">
+                    <svg class="icon-left" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <rect x="3" y="11" width="18" height="11" rx="2" ry="2"></rect>
+                        <path d="M7 11V7a5 5 0 0 1 10 0v4"></path>
+                    </svg>
+                    <input type="password" id="password" name="password" placeholder="Enter your password" required autocomplete="current-password">
+                    <button type="button" class="pw-toggle" onclick="togglePw()" aria-label="Show password" tabindex="-1">
+                        <svg id="eye-open" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"></path>
+                            <circle cx="12" cy="12" r="3"></circle>
+                        </svg>
+                        <svg id="eye-closed" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="display:none;">
+                            <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94"></path>
+                            <path d="M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19"></path>
+                            <line x1="1" y1="1" x2="23" y2="23"></line>
+                            <path d="M14.12 14.12a3 3 0 1 1-4.24-4.24"></path>
+                        </svg>
+                    </button>
+                </div>
             </div>
-            <button type="submit">Login</button>
+
+            <div class="options-row">
+                <label class="remember-wrap">
+                    <input type="checkbox" id="rememberMe">
+                    <span>Remember me</span>
+                </label>
+                <a href="#" class="forgot-link" onclick="alert('Please contact your administrator to reset your password.');return false;">Forgot password?</a>
+            </div>
+
+            <button type="submit" class="btn-login">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>
+                Sign In
+            </button>
         </form>
+
+        <div class="divider">or</div>
+
         
-        <div class="back-link">
-            <a href="/">← Back to Dashboard</a>
+
+        <div class="role-hints">
+            <span class="role-chip">Admin</span>
+            <span class="role-chip">Analyst</span>
+            <span class="role-chip">Viewer</span>
         </div>
     </div>
+
+    <script>
+    function togglePw() {
+        const inp = document.getElementById('password');
+        const open = document.getElementById('eye-open');
+        const closed = document.getElementById('eye-closed');
+        if (inp.type === 'password') {
+            inp.type = 'text';
+            open.style.display = 'none';
+            closed.style.display = 'block';
+        } else {
+            inp.type = 'password';
+            open.style.display = 'block';
+            closed.style.display = 'none';
+        }
+    }
+
+    // Remember-me: store username in localStorage
+    (function() {
+        const saved = localStorage.getItem('packfora_remember_user');
+        if (saved) {
+            document.getElementById('username').value = saved;
+            document.getElementById('rememberMe').checked = true;
+            // Auto-focus password if username was restored
+            document.getElementById('password').focus();
+        }
+        document.getElementById('loginForm').addEventListener('submit', function() {
+            const cb = document.getElementById('rememberMe');
+            const un = document.getElementById('username').value.trim();
+            if (cb.checked && un) {
+                localStorage.setItem('packfora_remember_user', un);
+            } else {
+                localStorage.removeItem('packfora_remember_user');
+            }
+        });
+    })();
+    </script>
 </body>
 </html>
 """
@@ -5149,6 +7015,7 @@ ADMIN_DASHBOARD_HTML = """
         <h1>Admin <span>Dashboard</span></h1>
         <div class="nav-links">
             <span style="opacity:0.7; font-size:0.9rem;">Welcome, {{ username }}</span>
+            <a href="/admin/users"> Users</a>
             <a href="/">Main Site</a>
             <a href="/admin/logout">Logout</a>
         </div>
@@ -5201,6 +7068,16 @@ ADMIN_DASHBOARD_HTML = """
                         <input type="file" id="cost-file" name="file" accept=".xlsx,.xls" onchange="updateFileName('cost')">
                         <div class="selected-file" id="cost-filename"></div>
                         <button type="submit" class="upload-btn" id="cost-btn" disabled>Upload</button>
+                    </form>
+                </div>
+                <div class="upload-card">
+                    <h4>Global Material Prices</h4>
+                    <form action="/admin/upload" method="POST" enctype="multipart/form-data" id="global_material-form">
+                        <input type="hidden" name="file_type" value="global_material">
+                        <label for="global_material-file" class="file-label">Choose File</label>
+                        <input type="file" id="global_material-file" name="file" accept=".xlsx,.xls" onchange="updateFileName('global_material')">
+                        <div class="selected-file" id="global_material-filename"></div>
+                        <button type="submit" class="upload-btn" id="global_material-btn" disabled>Upload</button>
                     </form>
                 </div>
             </div>
@@ -5511,6 +7388,1941 @@ ADMIN_DASHBOARD_HTML = """
     </script>
 </body>
 </html>
+"""
+
+# ================= ADMIN USERS MANAGEMENT HTML =================
+ADMIN_USERS_HTML = """
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>User Management - Packfora Analytics</title>
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
+    <style>
+        :root { --orange: #E8601C; --royal-blue: #1e40af; }
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        body { font-family: 'Outfit', sans-serif; background: linear-gradient(135deg, var(--royal-blue) 0%, #3b82f6 50%, #1e3a8a 100%); min-height: 100vh; color: white; }
+        .container { max-width: 900px; margin: 40px auto; padding: 0 20px; }
+        .card { background: rgba(255,255,255,0.15); backdrop-filter: blur(20px); border-radius: 20px; padding: 35px; border: 1px solid rgba(255,255,255,0.25); margin-bottom: 25px; }
+        h2 { color: var(--orange); margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 12px 15px; text-align: left; border-bottom: 1px solid rgba(255,255,255,0.1); }
+        th { font-size: 0.8rem; text-transform: uppercase; opacity: 0.7; }
+        .badge-admin { background: #ef4444; padding: 3px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; }
+        .badge-analyst { background: #3b82f6; padding: 3px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; }
+        .badge-viewer { background: rgba(255,255,255,0.3); padding: 3px 10px; border-radius: 6px; font-size: 0.75rem; font-weight: 700; }
+        input, select { padding: 10px 14px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.3); background: rgba(255,255,255,0.15); color: white; font-family: 'Outfit'; font-size: 0.9rem; }
+        select option { background: #1e3a8a; }
+        .btn { padding: 10px 20px; border: none; border-radius: 8px; font-weight: 700; cursor: pointer; font-family: 'Outfit'; transition: all 0.3s; }
+        .btn-orange { background: var(--orange); color: white; }
+        .btn-orange:hover { background: #d65519; }
+        .btn-red { background: rgba(239,68,68,0.3); color: #ef4444; border: 1px solid #ef4444; }
+        .btn-red:hover { background: rgba(239,68,68,0.5); }
+        .form-row { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 15px; }
+        .form-row > * { flex: 1; min-width: 150px; }
+        a { color: var(--orange); text-decoration: none; }
+        a:hover { text-decoration: underline; }
+        .top-bar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="top-bar">
+            <h2>👥 User Management</h2>
+            <a href="/admin/dashboard">← Back to Dashboard</a>
+        </div>
+
+        <div class="card">
+            <h3 style="color:var(--orange); margin-bottom:15px; font-size:0.9rem; text-transform:uppercase;">Add / Update User</h3>
+            <div class="form-row">
+                <input type="text" id="new-username" placeholder="Username">
+                <input type="password" id="new-password" placeholder="Password">
+                <select id="new-role">
+                    <option value="viewer">Viewer</option>
+                    <option value="analyst">Analyst</option>
+                    <option value="admin">Admin</option>
+                </select>
+                <button class="btn btn-orange" onclick="addUser()">Save User</button>
+            </div>
+            <div id="user-msg" style="display:none; padding:10px; border-radius:8px; margin-top:10px; font-size:0.9rem;"></div>
+        </div>
+
+        <div class="card">
+            <h3 style="color:var(--orange); margin-bottom:15px; font-size:0.9rem; text-transform:uppercase;">Current Users</h3>
+            <table>
+                <thead><tr><th>Username</th><th>Role</th><th>Action</th></tr></thead>
+                <tbody id="users-tbody">
+                {% for uname, udata in users.items() %}
+                <tr id="row-{{ uname }}">
+                    <td style="font-weight:600;">{{ uname }}</td>
+                    <td><span class="badge-{{ udata.role }}">{{ udata.role }}</span></td>
+                    <td>
+                        {% if uname != username %}
+                        <button class="btn btn-red" onclick="deleteUser('{{ uname }}')" style="padding:6px 14px; font-size:0.8rem;">Delete</button>
+                        {% else %}
+                        <span style="opacity:0.5; font-size:0.8rem;">You</span>
+                        {% endif %}
+                    </td>
+                </tr>
+                {% endfor %}
+                </tbody>
+            </table>
+        </div>
+
+        <div class="card" style="opacity:0.8; font-size:0.85rem;">
+            <h3 style="color:var(--orange); margin-bottom:10px; font-size:0.9rem; text-transform:uppercase;">Role Permissions</h3>
+            <p><strong>Admin</strong> → Full access: all DB edits, advanced models, delete, user management.</p>
+            <p><strong>Analyst</strong> → Advanced Models + Standard Models + Resin Tracker + Machine DB + Variable DB.</p>
+            <p><strong>Viewer</strong> → Resin Tracker + Standard Models only.</p>
+        </div>
+    </div>
+    <script>
+    async function addUser() {
+        const uname = document.getElementById('new-username').value.trim();
+        const pwd = document.getElementById('new-password').value;
+        const role = document.getElementById('new-role').value;
+        const msg = document.getElementById('user-msg');
+        if (!uname || !pwd) { showMsg('Username and password required', true); return; }
+        try {
+            const r = await fetch('/api/admin/users', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({username: uname, password: pwd, role: role})
+            });
+            const d = await r.json();
+            showMsg(d.message, !d.success);
+            if (d.success) setTimeout(() => location.reload(), 800);
+        } catch(e) { showMsg('Error: ' + e.message, true); }
+    }
+    async function deleteUser(uname) {
+        if (!confirm('Delete user "' + uname + '"?')) return;
+        try {
+            const r = await fetch('/api/admin/users/' + uname, {method:'DELETE'});
+            const d = await r.json();
+            showMsg(d.message, !d.success);
+            if (d.success) {
+                const row = document.getElementById('row-' + uname);
+                if (row) row.remove();
+            }
+        } catch(e) { showMsg('Error: ' + e.message, true); }
+    }
+    function showMsg(text, isError) {
+        const msg = document.getElementById('user-msg');
+        msg.style.display = 'block';
+        msg.textContent = text;
+        msg.style.background = isError ? 'rgba(239,68,68,0.2)' : 'rgba(16,185,129,0.2)';
+        msg.style.border = '1px solid ' + (isError ? '#ef4444' : '#10b981');
+        setTimeout(() => { msg.style.display = 'none'; }, 4000);
+    }
+    </script>
+</body>
+</html>
+"""
+
+# ================= MODEL BUILDER HTML =================
+MODEL_BUILDER_HTML = """
+<style>
+.mb-card{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:25px;margin-bottom:20px;}
+.mb-title{font-size:1.5rem;font-weight:800;margin-bottom:20px;}
+.mb-field-row{display:grid;grid-template-columns:28px 1fr 1fr .7fr 1fr .6fr 1.3fr auto;gap:6px;align-items:center;margin-bottom:6px;padding:8px;background:rgba(255,255,255,0.04);border-radius:8px;transition:background 0.2s,border 0.2s;border:2px solid transparent;}
+.mb-field-row.drag-over{border-color:var(--orange);background:rgba(232,96,28,0.08);}
+.mb-field-row .drag-handle{cursor:grab;opacity:0.4;font-size:1.1rem;text-align:center;user-select:none;}
+.mb-field-row .drag-handle:active{cursor:grabbing;opacity:0.8;}
+.mb-input{width:100%;padding:7px 9px;background:rgba(255,255,255,0.12);color:white;border:1px solid rgba(255,255,255,0.2);border-radius:6px;font-family:'Outfit';font-size:0.82rem;}
+.mb-input:focus{outline:none;border-color:var(--orange);}
+.mb-select{width:100%;padding:7px 9px;background:rgba(255,255,255,0.12);color:white;border:1px solid rgba(255,255,255,0.2);border-radius:6px;font-family:'Outfit';font-size:0.82rem;cursor:pointer;}
+.mb-select option{background:#1a1a2e;color:white;}
+.mb-btn{padding:10px 20px;border-radius:8px;border:none;cursor:pointer;font-family:'Outfit';font-weight:600;font-size:0.9rem;transition:all 0.3s;}
+.mb-btn-primary{background:linear-gradient(135deg,#e8601c,#ff8a50);color:white;}
+.mb-btn-green{background:linear-gradient(135deg,#4CAF50,#45a049);color:white;}
+.mb-btn-secondary{background:rgba(255,255,255,0.1);color:white;border:1px solid rgba(255,255,255,0.2);}
+.mb-btn-danger{background:rgba(239,68,68,0.2);color:#ef4444;border:1px solid rgba(239,68,68,0.3);}
+.mb-btn-sm{padding:5px 12px;font-size:0.78rem;}
+.mb-label{font-size:0.72rem;font-weight:700;text-transform:uppercase;opacity:0.6;margin-bottom:4px;}
+.mb-models-list{display:grid;grid-template-columns:repeat(auto-fill,minmax(340px,1fr));gap:15px;margin-top:15px;}
+.mb-model-card{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:10px;padding:18px;transition:all 0.3s;}
+.mb-model-card:hover{border-color:var(--orange);}
+.mb-badge{display:inline-block;font-size:0.7rem;padding:2px 8px;border-radius:10px;font-weight:700;text-transform:uppercase;}
+.mb-badge-ess{background:rgba(76,175,80,0.2);color:#4CAF50;}
+.mb-badge-adv{background:rgba(232,96,28,0.2);color:#e8601c;}
+.share-row{display:flex;gap:8px;align-items:center;margin-bottom:8px;}
+.share-row label{min-width:120px;font-size:0.82rem;}
+/* Formula autocomplete */
+.mb-formula-wrap{position:relative;}
+.mb-formula-input{width:100%;padding:7px 9px;background:rgba(255,255,255,0.12);color:white;border:1px solid rgba(255,255,255,0.2);border-radius:6px;font-family:'Outfit';font-size:0.82rem;}
+.mb-formula-input:focus{outline:none;border-color:var(--orange);}
+.mb-formula-input.valid{border-color:rgba(76,175,80,0.6);}
+.mb-formula-input.invalid{border-color:rgba(239,68,68,0.6);}
+.mb-ac-popup{position:absolute;top:100%;left:0;right:0;background:#1a1a2e;border:1px solid rgba(255,255,255,0.2);border-radius:6px;max-height:180px;overflow-y:auto;z-index:100;display:none;}
+.mb-ac-popup.show{display:block;}
+.mb-ac-item{padding:6px 10px;cursor:pointer;font-size:0.8rem;display:flex;justify-content:space-between;}
+.mb-ac-item:hover{background:rgba(232,96,28,0.15);}
+.mb-ac-item .ac-type{opacity:0.4;font-size:0.7rem;}
+/* Preview panel */
+.mb-preview{background:rgba(255,255,255,0.03);border:1px dashed rgba(255,255,255,0.15);border-radius:10px;padding:20px;margin-top:15px;}
+.mb-preview-title{font-size:0.85rem;font-weight:700;margin-bottom:12px;color:#4CAF50;}
+.mb-preview .pv-section{font-size:0.75rem;font-weight:700;color:var(--orange);text-transform:uppercase;margin:10px 0 6px;padding-bottom:4px;border-bottom:1px solid rgba(232,96,28,0.2);}
+.mb-preview .pv-row{display:grid;grid-template-columns:1.4fr 0.4fr 1fr;gap:6px;align-items:center;margin-bottom:5px;font-size:0.83rem;}
+.mb-preview .pv-input{padding:5px 8px;background:rgba(76,175,80,0.1);color:white;border:1px solid rgba(76,175,80,0.4);border-radius:5px;font-family:'Outfit';font-size:0.82rem;width:100%;}
+.mb-preview .pv-result{display:flex;justify-content:space-between;padding:5px 0;font-size:0.83rem;border-bottom:1px solid rgba(255,255,255,0.04);}
+.mb-preview .pv-val{font-weight:700;}
+/* Defaults UI in share */
+.share-defaults-grid{display:grid;gap:6px;max-height:200px;overflow-y:auto;margin:8px 0;}
+.share-def-row{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center;font-size:0.82rem;}
+@media(max-width:768px){.mb-field-row{grid-template-columns:28px 1fr 1fr;}.mb-models-list{grid-template-columns:1fr;}}
+/* === Wizard Stepper === */
+.wiz-stepper{display:flex;gap:0;margin-bottom:25px;overflow-x:auto;}
+.wiz-step{flex:1;min-width:0;padding:12px 8px;text-align:center;font-size:0.78rem;font-weight:700;text-transform:uppercase;border-bottom:3px solid rgba(255,255,255,0.1);opacity:0.4;cursor:pointer;transition:all .3s;white-space:nowrap;}
+.wiz-step.active{opacity:1;border-color:var(--orange);color:var(--orange);}
+.wiz-step.done{opacity:0.8;border-color:#4CAF50;color:#4CAF50;}
+.wiz-step .wiz-num{display:inline-block;width:22px;height:22px;line-height:22px;border-radius:50%;background:rgba(255,255,255,0.1);font-size:0.7rem;margin-right:5px;}
+.wiz-step.active .wiz-num{background:var(--orange);color:#fff;}
+.wiz-step.done .wiz-num{background:#4CAF50;color:#fff;}
+.wiz-panel{display:none;}
+.wiz-panel.active{display:block;}
+.wiz-nav{display:flex;gap:10px;margin-top:20px;justify-content:space-between;}
+/* === Template Cards === */
+.tmpl-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(260px,1fr));gap:14px;margin-top:12px;}
+.tmpl-card{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.12);border-radius:10px;padding:16px;cursor:pointer;transition:all .3s;}
+.tmpl-card:hover{border-color:var(--orange);transform:translateY(-2px);}
+.tmpl-card.selected{border-color:#4CAF50;background:rgba(76,175,80,0.08);}
+.tmpl-card h4{margin:0 0 6px;font-size:0.95rem;}
+.tmpl-card p{margin:0;opacity:0.5;font-size:0.78rem;line-height:1.4;}
+.tmpl-meta{display:flex;gap:10px;margin-top:8px;font-size:0.72rem;opacity:0.4;}
+/* === Formula Explain === */
+.formula-explain{background:rgba(76,175,80,0.08);border:1px solid rgba(76,175,80,0.2);border-radius:8px;padding:10px 12px;margin-top:6px;font-size:0.78rem;line-height:1.5;display:none;}
+.formula-explain.show{display:block;}
+.formula-explain .explain-readable{color:#4CAF50;font-weight:600;}
+.formula-explain .explain-deps{opacity:0.6;margin-top:4px;}
+/* === Unit Converter === */
+.unit-bar{display:flex;gap:6px;align-items:center;padding:8px 12px;background:rgba(255,255,255,0.04);border-radius:8px;margin-bottom:12px;font-size:0.82rem;}
+.unit-bar input{width:100px;}
+.unit-bar select{width:90px;}
+.unit-result{font-weight:700;color:var(--orange);margin-left:8px;}
+/* === Dependency Graph === */
+.dep-graph-wrap{position:relative;border:1px solid rgba(255,255,255,0.1);border-radius:10px;overflow:hidden;background:rgba(0,0,0,0.2);}
+.dep-graph-wrap canvas{width:100%;display:block;}
+.dep-legend{display:flex;gap:15px;padding:8px 12px;font-size:0.72rem;opacity:0.5;}
+.dep-legend span::before{content:'';display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:4px;vertical-align:middle;}
+.dep-legend .leg-input::before{background:#4CAF50;}
+.dep-legend .leg-formula::before{background:#e8601c;}
+/* === Data Integration Links === */
+.db-link-btn{display:inline-flex;align-items:center;gap:4px;padding:3px 8px;border-radius:5px;font-size:0.68rem;font-weight:700;cursor:pointer;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.7);transition:all .2s;}
+.db-link-btn:hover{background:rgba(232,96,28,0.15);border-color:var(--orange);color:var(--orange);}
+.db-link-btn.linked{background:rgba(76,175,80,0.12);border-color:rgba(76,175,80,0.4);color:#4CAF50;}
+/* === Visual Formula Builder === */
+.vfb-area{min-height:60px;padding:10px;background:rgba(0,0,0,0.2);border:2px dashed rgba(255,255,255,0.15);border-radius:8px;display:flex;flex-wrap:wrap;gap:4px;align-items:center;font-family:monospace;font-size:0.88rem;color:white;transition:border-color .2s;}
+.vfb-area:focus-within,.vfb-area.drag-over{border-color:var(--orange);}
+.vfb-chip{display:inline-flex;align-items:center;gap:3px;padding:4px 10px;border-radius:6px;font-size:0.78rem;font-weight:600;cursor:grab;user-select:none;transition:all .15s;}
+.vfb-chip.field{background:rgba(76,175,80,0.2);border:1px solid #4CAF50;color:#4CAF50;}
+.vfb-chip.op{background:rgba(232,96,28,0.2);border:1px solid var(--orange);color:var(--orange);cursor:pointer;}
+.vfb-chip.func{background:rgba(100,149,237,0.2);border:1px solid cornflowerblue;color:cornflowerblue;}
+.vfb-chip.literal{background:rgba(255,255,255,0.1);border:1px solid rgba(255,255,255,0.3);color:white;}
+.vfb-chip:hover{transform:scale(1.05);}
+.vfb-chip .chip-rm{margin-left:4px;opacity:0.5;cursor:pointer;font-weight:400;}
+.vfb-chip .chip-rm:hover{opacity:1;color:#ef4444;}
+.vfb-toolbar{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:8px;}
+.vfb-toolbar button{padding:5px 12px;border-radius:6px;font-family:'Outfit';font-size:0.78rem;font-weight:700;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:rgba(255,255,255,0.8);cursor:pointer;transition:all .2s;}
+.vfb-toolbar button:hover{background:rgba(232,96,28,0.15);border-color:var(--orange);color:var(--orange);}
+.vfb-field-chips{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px;padding:8px;background:rgba(76,175,80,0.05);border:1px solid rgba(76,175,80,0.15);border-radius:8px;max-height:120px;overflow-y:auto;}
+.vfb-preview-text{font-family:monospace;font-size:0.82rem;color:var(--orange);padding:6px 10px;background:rgba(0,0,0,0.15);border-radius:6px;margin-top:6px;word-break:break-all;}
+.vfb-validation{font-size:0.72rem;padding:4px 8px;border-radius:4px;margin-top:4px;display:inline-block;}
+.vfb-validation.ok{background:rgba(76,175,80,0.15);color:#4CAF50;}
+.vfb-validation.err{background:rgba(239,68,68,0.15);color:#ef4444;}
+/* === Excel Auto Converter === */
+.exc-drop{border:2px dashed rgba(100,149,237,0.4);border-radius:12px;padding:30px;text-align:center;background:rgba(100,149,237,0.05);transition:all .3s;cursor:pointer;}
+.exc-drop:hover,.exc-drop.drag-over{border-color:cornflowerblue;background:rgba(100,149,237,0.1);}
+.exc-mapping-table{width:100%;font-size:0.8rem;margin-top:12px;border-collapse:collapse;}
+.exc-mapping-table th{text-align:left;padding:8px;font-size:0.7rem;text-transform:uppercase;opacity:0.5;border-bottom:1px solid rgba(255,255,255,0.1);}
+.exc-mapping-table td{padding:7px 8px;border-bottom:1px solid rgba(255,255,255,0.05);}
+.exc-mapping-table tr:hover{background:rgba(255,255,255,0.03);}
+.exc-badge{font-size:0.68rem;padding:2px 7px;border-radius:8px;font-weight:700;}
+.exc-badge.input{background:rgba(76,175,80,0.2);color:#4CAF50;}
+.exc-badge.formula{background:rgba(232,96,28,0.2);color:#e8601c;}
+/* === Bulk Edit Mode === */
+.be-grid{width:100%;border-collapse:collapse;font-size:0.82rem;margin-top:10px;}
+.be-grid th{text-align:left;padding:8px;font-size:0.7rem;text-transform:uppercase;opacity:0.5;border-bottom:2px solid rgba(255,255,255,0.15);position:sticky;top:0;background:rgba(26,26,46,0.95);z-index:1;}
+.be-grid td{padding:3px 4px;border-bottom:1px solid rgba(255,255,255,0.05);}
+.be-grid input,.be-grid select{width:100%;padding:5px 7px;background:rgba(255,255,255,0.08);color:white;border:1px solid transparent;border-radius:4px;font-family:'Outfit';font-size:0.8rem;transition:border-color .2s;}
+.be-grid input:focus,.be-grid select:focus{outline:none;border-color:var(--orange);background:rgba(255,255,255,0.12);}
+.be-grid tr.selected{background:rgba(232,96,28,0.1);}
+.be-grid td .be-type{font-size:0.68rem;padding:2px 6px;border-radius:4px;font-weight:700;}
+.be-grid td .be-type.input{background:rgba(76,175,80,0.2);color:#4CAF50;}
+.be-grid td .be-type.formula{background:rgba(232,96,28,0.2);color:#e8601c;}
+.be-actions{display:flex;gap:8px;margin-bottom:10px;flex-wrap:wrap;align-items:center;}
+.be-actions .be-count{font-size:0.78rem;opacity:0.5;margin-left:auto;}
+/* === Smart Suggestions Panel === */
+.sug-panel{background:rgba(76,175,80,0.05);border:1px solid rgba(76,175,80,0.2);border-radius:10px;padding:15px;margin-top:10px;}
+.sug-block{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px;}
+.sug-chip{padding:6px 12px;border-radius:8px;font-size:0.78rem;font-weight:600;cursor:pointer;transition:all .2s;border:1px solid rgba(76,175,80,0.3);background:rgba(76,175,80,0.1);color:#4CAF50;}
+.sug-chip:hover{background:rgba(76,175,80,0.25);transform:translateY(-1px);}
+.sug-chip.added{opacity:0.4;pointer-events:none;}
+</style>
+
+<!-- ======================== WIZARD BUILDER ======================== -->
+<div class="mb-card">
+    <div class="mb-title">Cost Model Builder</div>
+    <div class="wiz-stepper" id="wiz-stepper">
+        <div class="wiz-step active" onclick="wizGoTo(0)"><span class="wiz-num">1</span>Type</div>
+        <div class="wiz-step" onclick="wizGoTo(1)"><span class="wiz-num">2</span>Template</div>
+        <div class="wiz-step" onclick="wizGoTo(2)"><span class="wiz-num">3</span>Inputs</div>
+        <div class="wiz-step" onclick="wizGoTo(3)"><span class="wiz-num">4</span>Formulas</div>
+        <div class="wiz-step" onclick="wizGoTo(4)"><span class="wiz-num">5</span>Preview</div>
+    </div>
+
+    <!-- STEP 0: Model Type -->
+    <div class="wiz-panel active" id="wiz-p-0">
+        <div style="display:flex;gap:15px;flex-wrap:wrap;margin-bottom:12px;">
+            <div style="flex:1;min-width:200px;">
+                <div class="mb-label">Model Name</div>
+                <input class="mb-input" id="mb-name" placeholder="e.g. Rigid Box Cost Model">
+            </div>
+            <div style="flex:0 0 200px;">
+                <div class="mb-label">Save To Category</div>
+                <select class="mb-select" id="mb-category">
+                    <option value="essentials">Standard Models</option>
+                    <option value="advanced">Advanced Models</option>
+                </select>
+            </div>
+        </div>
+        <div style="margin-bottom:15px;">
+            <div class="mb-label">Packaging Type</div>
+            <select class="mb-select" id="mb-pkg-type" onchange="wizPkgTypeChanged()">
+                <option value="">— Select or skip —</option>
+                <option value="PET Preform">PET Preform</option>
+                <option value="Shrink Sleeve">Shrink Sleeve</option>
+                <option value="Injection Moulding">Injection Moulding</option>
+                <option value="Flexible Pouch">Flexible Pouch</option>
+                <option value="Carton">Folding Carton</option>
+                <option value="Blow Moulding">Blow Moulding</option>
+                <option value="Thermoforming">Thermoforming</option>
+                <option value="other">Other / Custom</option>
+            </select>
+        </div>
+        <div style="margin-bottom:15px;">
+            <div class="mb-label">Description (optional)</div>
+            <textarea class="mb-input" id="mb-description" rows="2" placeholder="Brief description of this cost model..." style="resize:vertical;"></textarea>
+        </div>
+        <div class="wiz-nav"><span></span><button class="mb-btn mb-btn-primary" onclick="wizNext()">Next → Templates</button></div>
+        <!-- Smart Suggestions Panel -->
+        <div class="sug-panel" id="sug-panel" style="display:none;">
+            <div style="display:flex;justify-content:space-between;align-items:center;">
+                <div class="mb-label" style="margin:0;color:#4CAF50;">💡 Suggested Fields for <span id="sug-pkg-name"></span></div>
+                <button class="mb-btn mb-btn-green mb-btn-sm" onclick="sugAddAll()">Add All</button>
+            </div>
+            <div class="mb-label" style="margin-top:8px;">Inputs</div>
+            <div class="sug-block" id="sug-inputs"></div>
+            <div class="mb-label" style="margin-top:8px;">Formulas</div>
+            <div class="sug-block" id="sug-formulas"></div>
+        </div>
+    </div>
+
+    <!-- STEP 1: Template Library -->
+    <div class="wiz-panel" id="wiz-p-1">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+            <div class="mb-label" style="margin:0;">Choose a Template or Start Blank</div>
+            <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="wizSelectTemplate(null)">Start Blank</button>
+        </div>
+        <div id="wiz-tmpl-grid" class="tmpl-grid"><p style="opacity:0.5;">Loading templates...</p></div>
+        <div class="wiz-nav"><button class="mb-btn mb-btn-secondary" onclick="wizPrev()">← Back</button><button class="mb-btn mb-btn-primary" onclick="wizNext()">Next → Inputs</button></div>
+    </div>
+
+    <!-- STEP 2: Inputs -->
+    <div class="wiz-panel" id="wiz-p-2">
+        <!-- Unit Converter Bar -->
+        <div class="unit-bar">
+            <span style="font-weight:700;font-size:0.72rem;opacity:0.5;">CONVERT:</span>
+            <input class="mb-input" type="number" id="uc-val" value="1" style="width:90px;" oninput="ucConvert()">
+            <select class="mb-select" id="uc-from" style="width:95px;" onchange="ucConvert()">
+                <option>g</option><option>kg</option><option>MT</option><option>gsm</option><option>kg/sqm</option>
+                <option>mm</option><option>cm</option><option>m</option><option>micron</option><option>in</option>
+                <option>pcs</option><option>1000 pcs</option><option>sqm</option><option>sqft</option>
+                <option>ml</option><option>l</option><option>oz</option><option>lb</option>
+                <option>₹</option><option>$</option><option>€</option><option>£</option>
+            </select>
+            <span style="opacity:0.4;">→</span>
+            <select class="mb-select" id="uc-to" style="width:95px;" onchange="ucConvert()">
+                <option>kg</option><option>g</option><option>MT</option><option>kg/sqm</option><option>gsm</option>
+                <option>cm</option><option>mm</option><option>m</option><option>in</option><option>micron</option>
+                <option>1000 pcs</option><option>pcs</option><option>sqft</option><option>sqm</option>
+                <option>l</option><option>ml</option><option>g</option><option>kg</option>
+                <option>$</option><option>₹</option><option>€</option><option>£</option>
+            </select>
+            <span class="unit-result" id="uc-result">—</span>
+        </div>
+        <div style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="mb-btn mb-btn-primary mb-btn-sm" onclick="mbAddField('input')">+ Input Field</button>
+            <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="beOpen()" style="border-color:rgba(100,149,237,0.4);color:cornflowerblue;">⊞ Bulk Edit</button>
+            <span style="flex:1;"></span>
+            <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbImportJSON()">Import JSON</button>
+            <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbExportJSON()">Export JSON</button>
+            <input type="file" id="mb-import-file" accept=".json" style="display:none;" onchange="mbHandleImport(event)">
+        </div>
+        <div class="mb-label" style="margin-bottom:6px;">Input Fields <span style="opacity:0.4;font-weight:400;">(drag ≡ to reorder)</span></div>
+        <div style="display:grid;grid-template-columns:28px 1fr 1fr .7fr 1fr .6fr 1.3fr auto;gap:6px;margin-bottom:4px;padding:0 8px;font-size:0.66rem;opacity:0.4;font-weight:700;text-transform:uppercase;">
+            <span></span><span>ID</span><span>Label</span><span>Type</span><span>Group</span><span>Unit</span><span>Default / DB Link</span><span></span>
+        </div>
+        <div id="mb-inputs-container"></div>
+        <div class="wiz-nav"><button class="mb-btn mb-btn-secondary" onclick="wizPrev()">← Back</button><button class="mb-btn mb-btn-primary" onclick="wizNext()">Next → Formulas</button></div>
+    </div>
+
+    <!-- STEP 3: Formulas -->
+    <div class="wiz-panel" id="wiz-p-3">
+        <div style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;">
+            <button class="mb-btn mb-btn-primary mb-btn-sm" onclick="mbAddField('formula')">+ Formula Field</button>
+            <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="beOpen()" style="border-color:rgba(100,149,237,0.4);color:cornflowerblue;">⊞ Bulk Edit</button>
+            <span style="flex:1;"></span>
+            <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbShowDepGraph()">Dependency Graph</button>
+        </div>
+        <div class="mb-label" style="margin-bottom:6px;">Formula Fields</div>
+        <div style="display:grid;grid-template-columns:28px 1fr 1fr .7fr 1fr .6fr 1.3fr auto;gap:6px;margin-bottom:4px;padding:0 8px;font-size:0.66rem;opacity:0.4;font-weight:700;text-transform:uppercase;">
+            <span></span><span>ID</span><span>Label</span><span>Type</span><span>Section</span><span>Unit</span><span>Formula</span><span></span>
+        </div>
+        <div id="mb-formulas-container"></div>
+        <!-- Formula Assistant: explain panel -->
+        <div id="mb-formula-explain-panel" class="formula-explain"></div>
+        <!-- Dependency Graph -->
+        <div id="mb-dep-graph" style="display:none;margin-top:15px;">
+            <div class="mb-label">Dependency Graph</div>
+            <div class="dep-graph-wrap"><canvas id="dep-canvas" width="800" height="400"></canvas></div>
+            <div class="dep-legend"><span class="leg-input">Input</span><span class="leg-formula">Formula</span></div>
+            <div id="dep-warnings" style="margin-top:6px;"></div>
+        </div>
+        <div class="wiz-nav"><button class="mb-btn mb-btn-secondary" onclick="wizPrev()">← Back</button><button class="mb-btn mb-btn-primary" onclick="wizNext()">Next → Preview</button></div>
+    </div>
+
+    <!-- STEP 4: Preview & Save -->
+    <div class="wiz-panel" id="wiz-p-4">
+        <div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:15px;">
+            <button class="mb-btn mb-btn-green" onclick="mbSaveModel()">Save Model</button>
+            <button class="mb-btn mb-btn-secondary" onclick="mbClearForm()">Clear All</button>
+            <button class="mb-btn mb-btn-secondary" onclick="mbTogglePreview()" id="mb-preview-toggle">▶ Show Live Preview</button>
+        </div>
+        <div id="mb-preview-panel"></div>
+        <div class="wiz-nav"><button class="mb-btn mb-btn-secondary" onclick="wizPrev()">← Back</button><span></span></div>
+    </div>
+</div>
+
+<!-- ======================== SAVED MODELS ======================== -->
+<div class="mb-card">
+    <h3 style="margin-bottom:15px;">Saved Models</h3>
+    <div id="mb-models-list" class="mb-models-list"><p style="opacity:0.5;">Loading...</p></div>
+</div>
+
+<!-- ======================== VISUAL FORMULA BUILDER ======================== -->
+<div class="mb-card" id="vfb-panel" style="display:none;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+        <h3>Visual Formula Builder</h3>
+        <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="vfbClose()">✕ Close</button>
+    </div>
+    <div class="mb-label">Available Fields (drag into formula)</div>
+    <div class="vfb-field-chips" id="vfb-fields"></div>
+    <div class="mb-label">Operators & Functions</div>
+    <div class="vfb-toolbar" id="vfb-ops">
+        <button onclick="vfbInsertOp('+')">+</button>
+        <button onclick="vfbInsertOp('-')">−</button>
+        <button onclick="vfbInsertOp('*')">×</button>
+        <button onclick="vfbInsertOp('/')">÷</button>
+        <button onclick="vfbInsertOp('**')">^</button>
+        <button onclick="vfbInsertOp('(')">(</button>
+        <button onclick="vfbInsertOp(')')">)</button>
+        <button onclick="vfbInsertFunc('min')">MIN</button>
+        <button onclick="vfbInsertFunc('max')">MAX</button>
+        <button onclick="vfbInsertFunc('abs')">ABS</button>
+        <button onclick="vfbInsertFunc('round')">ROUND</button>
+        <button onclick="vfbInsertFunc('sqrt')">√</button>
+        <button onclick="vfbInsertFunc('ceil')">CEIL</button>
+        <button onclick="vfbInsertFunc('floor')">FLOOR</button>
+        <button onclick="vfbInsertLiteral()" style="border-color:rgba(255,255,255,0.3);"># Number</button>
+        <button onclick="vfbInsertIfExpr()" style="border-color:cornflowerblue;color:cornflowerblue;">IF..ELSE</button>
+    </div>
+    <div class="mb-label">Formula <span style="font-weight:400;opacity:0.4;">(drag fields, click operators, or type directly)</span></div>
+    <div class="vfb-area" id="vfb-canvas" ondrop="vfbDropOnCanvas(event)" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')"></div>
+    <div style="display:flex;gap:10px;margin-top:8px;align-items:center;">
+        <div class="mb-label" style="margin:0;">Preview:</div>
+        <div class="vfb-preview-text" id="vfb-preview" style="flex:1;">—</div>
+        <span id="vfb-valid" class="vfb-validation"></span>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:12px;">
+        <button class="mb-btn mb-btn-green mb-btn-sm" onclick="vfbApply()">✓ Apply Formula</button>
+        <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="vfbClear()">Clear</button>
+    </div>
+    <input type="hidden" id="vfb-target-idx">
+</div>
+
+<!-- ======================== EXCEL → MODEL CONVERTER ======================== -->
+<div class="mb-card">
+    <h3 style="margin-bottom:12px;">Excel → Model Auto Converter</h3>
+    <p style="opacity:0.5;font-size:0.82rem;margin-bottom:15px;">Upload a spreadsheet with inputs & formulas. Cell references auto-map to field IDs.</p>
+    <div class="exc-drop" id="exc-drop-zone" onclick="document.getElementById('exc-file-input').click()"
+         ondrop="excHandleDrop(event)" ondragover="event.preventDefault();this.classList.add('drag-over')" ondragleave="this.classList.remove('drag-over')">
+        <div style="font-size:1.8rem;margin-bottom:6px;">📊</div>
+        <div style="font-weight:700;">Drop .xlsx here or click to browse</div>
+        <div style="font-size:0.78rem;opacity:0.5;margin-top:4px;" id="exc-file-name">Supports Excel formulas</div>
+        <input type="file" id="exc-file-input" accept=".xlsx,.xls" style="display:none;" onchange="excFileSelected(this)">
+    </div>
+    <div id="exc-mapping-preview" style="display:none;margin-top:15px;">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+            <div>
+                <span class="mb-badge mb-badge-ess" id="exc-input-count">0 inputs</span>
+                <span class="mb-badge mb-badge-adv" id="exc-formula-count" style="margin-left:6px;">0 formulas</span>
+            </div>
+            <div style="display:flex;gap:6px;">
+                <button class="mb-btn mb-btn-green mb-btn-sm" onclick="excApplyModel()">✓ Load into Builder</button>
+                <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="excClear()">Discard</button>
+            </div>
+        </div>
+        <div style="max-height:350px;overflow:auto;border:1px solid rgba(255,255,255,0.1);border-radius:8px;">
+            <table class="exc-mapping-table" id="exc-mapping-table">
+                <thead><tr><th>Cell</th><th>Type</th><th>Field ID</th><th>Label</th><th>Formula / Default</th></tr></thead>
+                <tbody id="exc-mapping-body"></tbody>
+            </table>
+        </div>
+    </div>
+</div>
+
+<!-- ======================== BULK EDIT MODE ======================== -->
+<div class="mb-card" id="bulk-edit-panel" style="display:none;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+        <h3>Bulk Edit Mode — Spreadsheet View</h3>
+        <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="beClose()">✕ Close</button>
+    </div>
+    <div class="be-actions">
+        <button class="mb-btn mb-btn-primary mb-btn-sm" onclick="beAddRow('input')">+ Input</button>
+        <button class="mb-btn mb-btn-primary mb-btn-sm" onclick="beAddRow('formula')">+ Formula</button>
+        <button class="mb-btn mb-btn-danger mb-btn-sm" onclick="beDeleteSelected()">Delete Selected</button>
+        <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="beSelectAll()">Select All</button>
+        <span class="be-count" id="be-count">0 fields</span>
+    </div>
+    <div style="max-height:500px;overflow:auto;border:1px solid rgba(255,255,255,0.1);border-radius:8px;">
+        <table class="be-grid" id="be-grid">
+            <thead><tr>
+                <th style="width:30px;"><input type="checkbox" id="be-check-all" onchange="beToggleAll(this.checked)"></th>
+                <th>Type</th><th>ID</th><th>Label</th><th>Unit</th><th>Group / Section</th><th>Default / Formula</th>
+            </tr></thead>
+            <tbody id="be-tbody"></tbody>
+        </table>
+    </div>
+    <div style="margin-top:10px;display:flex;gap:8px;">
+        <button class="mb-btn mb-btn-green" onclick="beApply()">✓ Apply Changes</button>
+    </div>
+</div>
+
+<!-- ======================== SHARE PANEL ======================== -->
+<div class="mb-card" id="mb-share-panel" style="display:none;">
+    <h3 style="margin-bottom:15px;">Share Model</h3>
+    <input type="hidden" id="mb-share-model-id">
+    <div class="share-row"><label>Password (opt):</label><input class="mb-input" id="mb-share-pw" type="password" placeholder="Leave blank for no password" style="flex:1;"></div>
+    <div class="share-row"><label>Expiry (opt):</label><input class="mb-input" id="mb-share-exp" type="datetime-local" style="flex:1;"></div>
+    <div style="margin:12px 0;">
+        <div class="mb-label">Lock / Hide Fields</div>
+        <div id="mb-share-fields" style="max-height:200px;overflow-y:auto;"></div>
+    </div>
+    <div style="margin:12px 0;">
+        <div class="mb-label">Field Defaults</div>
+        <div id="mb-share-defaults-ui" class="share-defaults-grid"></div>
+    </div>
+    <button class="mb-btn mb-btn-green" onclick="mbCreateShare()" style="margin-top:10px;">Generate Share Link</button>
+    <div id="mb-share-result" style="margin-top:10px;"></div>
+</div>
+
+<div class="mb-card">
+    <h3 style="margin-bottom:15px;">Active Share Links</h3>
+    <div id="mb-shares-list"><p style="opacity:0.5;">Loading...</p></div>
+</div>
+
+<script>
+let mbFields = [];
+let mbEditingId = null;
+let mbPreviewOpen = false;
+let mbDragIdx = null;
+let wizStep = 0;
+let wizSelectedTemplate = null;
+
+const INPUT_GROUPS = ['Material', 'Machine', 'Overhead', 'Labour', 'Logistics', 'General', 'Dimensions', 'Rates'];
+const FORMULA_SECTIONS = ['Cost Breakdown', 'Summary', 'Annual', 'Per Unit', 'Overhead Allocation', 'Results'];
+const INPUT_TYPES = ['number', 'text', 'dropdown', 'percent', 'checkbox'];
+const SAFE_FUNCS = ['min','max','abs','round','sum','pow','int','float','sqrt','log','log10','ceil','floor'];
+
+function optionsHtml(list, selected) { return list.map(v => `<option value="${v}" ${v===selected?'selected':''}>${v}</option>`).join(''); }
+
+// ═══════════════ WIZARD STEPPER ═══════════════
+function wizGoTo(step) {
+    wizStep = step;
+    document.querySelectorAll('.wiz-step').forEach((el, i) => {
+        el.classList.remove('active', 'done');
+        if (i < step) el.classList.add('done');
+        else if (i === step) el.classList.add('active');
+    });
+    document.querySelectorAll('.wiz-panel').forEach((el, i) => {
+        el.classList.toggle('active', i === step);
+    });
+    if (step === 1) wizLoadTemplates();
+    if (step === 2) mbRenderInputFields();
+    if (step === 3) mbRenderFormulaFields();
+    if (step === 4) { mbPreviewOpen = true; mbUpdatePreview(); }
+}
+function wizNext() { if (wizStep < 4) wizGoTo(wizStep + 1); }
+function wizPrev() { if (wizStep > 0) wizGoTo(wizStep - 1); }
+
+function wizPkgTypeChanged() {
+    // Auto-suggest fields for packaging type on template step
+}
+
+// ═══════════════ TEMPLATE LIBRARY ═══════════════
+async function wizLoadTemplates() {
+    const grid = document.getElementById('wiz-tmpl-grid');
+    try {
+        const r = await fetch('/api/model_templates');
+        const data = await r.json();
+        if (!data.success || !data.templates.length) { grid.innerHTML = '<p style="opacity:0.5;">No templates available.</p>'; return; }
+        grid.innerHTML = data.templates.map(t => `
+            <div class="tmpl-card ${wizSelectedTemplate===t.key?'selected':''}" onclick="wizSelectTemplate('${t.key}')">
+                <h4>${t.name}</h4>
+                <p>${t.description}</p>
+                <div class="tmpl-meta">
+                    <span>${t.input_count} inputs</span>
+                    <span>${t.formula_count} formulas</span>
+                    <span>${t.packaging_type}</span>
+                </div>
+            </div>
+        `).join('');
+    } catch(e) { grid.innerHTML = '<p style="opacity:0.5;">Error loading templates.</p>'; }
+}
+
+async function wizSelectTemplate(key) {
+    wizSelectedTemplate = key;
+    document.querySelectorAll('.tmpl-card').forEach(c => c.classList.remove('selected'));
+    if (!key) {
+        // Blank start
+        mbFields = [];
+        mbRenderInputFields();
+        mbRenderFormulaFields();
+        return;
+    }
+    // Mark selected
+    document.querySelectorAll('.tmpl-card').forEach(c => {
+        if (c.querySelector('h4') && c.onclick.toString().includes(key)) c.classList.add('selected');
+    });
+    try {
+        const r = await fetch('/api/model_templates/' + key);
+        const data = await r.json();
+        if (!data.success) return;
+        const tmpl = data.template;
+        document.getElementById('mb-name').value = tmpl.name || '';
+        document.getElementById('mb-description').value = tmpl.description || '';
+        document.getElementById('mb-category').value = tmpl.category || 'essentials';
+        mbFields = JSON.parse(JSON.stringify(tmpl.fields));
+        mbRenderInputFields();
+        mbRenderFormulaFields();
+        // Auto-advance
+        wizNext();
+    } catch(e) { alert('Error loading template.'); }
+}
+
+// ═══════════════ UNIT CONVERTER ═══════════════
+async function ucConvert() {
+    const val = parseFloat(document.getElementById('uc-val').value) || 0;
+    const from = document.getElementById('uc-from').value;
+    const to = document.getElementById('uc-to').value;
+    const out = document.getElementById('uc-result');
+    if (!val || from === to) { out.textContent = val ? val.toString() : '—'; return; }
+    try {
+        const r = await fetch('/api/convert_units', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({value: val, from: from, to: to})
+        });
+        const data = await r.json();
+        if (data.success) { out.textContent = data.result + ' ' + to; out.style.color = 'var(--orange)'; }
+        else { out.textContent = '—'; out.style.color = '#ef4444'; }
+    } catch(e) { out.textContent = '—'; }
+}
+
+// ═══════════════ DRAG & DROP ═══════════════
+function mbDragStart(e, idx) { mbDragIdx = idx; e.dataTransfer.effectAllowed = 'move'; e.target.closest('.mb-field-row').style.opacity = '0.5'; }
+function mbDragEnd(e) { e.target.closest('.mb-field-row').style.opacity = '1'; document.querySelectorAll('.mb-field-row').forEach(r => r.classList.remove('drag-over')); }
+function mbDragOver(e, idx) { e.preventDefault(); e.dataTransfer.dropEffect = 'move'; document.querySelectorAll('.mb-field-row').forEach(r => r.classList.remove('drag-over')); e.target.closest('.mb-field-row').classList.add('drag-over'); }
+function mbDrop(e, idx) {
+    e.preventDefault();
+    if (mbDragIdx === null || mbDragIdx === idx) return;
+    const item = mbFields.splice(mbDragIdx, 1)[0];
+    mbFields.splice(idx, 0, item);
+    mbDragIdx = null;
+    mbRenderInputFields();
+    mbRenderFormulaFields();
+    mbUpdatePreview();
+}
+
+// ═══════════════ ADD FIELD ═══════════════
+function mbAddField(type, data) {
+    const f = data || {id:'', label:'', type:type, unit:'', default:0, formula:'', input_group:'General', formula_section:'Cost Breakdown', input_type:'number', options:'', data_source:'', data_key:''};
+    f.type = type;
+    if (!f.input_type) f.input_type = 'number';
+    mbFields.push(f);
+    if (type === 'input') mbRenderInputFields();
+    else mbRenderFormulaFields();
+    mbUpdatePreview();
+}
+
+// ═══════════════ RENDER INPUT FIELDS (Step 2) ═══════════════
+function mbRenderInputFields() {
+    const c = document.getElementById('mb-inputs-container');
+    if (!c) return;
+    c.innerHTML = '';
+    mbFields.forEach((f, i) => {
+        if (f.type !== 'input') return;
+        const typeCol = `<select class="mb-select" style="font-size:0.76rem;" onchange="mbFields[${i}].input_type=this.value;mbRenderInputFields();mbUpdatePreview();">${optionsHtml(INPUT_TYPES, f.input_type||'number')}</select>`;
+        const groupCol = `<select class="mb-select" onchange="mbFields[${i}].input_group=this.value;mbUpdatePreview()">${optionsHtml(INPUT_GROUPS, f.input_group||'General')}</select>`;
+
+        // Default value + DB link button
+        let lastCol;
+        if (f.input_type === 'dropdown') {
+            lastCol = `<input class="mb-input" placeholder="opt1,opt2,opt3" value="${f.options||''}" onchange="mbFields[${i}].options=this.value;mbUpdatePreview()">`;
+        } else if (f.input_type === 'checkbox') {
+            lastCol = `<select class="mb-select" onchange="mbFields[${i}].default=this.value==='true'?1:0;mbUpdatePreview()"><option value="false" ${!f.default?'selected':''}>Off</option><option value="true" ${f.default?'selected':''}>On</option></select>`;
+        } else if (f.input_type === 'percent') {
+            lastCol = `<input class="mb-input" type="number" min="0" max="100" value="${f.default||0}" onchange="mbFields[${i}].default=parseFloat(this.value)||0;mbUpdatePreview()">`;
+        } else {
+            lastCol = `<div style="display:flex;gap:4px;align-items:center;">
+                <input class="mb-input" type="${f.input_type==='text'?'text':'number'}" value="${f.default===undefined?0:f.default}" onchange="mbFields[${i}].default=this.type==='number'?parseFloat(this.value)||0:this.value;mbUpdatePreview()" style="flex:1;" id="mb-def-${i}">
+                <button class="db-link-btn ${f.data_source?'linked':''}" onclick="mbLinkDB(${i})" title="Link to database">${f.data_source?'🔗 '+f.data_source:'⛓ DB'}</button>
+            </div>`;
+        }
+
+        const row = document.createElement('div');
+        row.className = 'mb-field-row';
+        row.draggable = true;
+        row.ondragstart = (e) => mbDragStart(e, i);
+        row.ondragend = mbDragEnd;
+        row.ondragover = (e) => mbDragOver(e, i);
+        row.ondrop = (e) => mbDrop(e, i);
+        row.innerHTML = `
+            <span class="drag-handle" title="Drag to reorder">≡</span>
+            <input class="mb-input" placeholder="field_id" value="${f.id||''}" onchange="mbFields[${i}].id=this.value;mbUpdatePreview()">
+            <input class="mb-input" placeholder="Display Label" value="${f.label||''}" onchange="mbFields[${i}].label=this.value;mbUpdatePreview()">
+            ${typeCol}
+            ${groupCol}
+            <input class="mb-input" placeholder="unit" value="${f.unit||''}" onchange="mbFields[${i}].unit=this.value;mbUpdatePreview()">
+            ${lastCol}
+            <button class="mb-btn mb-btn-danger" onclick="mbFields.splice(${i},1);mbRenderInputFields();mbUpdatePreview()" style="padding:5px 9px;font-size:0.78rem;">✕</button>
+        `;
+        c.appendChild(row);
+    });
+}
+
+// ═══════════════ DATA INTEGRATION LINKS ═══════════════
+async function mbLinkDB(idx) {
+    const f = mbFields[idx];
+    const source = prompt('Link to which database?\\n\\n1 = Resin Tracker\\n2 = Machine DB\\n3 = Variable Cost DB\\n\\nEnter 1, 2, or 3 (or clear to unlink):');
+    if (source === null) return;
+    if (!source.trim()) { f.data_source = ''; f.data_key = ''; mbRenderInputFields(); return; }
+
+    const srcMap = {'1':'resin', '2':'machine', '3':'variable_cost'};
+    const src = srcMap[source.trim()];
+    if (!src) { alert('Invalid choice.'); return; }
+
+    let key = '';
+    if (src === 'resin') {
+        key = prompt('Enter resin type (PET, PP, HDPE, LDPE, LLDPE, PVC, PS):') || '';
+    } else if (src === 'variable_cost') {
+        key = prompt('Enter cost key (electricity, labour, land, building):') || '';
+    }
+
+    f.data_source = src;
+    f.data_key = key;
+
+    // Auto-fetch current value
+    try {
+        const r = await fetch('/api/db_lookup', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({source: src, key: key, country: 'India'})
+        });
+        const data = await r.json();
+        if (data.success && data.value) {
+            f.default = data.value;
+            const defEl = document.getElementById('mb-def-' + idx);
+            if (defEl) defEl.value = data.value;
+            alert('Fetched: ' + (data.display || data.value) + '\\nSource: ' + (data.source || src));
+        } else {
+            alert('Linked but no value found: ' + (data.message || 'No data'));
+        }
+    } catch(e) { alert('Link saved. Could not fetch value: ' + e.message); }
+    mbRenderInputFields();
+}
+
+async function mbRefreshAllDBLinks() {
+    let refreshed = 0;
+    for (let i = 0; i < mbFields.length; i++) {
+        const f = mbFields[i];
+        if (!f.data_source) continue;
+        try {
+            const r = await fetch('/api/db_lookup', {
+                method:'POST', headers:{'Content-Type':'application/json'},
+                body: JSON.stringify({source: f.data_source, key: f.data_key || '', country: 'India'})
+            });
+            const data = await r.json();
+            if (data.success && data.value) { f.default = data.value; refreshed++; }
+        } catch(e) {}
+    }
+    mbRenderInputFields();
+    mbUpdatePreview();
+    if (refreshed > 0) alert(refreshed + ' field(s) refreshed from databases.');
+}
+
+// ═══════════════ RENDER FORMULA FIELDS (Step 3) ═══════════════
+function mbRenderFormulaFields() {
+    const c = document.getElementById('mb-formulas-container');
+    if (!c) return;
+    c.innerHTML = '';
+    mbFields.forEach((f, i) => {
+        if (f.type !== 'formula') return;
+        const sectionCol = `<select class="mb-select" onchange="mbFields[${i}].formula_section=this.value;mbUpdatePreview()">${optionsHtml(FORMULA_SECTIONS, f.formula_section||'Cost Breakdown')}</select>`;
+        const lastCol = `<div class="mb-formula-wrap">
+            <input class="mb-formula-input" placeholder="e.g. price * qty" value="${(f.formula||'').replace(/"/g,'&quot;')}"
+                oninput="mbFields[${i}].formula=this.value;mbFormulaInput(this,${i})"
+                onfocus="mbShowAC(${i})" onblur="setTimeout(()=>mbHideAC(${i}),200)"
+                id="mb-formula-${i}" autocomplete="off">
+            <div class="mb-ac-popup" id="mb-ac-${i}"></div>
+            <div style="display:flex;gap:4px;margin-top:3px;">
+                <button class="db-link-btn" onclick="mbExplainFormula(${i})" title="Explain formula">💡 Explain</button>
+                <button class="db-link-btn" onclick="vfbOpen(${i})" title="Visual formula builder">🧱 Visual</button>
+            </div>
+        </div>`;
+
+        const row = document.createElement('div');
+        row.className = 'mb-field-row';
+        row.draggable = true;
+        row.ondragstart = (e) => mbDragStart(e, i);
+        row.ondragend = mbDragEnd;
+        row.ondragover = (e) => mbDragOver(e, i);
+        row.ondrop = (e) => mbDrop(e, i);
+        row.innerHTML = `
+            <span class="drag-handle" title="Drag to reorder">≡</span>
+            <input class="mb-input" placeholder="field_id" value="${f.id||''}" onchange="mbFields[${i}].id=this.value;mbUpdatePreview()">
+            <input class="mb-input" placeholder="Display Label" value="${f.label||''}" onchange="mbFields[${i}].label=this.value;mbUpdatePreview()">
+            <span style="color:#e8601c;font-weight:700;font-size:0.74rem;">FORMULA</span>
+            ${sectionCol}
+            <input class="mb-input" placeholder="unit" value="${f.unit||''}" onchange="mbFields[${i}].unit=this.value;mbUpdatePreview()">
+            ${lastCol}
+            <button class="mb-btn mb-btn-danger" onclick="mbFields.splice(${i},1);mbRenderFormulaFields();mbUpdatePreview()" style="padding:5px 9px;font-size:0.78rem;">✕</button>
+        `;
+        c.appendChild(row);
+    });
+}
+
+// ═══════════════ SMART FORMULA ASSISTANT ═══════════════
+async function mbExplainFormula(idx) {
+    const f = mbFields[idx];
+    if (!f || !f.formula) return;
+    const panel = document.getElementById('mb-formula-explain-panel');
+    panel.innerHTML = '<span style="opacity:0.5;">Analyzing...</span>';
+    panel.classList.add('show');
+    try {
+        const r = await fetch('/api/formula_explain', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({formula: f.formula, fields: mbFields})
+        });
+        const data = await r.json();
+        if (data.success) {
+            panel.innerHTML = `
+                <div class="explain-readable">${data.readable || ''}</div>
+                <div class="explain-deps">Depends on: ${data.dependencies.map(d => '<strong>'+d+'</strong>').join(', ') || 'none'}</div>
+                ${data.functions.length ? '<div style="margin-top:4px;opacity:0.5;">Functions: '+data.functions.join(', ')+'</div>' : ''}
+            `;
+        } else {
+            panel.innerHTML = '<span style="color:#ef4444;">' + (data.explanation || 'Error') + '</span>';
+        }
+    } catch(e) { panel.innerHTML = '<span style="color:#ef4444;">Error analyzing formula.</span>'; }
+}
+
+// ═══════════════ FORMULA AUTOCOMPLETE + VALIDATION ═══════════════
+function mbGetAllIds(exceptIdx) {
+    return mbFields.filter((f,i) => f.id && i !== exceptIdx).map(f => ({id:f.id, label:f.label||f.id, type:f.type}));
+}
+
+function mbShowAC(idx) {
+    const popup = document.getElementById('mb-ac-' + idx);
+    const input = document.getElementById('mb-formula-' + idx);
+    if (!popup || !input) return;
+    const val = input.value;
+    const word = (val.match(/[a-zA-Z_][a-zA-Z0-9_]*$/) || [''])[0].toLowerCase();
+    const ids = mbGetAllIds(idx);
+    let items = [];
+    ids.forEach(f => { if (!word || f.id.toLowerCase().includes(word)) items.push({text:f.id, desc:f.type==='formula'?'formula':'input', type:'field'}); });
+    SAFE_FUNCS.forEach(fn => { if (!word || fn.includes(word)) items.push({text:fn+'()', desc:'function', type:'func'}); });
+    if (items.length === 0) { popup.classList.remove('show'); return; }
+    popup.innerHTML = items.slice(0,15).map(it =>
+        `<div class="mb-ac-item" onmousedown="mbInsertAC(${idx},'${it.text}')"><span>${it.text}</span><span class="ac-type">${it.desc}</span></div>`
+    ).join('');
+    popup.classList.add('show');
+}
+
+function mbHideAC(idx) { const p = document.getElementById('mb-ac-' + idx); if(p) p.classList.remove('show'); }
+
+function mbInsertAC(idx, text) {
+    const input = document.getElementById('mb-formula-' + idx);
+    if (!input) return;
+    const val = input.value;
+    const before = val.replace(/[a-zA-Z_][a-zA-Z0-9_]*$/, '');
+    input.value = before + text;
+    mbFields[idx].formula = input.value;
+    mbHideAC(idx);
+    input.focus();
+    mbValidateFormula(idx);
+}
+
+function mbFormulaInput(el, idx) {
+    mbShowAC(idx);
+    mbValidateFormula(idx);
+    mbUpdatePreview();
+}
+
+let _valTimer = {};
+function mbValidateFormula(idx) {
+    clearTimeout(_valTimer[idx]);
+    _valTimer[idx] = setTimeout(() => {
+        const input = document.getElementById('mb-formula-' + idx);
+        if (!input) return;
+        const expr = input.value.trim();
+        if (!expr) { input.className = 'mb-formula-input'; return; }
+        const fieldIds = mbFields.filter(f => f.id).map(f => f.id);
+        fetch('/api/validate_formula', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({formula: expr, field_ids: fieldIds})
+        }).then(r => r.json()).then(data => {
+            input.classList.remove('valid','invalid');
+            input.classList.add(data.success ? 'valid' : 'invalid');
+            input.title = data.success ? 'Test value: ' + data.test_value : 'Error: ' + data.error;
+        }).catch(() => {});
+    }, 300);
+}
+
+// ═══════════════ DEPENDENCY GRAPH ═══════════════
+async function mbShowDepGraph() {
+    const panel = document.getElementById('mb-dep-graph');
+    const warn = document.getElementById('dep-warnings');
+    panel.style.display = panel.style.display === 'none' ? 'block' : 'none';
+    if (panel.style.display === 'none') return;
+
+    try {
+        const r = await fetch('/api/formula_deps', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({fields: mbFields})
+        });
+        const data = await r.json();
+        if (!data.success) return;
+
+        // Show warnings
+        let warnHtml = '';
+        if (data.circular.length) {
+            warnHtml += data.circular.map(c => `<div style="color:#ef4444;font-size:0.78rem;">⚠ Circular: ${c.field} ↔ ${c.cycle_through}</div>`).join('');
+        }
+        if (data.missing.length) {
+            warnHtml += data.missing.map(m => `<div style="color:#ff9800;font-size:0.78rem;">⚠ Missing: ${m.field} references undefined "${m.missing}"</div>`).join('');
+        }
+        if (!warnHtml) warnHtml = '<div style="color:#4CAF50;font-size:0.78rem;">✓ No issues detected.</div>';
+        warn.innerHTML = warnHtml;
+
+        // Draw graph on canvas
+        drawDepGraph(data.nodes, data.edges, data.circular);
+    } catch(e) { warn.innerHTML = '<div style="color:#ef4444;">Error loading graph.</div>'; }
+}
+
+function drawDepGraph(nodes, edges, circular) {
+    const canvas = document.getElementById('dep-canvas');
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const W = canvas.width, H = canvas.height;
+    ctx.clearRect(0, 0, W, H);
+
+    if (nodes.length === 0) {
+        ctx.fillStyle = 'rgba(255,255,255,0.3)';
+        ctx.font = '14px Outfit';
+        ctx.textAlign = 'center';
+        ctx.fillText('Add fields to see the dependency graph', W/2, H/2);
+        return;
+    }
+
+    // Simple force-directed layout (fixed iterations)
+    const inputNodes = nodes.filter(n => n.type === 'input');
+    const formulaNodes = nodes.filter(n => n.type === 'formula');
+    const posMap = {};
+    const pad = 60;
+
+    // Arrange inputs on left, formulas on right
+    inputNodes.forEach((n, i) => {
+        posMap[n.id] = { x: pad + 80, y: pad + i * ((H - 2*pad) / Math.max(inputNodes.length-1, 1)) };
+    });
+    formulaNodes.forEach((n, i) => {
+        posMap[n.id] = { x: W - pad - 80, y: pad + i * ((H - 2*pad) / Math.max(formulaNodes.length-1, 1)) };
+    });
+
+    // Handle single-node edge cases
+    if (inputNodes.length === 1) posMap[inputNodes[0].id].y = H/2;
+    if (formulaNodes.length === 1) posMap[formulaNodes[0].id].y = H/2;
+
+    const circularSet = new Set(circular.map(c => c.field + '→' + c.cycle_through));
+
+    // Draw edges
+    edges.forEach(e => {
+        const from = posMap[e.from], to = posMap[e.to];
+        if (!from || !to) return;
+        const isCirc = circularSet.has(e.from + '→' + e.to) || circularSet.has(e.to + '→' + e.from);
+        ctx.beginPath();
+        ctx.strokeStyle = isCirc ? '#ef4444' : 'rgba(232,96,28,0.35)';
+        ctx.lineWidth = isCirc ? 2.5 : 1.2;
+        ctx.setLineDash(isCirc ? [6,3] : []);
+        ctx.moveTo(from.x, from.y);
+        // Curved line
+        const cx = (from.x + to.x) / 2;
+        ctx.quadraticCurveTo(cx, (from.y + to.y) / 2 - 20, to.x, to.y);
+        ctx.stroke();
+        ctx.setLineDash([]);
+        // Arrow
+        const angle = Math.atan2(to.y - from.y, to.x - from.x);
+        ctx.beginPath();
+        ctx.fillStyle = ctx.strokeStyle;
+        ctx.moveTo(to.x - 14 * Math.cos(angle), to.y - 14 * Math.sin(angle));
+        ctx.lineTo(to.x - 14 * Math.cos(angle) - 8 * Math.cos(angle - 0.4), to.y - 14 * Math.sin(angle) - 8 * Math.sin(angle - 0.4));
+        ctx.lineTo(to.x - 14 * Math.cos(angle) - 8 * Math.cos(angle + 0.4), to.y - 14 * Math.sin(angle) - 8 * Math.sin(angle + 0.4));
+        ctx.fill();
+    });
+
+    // Draw nodes
+    nodes.forEach(n => {
+        const pos = posMap[n.id];
+        if (!pos) return;
+        const isInput = n.type === 'input';
+        ctx.beginPath();
+        ctx.arc(pos.x, pos.y, 12, 0, Math.PI * 2);
+        ctx.fillStyle = isInput ? 'rgba(76,175,80,0.8)' : 'rgba(232,96,28,0.8)';
+        ctx.fill();
+        ctx.strokeStyle = isInput ? '#4CAF50' : '#e8601c';
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        // Label
+        ctx.fillStyle = 'rgba(255,255,255,0.85)';
+        ctx.font = '11px Outfit';
+        ctx.textAlign = isInput ? 'right' : 'left';
+        ctx.fillText(n.label || n.id, pos.x + (isInput ? -18 : 18), pos.y + 4);
+    });
+}
+
+// ═══════════════ LIVE PREVIEW ═══════════════
+function mbTogglePreview() {
+    mbPreviewOpen = !mbPreviewOpen;
+    const panel = document.getElementById('mb-preview-panel');
+    const btn = document.getElementById('mb-preview-toggle');
+    if (mbPreviewOpen) {
+        panel.style.display = 'block';
+        btn.textContent = '⏸ Hide Preview';
+        mbUpdatePreview();
+    } else {
+        panel.style.display = 'none';
+        btn.textContent = '▶ Show Live Preview';
+    }
+}
+
+function mbUpdatePreview() {
+    if (!mbPreviewOpen) return;
+    const panel = document.getElementById('mb-preview-panel');
+    if (!panel) return;
+    const inputGroups = {};
+    const formulaSections = {};
+    mbFields.forEach(f => {
+        if (!f.id) return;
+        if (f.type === 'input') {
+            const g = f.input_group || 'General';
+            if (!inputGroups[g]) inputGroups[g] = [];
+            inputGroups[g].push(f);
+        } else if (f.type === 'formula') {
+            const s = f.formula_section || 'Results';
+            if (!formulaSections[s]) formulaSections[s] = [];
+            formulaSections[s].push(f);
+        }
+    });
+    let html = '<div class="mb-preview"><div class="mb-preview-title">Live Preview & Test</div>';
+    html += '<div style="display:grid;grid-template-columns:1fr 1fr;gap:20px;">';
+    html += '<div>';
+    for (const [group, fields] of Object.entries(inputGroups)) {
+        html += `<div class="pv-section">${group}</div>`;
+        fields.forEach(f => {
+            let inp;
+            if (f.input_type === 'checkbox') {
+                inp = `<input type="checkbox" id="pv_${f.id}" ${f.default?'checked':''} onchange="mbCalcPreview()" style="width:18px;height:18px;">`;
+            } else if (f.input_type === 'dropdown') {
+                const opts = (f.options||'').split(',').map(o=>o.trim()).filter(Boolean);
+                inp = `<select class="pv-input" id="pv_${f.id}" onchange="mbCalcPreview()">${opts.map((o,oi) => `<option value="${oi}">${o}</option>`).join('')}</select>`;
+            } else if (f.input_type === 'percent') {
+                inp = `<input type="range" min="0" max="100" value="${f.default||0}" id="pv_${f.id}" oninput="document.getElementById('pvlbl_${f.id}').textContent=this.value+'%';mbCalcPreview()" style="width:70%;"><span id="pvlbl_${f.id}" style="font-size:0.78rem;margin-left:4px;">${f.default||0}%</span>`;
+            } else if (f.input_type === 'text') {
+                inp = `<input class="pv-input" type="text" id="pv_${f.id}" value="${f.default||''}" onchange="mbCalcPreview()">`;
+            } else {
+                inp = `<input class="pv-input" type="number" step="any" id="pv_${f.id}" value="${f.default||0}" oninput="mbCalcPreview()">`;
+            }
+            html += `<div class="pv-row"><label>${f.label||f.id}</label><span style="font-size:0.72rem;opacity:0.5;">${f.unit||''}</span>${inp}</div>`;
+        });
+    }
+    html += '</div>';
+    html += '<div>';
+    for (const [sec, fields] of Object.entries(formulaSections)) {
+        html += `<div class="pv-section">${sec}</div>`;
+        fields.forEach(f => {
+            html += `<div class="pv-result"><span>${f.label||f.id} <span style="opacity:0.4;font-size:0.7rem;">${f.unit||''}</span></span><span class="pv-val" id="pv_out_${f.id}">—</span></div>`;
+        });
+    }
+    html += '</div></div>';
+    html += `<div style="display:flex;gap:8px;margin-top:10px;flex-wrap:wrap;">
+        <button class="mb-btn mb-btn-primary mb-btn-sm" onclick="mbCalcPreview()">⟳ Recalculate</button>
+        <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbRefreshAllDBLinks()">🔄 Refresh DB Prices</button>
+    </div>`;
+    html += '</div>';
+    panel.innerHTML = html;
+    mbCalcPreview();
+}
+
+function mbCalcPreview() {
+    const ns = {};
+    const safeFns = {min:Math.min, max:Math.max, abs:Math.abs, round:Math.round, pow:Math.pow, sqrt:Math.sqrt, log:Math.log, log10:Math.log10, ceil:Math.ceil, floor:Math.floor, int:Math.trunc, float:Number, sum:function(){let s=0;for(let a of arguments)s+=a;return s;}};
+    mbFields.forEach(f => {
+        if (f.type !== 'input' || !f.id) return;
+        const el = document.getElementById('pv_' + f.id);
+        if (!el) { ns[f.id] = parseFloat(f.default)||0; return; }
+        if (f.input_type === 'checkbox') ns[f.id] = el.checked ? 1 : 0;
+        else if (f.input_type === 'percent') ns[f.id] = (parseFloat(el.value)||0) / 100;
+        else if (f.input_type === 'text') ns[f.id] = 0;
+        else ns[f.id] = parseFloat(el.value) || 0;
+    });
+    // Safe client-side eval using Function with whitelisted scope
+    mbFields.forEach(f => {
+        if (f.type !== 'formula' || !f.id) return;
+        try {
+            const expr = f.formula || '0';
+            const scope = Object.assign({}, ns, safeFns);
+            const keys = Object.keys(scope);
+            const vals = Object.values(scope);
+            const fn = new Function(...keys, '"use strict"; return (' + expr + ')');
+            ns[f.id] = fn(...vals);
+        } catch(e) { ns[f.id] = 0; }
+        const el = document.getElementById('pv_out_' + f.id);
+        if (el) {
+            const v = ns[f.id];
+            el.textContent = typeof v === 'number' && isFinite(v) ? v.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:4}) : '⚠ err';
+            el.style.color = (typeof v === 'number' && isFinite(v)) ? '' : '#ef4444';
+        }
+    });
+}
+
+// ═══════════════ SAVE / LOAD / CLEAR ═══════════════
+async function mbSaveModel() {
+    const name = document.getElementById('mb-name').value.trim();
+    const category = document.getElementById('mb-category').value;
+    const description = document.getElementById('mb-description').value.trim();
+    if (!name) { alert('Enter a model name.'); return; }
+    if (mbFields.length === 0) { alert('Add at least one field.'); return; }
+    const ids = mbFields.map(f => f.id).filter(Boolean);
+    if (ids.length !== mbFields.length) { alert('All fields must have an ID.'); return; }
+    if (new Set(ids).size !== ids.length) { alert('Duplicate field IDs detected.'); return; }
+    const payload = { name, category, description, fields: mbFields };
+    if (mbEditingId) payload.id = mbEditingId;
+    const r = await fetch('/api/models', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
+    const data = await r.json();
+    if (data.success) {
+        alert('Model saved! ID: ' + data.id);
+        mbEditingId = null;
+        mbClearForm();
+        mbLoadModels();
+    } else { alert('Error: ' + data.message); }
+}
+
+function mbClearForm() {
+    document.getElementById('mb-name').value = '';
+    document.getElementById('mb-description').value = '';
+    mbFields = [];
+    mbEditingId = null;
+    wizSelectedTemplate = null;
+    mbRenderInputFields();
+    mbRenderFormulaFields();
+    if (mbPreviewOpen) mbUpdatePreview();
+    wizGoTo(0);
+}
+
+// ═══════════════ IMPORT / EXPORT ═══════════════
+function mbExportJSON() {
+    if (mbFields.length === 0) { alert('No fields to export.'); return; }
+    const payload = {
+        name: document.getElementById('mb-name').value.trim(),
+        description: document.getElementById('mb-description').value.trim(),
+        category: document.getElementById('mb-category').value,
+        fields: mbFields
+    };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], {type:'application/json'});
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = (payload.name || 'model').replace(/\\s+/g, '_') + '.json';
+    a.click();
+    URL.revokeObjectURL(a.href);
+}
+
+function mbImportJSON() { document.getElementById('mb-import-file').click(); }
+
+function mbHandleImport(e) {
+    const file = e.target.files[0];
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = function(ev) {
+        try {
+            const data = JSON.parse(ev.target.result);
+            if (data.name) document.getElementById('mb-name').value = data.name;
+            if (data.description) document.getElementById('mb-description').value = data.description;
+            if (data.category) document.getElementById('mb-category').value = data.category;
+            if (data.fields && Array.isArray(data.fields)) {
+                mbFields = data.fields;
+                mbRenderInputFields();
+                mbRenderFormulaFields();
+                mbUpdatePreview();
+                alert('Model imported: ' + (data.name || 'Untitled') + ' (' + data.fields.length + ' fields)');
+            } else { alert('Invalid model JSON — no fields array found.'); }
+        } catch(err) { alert('Failed to parse JSON: ' + err.message); }
+    };
+    reader.readAsText(file);
+    e.target.value = '';
+}
+
+// ═══════════════ MODEL LIST ═══════════════
+async function mbLoadModels() {
+    const r = await fetch('/api/models');
+    const data = await r.json();
+    const c = document.getElementById('mb-models-list');
+    if (!data.success || !data.models.length) { c.innerHTML = '<p style="opacity:0.5;">No custom models yet.</p>'; return; }
+    c.innerHTML = data.models.map(m => {
+        const badge = m.category === 'advanced' ? '<span class="mb-badge mb-badge-adv">Advanced</span>' : '<span class="mb-badge mb-badge-ess">Standard</span>';
+        const fieldCount = (m.fields||[]).length;
+        const desc = m.description ? `<div style="font-size:0.78rem;opacity:0.5;margin-top:4px;">${m.description.substring(0,80)}${m.description.length>80?'…':''}</div>` : '';
+        return `<div class="mb-model-card">
+            <div style="display:flex;justify-content:space-between;align-items:start;gap:8px;">
+                <div style="flex:1;min-width:0;">
+                    <div style="font-weight:700;font-size:1.02rem;margin-bottom:4px;">${m.name}</div>
+                    ${badge} <span style="opacity:0.4;font-size:0.75rem;margin-left:6px;">${fieldCount} fields</span>
+                    ${desc}
+                </div>
+                <div style="display:flex;gap:5px;flex-wrap:wrap;justify-content:flex-end;">
+                    <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbEditModel('${m.id}')">Edit</button>
+                    <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbDuplicateModel('${m.id}')">⧉ Dup</button>
+                    <button class="mb-btn mb-btn-primary mb-btn-sm" onclick="mbOpenShare('${m.id}')">Share</button>
+                    <button class="mb-btn mb-btn-danger mb-btn-sm" onclick="mbDeleteModel('${m.id}')">✕</button>
+                </div>
+            </div>
+            <div style="font-size:0.72rem;opacity:0.35;margin-top:6px;">ID: ${m.id} | ${(m.updated_at||'').slice(0,16)}</div>
+        </div>`;
+    }).join('');
+}
+
+async function mbEditModel(id) {
+    const r = await fetch('/api/models/' + id);
+    const data = await r.json();
+    if (!data.success) return;
+    const m = data.model;
+    document.getElementById('mb-name').value = m.name || '';
+    document.getElementById('mb-description').value = m.description || '';
+    document.getElementById('mb-category').value = m.category || 'essentials';
+    mbFields = m.fields || [];
+    mbEditingId = m.id;
+    wizGoTo(2); // Jump to Inputs step
+    window.scrollTo({top:0, behavior:'smooth'});
+}
+
+async function mbDeleteModel(id) {
+    if (!confirm('Delete this model?')) return;
+    await fetch('/api/models/' + id, {method:'DELETE'});
+    mbLoadModels();
+}
+
+async function mbDuplicateModel(id) {
+    const r = await fetch('/api/models/' + id + '/duplicate', {method:'POST'});
+    const data = await r.json();
+    if (data.success) { alert('Model duplicated! New ID: ' + data.id); mbLoadModels(); }
+    else alert('Error: ' + (data.message||'Failed'));
+}
+
+// ═══════════════ SHARE PANEL ═══════════════
+function mbOpenShare(modelId) {
+    document.getElementById('mb-share-panel').style.display = 'block';
+    document.getElementById('mb-share-model-id').value = modelId;
+    document.getElementById('mb-share-result').innerHTML = '';
+    document.getElementById('mb-share-pw').value = '';
+    document.getElementById('mb-share-exp').value = '';
+    fetch('/api/models/' + modelId).then(r=>r.json()).then(data => {
+        if (!data.success) return;
+        const fields = data.model.fields || [];
+        document.getElementById('mb-share-fields').innerHTML = fields.map(f =>
+            `<div style="display:flex;gap:10px;align-items:center;padding:4px 0;border-bottom:1px solid rgba(255,255,255,0.03);">
+                <span style="flex:1;font-size:0.82rem;">${f.label||f.id} <span style="opacity:0.3;font-size:0.7rem;">${f.type}</span></span>
+                <label style="font-size:0.73rem;"><input type="checkbox" class="share-lock" data-fid="${f.id}"> Lock</label>
+                <label style="font-size:0.73rem;"><input type="checkbox" class="share-hide" data-fid="${f.id}"> Hide</label>
+            </div>`
+        ).join('');
+        const inputFields = fields.filter(f => f.type === 'input');
+        document.getElementById('mb-share-defaults-ui').innerHTML = inputFields.map(f => {
+            const val = f.default !== undefined ? f.default : 0;
+            return `<div class="share-def-row">
+                <span>${f.label||f.id}</span>
+                <input class="mb-input" type="number" step="any" data-def-fid="${f.id}" value="${val}" style="padding:5px 8px;font-size:0.82rem;">
+            </div>`;
+        }).join('') || '<p style="opacity:0.4;font-size:0.8rem;">No input fields</p>';
+    });
+    document.getElementById('mb-share-panel').scrollIntoView({behavior:'smooth'});
+}
+
+async function mbCreateShare() {
+    const modelId = document.getElementById('mb-share-model-id').value;
+    const pw = document.getElementById('mb-share-pw').value;
+    const exp = document.getElementById('mb-share-exp').value;
+    const locked = [...document.querySelectorAll('.share-lock:checked')].map(c => c.dataset.fid);
+    const hidden = [...document.querySelectorAll('.share-hide:checked')].map(c => c.dataset.fid);
+    const defaults = {};
+    document.querySelectorAll('[data-def-fid]').forEach(el => {
+        const fid = el.dataset.defFid;
+        const val = parseFloat(el.value);
+        if (!isNaN(val)) defaults[fid] = val;
+    });
+    const r = await fetch('/api/share', {
+        method:'POST', headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({model_id:modelId, password:pw||null, expiry:exp||null, locked_fields:locked, hidden_fields:hidden, defaults:defaults})
+    });
+    const data = await r.json();
+    if (data.success) {
+        const url = window.location.origin + data.url;
+        document.getElementById('mb-share-result').innerHTML = `<div style="padding:12px;background:rgba(76,175,80,0.15);border:1px solid #4CAF50;border-radius:8px;">
+            <strong>Share Link:</strong> <a href="${url}" target="_blank" style="color:#4CAF50;word-break:break-all;">${url}</a>
+            <button onclick="navigator.clipboard.writeText('${url}');this.textContent='Copied!'" class="mb-btn mb-btn-secondary" style="margin-left:10px;padding:4px 10px;font-size:0.78rem;">Copy</button>
+        </div>`;
+        mbLoadShares();
+    } else { alert('Error: ' + data.message); }
+}
+
+async function mbLoadShares() {
+    const r = await fetch('/api/shares');
+    const data = await r.json();
+    const c = document.getElementById('mb-shares-list');
+    if (!data.success || !data.shares.length) { c.innerHTML = '<p style="opacity:0.5;">No shares yet.</p>'; return; }
+    c.innerHTML = '<table style="width:100%;font-size:0.83rem;"><tr style="opacity:0.4;text-transform:uppercase;font-size:0.7rem;"><th style="text-align:left;padding:6px;">Token</th><th>Model</th><th>By</th><th>PW</th><th>Expiry</th><th></th></tr>' +
+        data.shares.map(s => `<tr style="border-bottom:1px solid rgba(255,255,255,0.05);">
+            <td style="padding:7px;"><a href="/calc/${s.token}" target="_blank" style="color:#4CAF50;">${s.token}</a></td>
+            <td style="padding:7px;">${s.model_id}</td>
+            <td style="padding:7px;">${s.created_by||'-'}</td>
+            <td style="padding:7px;">${s.password?'✓':'—'}</td>
+            <td style="padding:7px;">${s.expiry?(s.expiry).slice(0,16):'∞'}</td>
+            <td style="padding:7px;"><button class="mb-btn mb-btn-danger" onclick="mbDeleteShare('${s.token}')" style="padding:3px 8px;font-size:0.7rem;">✕</button></td>
+        </tr>`).join('') + '</table>';
+}
+
+async function mbDeleteShare(token) {
+    if (!confirm('Delete this share link?')) return;
+    await fetch('/api/shares/' + token, {method:'DELETE'});
+    mbLoadShares();
+}
+
+// ═══════════════ BACKWARD COMPAT: mbRenderFields ═══════════════
+function mbRenderFields() { mbRenderInputFields(); mbRenderFormulaFields(); }
+
+// ═══════════════ VISUAL FORMULA BUILDER (Feature 1) ═══════════════
+let vfbTokens = []; // array of {type:'field'|'op'|'func'|'literal'|'paren', value:...}
+let vfbTargetIdx = null;
+
+function vfbOpen(idx) {
+    vfbTargetIdx = idx;
+    const panel = document.getElementById('vfb-panel');
+    panel.style.display = 'block';
+    panel.scrollIntoView({behavior:'smooth'});
+
+    // Populate available field chips
+    const fieldsEl = document.getElementById('vfb-fields');
+    fieldsEl.innerHTML = '';
+    mbFields.forEach((f, i) => {
+        if (i === idx) return; // skip self
+        if (!f.id) return;
+        const chip = document.createElement('span');
+        chip.className = 'vfb-chip field';
+        chip.textContent = f.label || f.id;
+        chip.draggable = true;
+        chip.dataset.fieldId = f.id;
+        chip.ondragstart = (e) => { e.dataTransfer.setData('text/plain', f.id); e.dataTransfer.setData('vfb-type', 'field'); };
+        chip.onclick = () => { vfbTokens.push({type:'field', value:f.id, label:f.label||f.id}); vfbRender(); };
+        fieldsEl.appendChild(chip);
+    });
+
+    // Load existing formula as tokens
+    vfbTokens = [];
+    const existing = mbFields[idx]?.formula || '';
+    if (existing) vfbParseExisting(existing);
+    vfbRender();
+}
+
+function vfbParseExisting(expr) {
+    // Tokenize existing formula string into visual chips
+    const fieldIds = mbFields.filter(f=>f.id).map(f=>f.id).sort((a,b)=>b.length-a.length);
+    const funcNames = SAFE_FUNCS;
+    let remaining = expr.trim();
+    while (remaining.length > 0) {
+        remaining = remaining.trimStart();
+        if (!remaining) break;
+        let matched = false;
+        // Try field IDs
+        for (const fid of fieldIds) {
+            if (remaining.startsWith(fid) && (remaining.length === fid.length || /[^a-zA-Z0-9_]/.test(remaining[fid.length]))) {
+                const f = mbFields.find(x=>x.id===fid);
+                vfbTokens.push({type:'field', value:fid, label:f?.label||fid});
+                remaining = remaining.slice(fid.length);
+                matched = true; break;
+            }
+        }
+        if (matched) continue;
+        // Try function names
+        for (const fn of funcNames) {
+            if (remaining.startsWith(fn+'(')) {
+                vfbTokens.push({type:'func', value:fn});
+                remaining = remaining.slice(fn.length);
+                matched = true; break;
+            }
+        }
+        if (matched) continue;
+        // Operators
+        for (const op of ['**','+','-','*','/','>=','<=','!=','==','>','<']) {
+            if (remaining.startsWith(op)) {
+                vfbTokens.push({type:'op', value:op});
+                remaining = remaining.slice(op.length);
+                matched = true; break;
+            }
+        }
+        if (matched) continue;
+        // Parens and commas
+        if ('(),'.includes(remaining[0])) {
+            vfbTokens.push({type:'paren', value:remaining[0]});
+            remaining = remaining.slice(1);
+            continue;
+        }
+        // Numbers
+        const numMatch = remaining.match(/^(\\d+\\.?\\d*)/);
+        if (numMatch) {
+            vfbTokens.push({type:'literal', value:numMatch[1]});
+            remaining = remaining.slice(numMatch[1].length);
+            continue;
+        }
+        // If/else keywords
+        if (remaining.startsWith('if ') || remaining.startsWith('else ')) {
+            const kw = remaining.startsWith('if ') ? 'if' : 'else';
+            vfbTokens.push({type:'op', value:kw});
+            remaining = remaining.slice(kw.length);
+            continue;
+        }
+        // Skip unknown chars
+        remaining = remaining.slice(1);
+    }
+}
+
+function vfbClose() {
+    document.getElementById('vfb-panel').style.display = 'none';
+    vfbTokens = [];
+    vfbTargetIdx = null;
+}
+
+function vfbInsertOp(op) { vfbTokens.push({type:'op', value:op}); vfbRender(); }
+function vfbInsertFunc(fn) { vfbTokens.push({type:'func', value:fn}); vfbTokens.push({type:'paren', value:'('}); vfbRender(); }
+function vfbInsertLiteral() {
+    const v = prompt('Enter number:');
+    if (v !== null && v.trim()) vfbTokens.push({type:'literal', value:parseFloat(v)||0});
+    vfbRender();
+}
+function vfbInsertIfExpr() {
+    vfbTokens.push({type:'op', value:'('});
+    vfbTokens.push({type:'op', value:')'});
+    vfbTokens.push({type:'op', value:'if'});
+    vfbTokens.push({type:'op', value:'('});
+    vfbTokens.push({type:'op', value:')'});
+    vfbTokens.push({type:'op', value:'else'});
+    vfbRender();
+}
+
+function vfbDropOnCanvas(e) {
+    e.preventDefault();
+    document.getElementById('vfb-canvas').classList.remove('drag-over');
+    const fid = e.dataTransfer.getData('text/plain');
+    const ftype = e.dataTransfer.getData('vfb-type');
+    if (ftype === 'field' && fid) {
+        const f = mbFields.find(x=>x.id===fid);
+        vfbTokens.push({type:'field', value:fid, label:f?.label||fid});
+        vfbRender();
+    }
+}
+
+function vfbRemoveToken(idx) { vfbTokens.splice(idx, 1); vfbRender(); }
+
+function vfbRender() {
+    const canvas = document.getElementById('vfb-canvas');
+    canvas.innerHTML = '';
+    const opDisplay = {'+':'+', '-':'−', '*':'×', '/':'÷', '**':'^', '>=':'≥', '<=':'≤', '!=':'≠', '==':'=', '>':'>', '<':'<', 'if':'IF', 'else':'ELSE'};
+    vfbTokens.forEach((t, i) => {
+        const chip = document.createElement('span');
+        chip.className = 'vfb-chip ' + t.type;
+        if (t.type === 'field') chip.innerHTML = (t.label||t.value) + `<span class="chip-rm" onclick="vfbRemoveToken(${i})">×</span>`;
+        else if (t.type === 'op') chip.innerHTML = (opDisplay[t.value]||t.value) + `<span class="chip-rm" onclick="vfbRemoveToken(${i})">×</span>`;
+        else if (t.type === 'func') chip.innerHTML = t.value.toUpperCase() + `<span class="chip-rm" onclick="vfbRemoveToken(${i})">×</span>`;
+        else if (t.type === 'paren') chip.innerHTML = t.value + `<span class="chip-rm" onclick="vfbRemoveToken(${i})">×</span>`;
+        else chip.innerHTML = t.value + `<span class="chip-rm" onclick="vfbRemoveToken(${i})">×</span>`;
+        canvas.appendChild(chip);
+    });
+    if (vfbTokens.length === 0) canvas.innerHTML = '<span style="opacity:0.3;font-family:Outfit;font-size:0.82rem;">Drag fields here or click operators...</span>';
+
+    // Build formula string and show preview
+    const formula = vfbBuildFormula();
+    document.getElementById('vfb-preview').textContent = formula || '—';
+    vfbValidate(formula);
+}
+
+function vfbBuildFormula() {
+    let parts = [];
+    vfbTokens.forEach(t => {
+        if (t.type === 'field') parts.push(t.value);
+        else if (t.type === 'func') parts.push(t.value);
+        else if (t.type === 'op') {
+            if (t.value === 'if') parts.push(' if ');
+            else if (t.value === 'else') parts.push(' else ');
+            else parts.push(' ' + t.value + ' ');
+        }
+        else if (t.type === 'paren') parts.push(t.value);
+        else parts.push(t.value);
+    });
+    return parts.join('').replace(/\s+/g, ' ').trim();
+}
+
+async function vfbValidate(formula) {
+    const el = document.getElementById('vfb-valid');
+    if (!formula) { el.textContent = ''; el.className = 'vfb-validation'; return; }
+    try {
+        const fieldIds = mbFields.filter(f=>f.id).map(f=>f.id);
+        const r = await fetch('/api/validate_formula', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({formula, field_ids:fieldIds})
+        });
+        const d = await r.json();
+        if (d.success) { el.textContent = '✓ Valid (test=' + (d.test_value||0).toFixed(2) + ')'; el.className = 'vfb-validation ok'; }
+        else { el.textContent = '✗ ' + (d.error||'Error'); el.className = 'vfb-validation err'; }
+    } catch(e) { el.textContent = ''; }
+}
+
+function vfbClear() { vfbTokens = []; vfbRender(); }
+
+function vfbApply() {
+    if (vfbTargetIdx === null) return;
+    const formula = vfbBuildFormula();
+    mbFields[vfbTargetIdx].formula = formula;
+    mbRenderFormulaFields();
+    mbUpdatePreview();
+    vfbClose();
+}
+
+// ═══════════════ EXCEL → MODEL CONVERTER (Feature 2) ═══════════════
+let excParsedModel = null;
+
+function excFileSelected(input) {
+    if (!input.files[0]) return;
+    document.getElementById('exc-file-name').textContent = input.files[0].name;
+    excUpload(input.files[0]);
+}
+
+function excHandleDrop(e) {
+    e.preventDefault();
+    document.getElementById('exc-drop-zone').classList.remove('drag-over');
+    const file = e.dataTransfer.files[0];
+    if (file) {
+        document.getElementById('exc-file-name').textContent = file.name;
+        excUpload(file);
+    }
+}
+
+async function excUpload(file) {
+    const fd = new FormData();
+    fd.append('file', file);
+    try {
+        const r = await fetch('/api/excel_to_model', {method:'POST', body:fd});
+        const data = await r.json();
+        if (!data.success) { alert('Error: ' + data.message); return; }
+        excParsedModel = data.model;
+        // Show mapping preview
+        document.getElementById('exc-mapping-preview').style.display = 'block';
+        document.getElementById('exc-input-count').textContent = data.input_count + ' inputs';
+        document.getElementById('exc-formula-count').textContent = data.formula_count + ' formulas';
+        const tbody = document.getElementById('exc-mapping-body');
+        tbody.innerHTML = data.mapping.map(m => `<tr>
+            <td style="font-family:monospace;color:cornflowerblue;">${m.cell}</td>
+            <td><span class="exc-badge ${m.type}">${m.type}</span></td>
+            <td style="font-family:monospace;">${m.field_id}</td>
+            <td>${m.label}</td>
+            <td style="font-family:monospace;font-size:0.75rem;opacity:0.6;max-width:200px;overflow:hidden;text-overflow:ellipsis;">${m.type==='formula'?m.formula:m.default}</td>
+        </tr>`).join('');
+    } catch(e) { alert('Upload failed: ' + e.message); }
+}
+
+function excApplyModel() {
+    if (!excParsedModel) return;
+    document.getElementById('mb-name').value = excParsedModel.name || '';
+    document.getElementById('mb-description').value = excParsedModel.description || '';
+    document.getElementById('mb-category').value = excParsedModel.category || 'essentials';
+    mbFields = JSON.parse(JSON.stringify(excParsedModel.fields));
+    mbRenderInputFields();
+    mbRenderFormulaFields();
+    mbUpdatePreview();
+    wizGoTo(2); // Jump to inputs step
+    excClear();
+    alert('✓ Model loaded into builder with ' + mbFields.length + ' fields. Review and adjust.');
+}
+
+function excClear() {
+    excParsedModel = null;
+    document.getElementById('exc-mapping-preview').style.display = 'none';
+    document.getElementById('exc-file-input').value = '';
+    document.getElementById('exc-file-name').textContent = 'Supports Excel formulas (=A1*B2)';
+}
+
+// ═══════════════ SMART FIELD SUGGESTIONS (Feature 3) ═══════════════
+let sugBlocks = null;
+
+function wizPkgTypeChanged() {
+    const pkg = document.getElementById('mb-pkg-type').value;
+    const panel = document.getElementById('sug-panel');
+    if (!pkg || pkg === 'other') { panel.style.display = 'none'; return; }
+
+    fetch('/api/field_suggest', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({packaging_type:pkg})})
+    .then(r=>r.json()).then(data => {
+        if (!data.success) return;
+        sugBlocks = data.smart_blocks;
+        if (!sugBlocks || (!sugBlocks.inputs?.length && !sugBlocks.formulas?.length)) {
+            // Fallback: use template fields
+            if (data.fields?.length) {
+                panel.style.display = 'block';
+                document.getElementById('sug-pkg-name').textContent = pkg;
+                const inputs = data.fields.filter(f=>f.type==='input');
+                const formulas = data.fields.filter(f=>f.type==='formula');
+                document.getElementById('sug-inputs').innerHTML = inputs.map((f,i) => `<span class="sug-chip" onclick="sugAddField(this, ${i}, 'input')" data-fid="${f.id}">${f.label||f.id}</span>`).join('');
+                document.getElementById('sug-formulas').innerHTML = formulas.map((f,i) => `<span class="sug-chip" onclick="sugAddField(this, ${i}, 'formula')" data-fid="${f.id}">${f.label||f.id}</span>`).join('');
+                sugBlocks = {inputs, formulas};
+            } else { panel.style.display = 'none'; }
+            return;
+        }
+        panel.style.display = 'block';
+        document.getElementById('sug-pkg-name').textContent = pkg;
+        document.getElementById('sug-inputs').innerHTML = (sugBlocks.inputs||[]).map((f,i) =>
+            `<span class="sug-chip" onclick="sugAddSmartField(this, ${i}, 'inputs')" data-fid="${f.id}">${f.label} <span style="opacity:0.5;font-size:0.68rem;">${f.unit||''}</span></span>`
+        ).join('');
+        document.getElementById('sug-formulas').innerHTML = (sugBlocks.formulas||[]).map((f,i) =>
+            `<span class="sug-chip" onclick="sugAddSmartField(this, ${i}, 'formulas')" data-fid="${f.id}">${f.label} <span style="opacity:0.5;font-size:0.68rem;">${f.unit||''}</span></span>`
+        ).join('');
+    }).catch(() => { panel.style.display = 'none'; });
+}
+
+function sugAddSmartField(chip, idx, group) {
+    if (!sugBlocks || !sugBlocks[group]) return;
+    const f = JSON.parse(JSON.stringify(sugBlocks[group][idx]));
+    f.type = group === 'inputs' ? 'input' : 'formula';
+    if (!f.input_type && f.type === 'input') f.input_type = 'number';
+    if (!f.input_group && f.type === 'input') f.input_group = 'General';
+    if (!f.formula_section && f.type === 'formula') f.formula_section = 'Cost Breakdown';
+    // Check not already added
+    if (mbFields.find(x=>x.id===f.id)) { chip.classList.add('added'); return; }
+    mbFields.push(f);
+    chip.classList.add('added');
+    mbRenderInputFields();
+    mbRenderFormulaFields();
+    mbUpdatePreview();
+}
+
+function sugAddField(chip, idx, type) {
+    if (!sugBlocks) return;
+    const arr = type === 'input' ? sugBlocks.inputs : sugBlocks.formulas;
+    if (!arr || !arr[idx]) return;
+    sugAddSmartField(chip, idx, type === 'input' ? 'inputs' : 'formulas');
+}
+
+function sugAddAll() {
+    if (!sugBlocks) return;
+    (sugBlocks.inputs||[]).forEach((f, i) => {
+        const copy = JSON.parse(JSON.stringify(f));
+        copy.type = 'input';
+        if (!copy.input_type) copy.input_type = 'number';
+        if (!copy.input_group) copy.input_group = 'General';
+        if (!mbFields.find(x=>x.id===copy.id)) mbFields.push(copy);
+    });
+    (sugBlocks.formulas||[]).forEach((f, i) => {
+        const copy = JSON.parse(JSON.stringify(f));
+        copy.type = 'formula';
+        if (!copy.formula_section) copy.formula_section = 'Cost Breakdown';
+        if (!mbFields.find(x=>x.id===copy.id)) mbFields.push(copy);
+    });
+    document.querySelectorAll('.sug-chip').forEach(c => c.classList.add('added'));
+    mbRenderInputFields();
+    mbRenderFormulaFields();
+    mbUpdatePreview();
+}
+
+// ═══════════════ BULK EDIT MODE (Feature 4) ═══════════════
+let beData = [];
+
+function beOpen() {
+    document.getElementById('bulk-edit-panel').style.display = 'block';
+    document.getElementById('bulk-edit-panel').scrollIntoView({behavior:'smooth'});
+    beData = JSON.parse(JSON.stringify(mbFields));
+    beRender();
+}
+
+function beClose() {
+    document.getElementById('bulk-edit-panel').style.display = 'none';
+}
+
+function beRender() {
+    const tbody = document.getElementById('be-tbody');
+    tbody.innerHTML = '';
+    const groups = [...INPUT_GROUPS, ...FORMULA_SECTIONS];
+    beData.forEach((f, i) => {
+        const isFormula = f.type === 'formula';
+        const groupOpts = (isFormula ? FORMULA_SECTIONS : INPUT_GROUPS).map(g => `<option ${g===(isFormula?f.formula_section:f.input_group)?'selected':''}>${g}</option>`).join('');
+        const lastCol = isFormula
+            ? `<input value="${(f.formula||'').replace(/"/g,'&quot;')}" onchange="beData[${i}].formula=this.value" style="font-family:monospace;font-size:0.75rem;">`
+            : `<input type="number" step="any" value="${f.default||0}" onchange="beData[${i}].default=parseFloat(this.value)||0">`;
+        const tr = document.createElement('tr');
+        tr.innerHTML = `
+            <td><input type="checkbox" class="be-chk" data-idx="${i}"></td>
+            <td><span class="be-type ${f.type}">${f.type}</span></td>
+            <td><input value="${f.id||''}" onchange="beData[${i}].id=this.value"></td>
+            <td><input value="${f.label||''}" onchange="beData[${i}].label=this.value"></td>
+            <td><input value="${f.unit||''}" onchange="beData[${i}].unit=this.value" style="width:70px;"></td>
+            <td><select onchange="if(beData[${i}].type==='formula')beData[${i}].formula_section=this.value;else beData[${i}].input_group=this.value;">${groupOpts}</select></td>
+            <td>${lastCol}</td>
+        `;
+        tbody.appendChild(tr);
+    });
+    document.getElementById('be-count').textContent = beData.length + ' fields';
+}
+
+function beAddRow(type) {
+    beData.push({id:'',label:'',type:type,unit:'',default:0,formula:'',input_group:'General',formula_section:'Cost Breakdown',input_type:'number'});
+    beRender();
+}
+
+function beDeleteSelected() {
+    const checks = document.querySelectorAll('.be-chk:checked');
+    if (!checks.length) return;
+    const indices = new Set([...checks].map(c => parseInt(c.dataset.idx)));
+    beData = beData.filter((_, i) => !indices.has(i));
+    beRender();
+}
+
+function beSelectAll() {
+    document.querySelectorAll('.be-chk').forEach(c => c.checked = true);
+}
+
+function beToggleAll(checked) {
+    document.querySelectorAll('.be-chk').forEach(c => c.checked = checked);
+}
+
+function beApply() {
+    mbFields = JSON.parse(JSON.stringify(beData));
+    mbRenderInputFields();
+    mbRenderFormulaFields();
+    mbUpdatePreview();
+    beClose();
+    alert('✓ Applied ' + mbFields.length + ' fields from bulk edit.');
+}
+
+// ═══════════════ INIT ═══════════════
+wizGoTo(0);
+mbLoadModels();
+mbLoadShares();
+</script>
+"""
+
+# ================= SHARE PASSWORD PROMPT =================
+SHARE_PASSWORD_HTML = """
+<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Protected Calculator</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+<style>
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:linear-gradient(135deg,#0a0e27,#1a1a2e,#16213e);color:white;font-family:'Outfit',sans-serif;min-height:100vh;display:flex;align-items:center;justify-content:center;}
+.pw-card{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:16px;padding:40px;max-width:400px;width:90%;text-align:center;}
+.pw-card h2{margin-bottom:8px;font-size:1.4rem;}
+.pw-card p{opacity:0.6;margin-bottom:25px;font-size:0.9rem;}
+.pw-input{width:100%;padding:12px 16px;background:rgba(255,255,255,0.12);color:white;border:1px solid rgba(255,255,255,0.2);border-radius:8px;font-size:1rem;font-family:'Outfit';margin-bottom:15px;}
+.pw-input:focus{outline:none;border-color:#e8601c;}
+.pw-btn{width:100%;padding:12px;background:linear-gradient(135deg,#e8601c,#ff8a50);color:white;border:none;border-radius:8px;font-size:1rem;font-weight:700;cursor:pointer;font-family:'Outfit';}
+.pw-error{color:#ef4444;font-size:0.85rem;margin-bottom:10px;}
+</style></head><body>
+<div class="pw-card">
+    <h2>🔒 Password Required</h2>
+    <p>This calculator is password-protected.</p>
+    {% if error %}<div class="pw-error">Incorrect password. Try again.</div>{% endif %}
+    <form method="POST" action="/calc/{{ token }}">
+        <input class="pw-input" type="password" name="password" placeholder="Enter password" autofocus>
+        <button class="pw-btn" type="submit">Unlock</button>
+    </form>
+</div>
+</body></html>
+"""
+
+# ================= SHARED CALCULATOR HTML =================
+SHARE_CALC_HTML = """
+<!DOCTYPE html>
+<html><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>{{ model.name }} - Calculator</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&display=swap" rel="stylesheet">
+<style>
+:root{--orange:#e8601c;}
+*{margin:0;padding:0;box-sizing:border-box;}
+body{background:linear-gradient(135deg,#0a0e27,#1a1a2e,#16213e);color:white;font-family:'Outfit',sans-serif;min-height:100vh;}
+.sc-header{padding:20px 30px;background:rgba(0,0,0,0.3);border-bottom:1px solid rgba(255,255,255,0.08);display:flex;justify-content:space-between;align-items:center;}
+.sc-header h1{font-size:1.3rem;font-weight:700;}
+.sc-header .badge{font-size:0.7rem;padding:3px 10px;border-radius:10px;background:rgba(232,96,28,0.2);color:#e8601c;font-weight:700;}
+.sc-container{max-width:1100px;margin:30px auto;padding:0 20px;}
+.sc-layout{display:grid;grid-template-columns:1fr 1fr;gap:25px;}
+@media(max-width:900px){.sc-layout{grid-template-columns:1fr;}}
+.sc-card{background:rgba(255,255,255,0.06);border:1px solid rgba(255,255,255,0.1);border-radius:14px;padding:22px;}
+.sc-section-title{font-size:0.8rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:1px;margin-bottom:12px;padding-bottom:8px;border-bottom:1px solid rgba(232,96,28,0.3);}
+.sc-row{display:grid;grid-template-columns:1.5fr 0.5fr 1fr;gap:8px;align-items:center;margin-bottom:8px;}
+.sc-row label{font-size:0.85rem;opacity:0.9;}
+.sc-row .unit{font-size:0.75rem;opacity:0.6;text-align:center;}
+.sc-input{width:100%;padding:8px 12px;background:rgba(76,175,80,0.1);color:white;border:1px solid rgba(76,175,80,0.6);border-radius:8px;font-family:'Outfit';font-size:0.9rem;}
+.sc-input:focus{outline:none;border-color:#4CAF50;}
+.sc-input-locked{background:rgba(255,255,255,0.05);border-color:rgba(255,255,255,0.15);opacity:0.7;cursor:not-allowed;}
+.sc-btn{width:100%;padding:14px;background:linear-gradient(135deg,#e8601c,#ff8a50);color:white;border:none;border-radius:10px;font-size:1rem;font-weight:700;cursor:pointer;font-family:'Outfit';margin-top:15px;transition:all 0.3s;}
+.sc-btn:hover{transform:translateY(-1px);box-shadow:0 6px 20px rgba(232,96,28,0.4);}
+.sc-result-row{display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.05);}
+.sc-result-label{opacity:0.8;font-size:0.9rem;}
+.sc-result-value{font-weight:700;font-size:0.95rem;}
+.sc-footer{text-align:center;padding:30px;font-size:0.75rem;opacity:0.3;}
+</style></head><body>
+<div class="sc-header">
+    <h1>{{ model.name }}</h1>
+    <span class="badge">Shared Calculator</span>
+</div>
+<div class="sc-container">
+    <div class="sc-layout">
+        <div class="sc-card">
+            {% set grouped_inputs = {} %}
+            {% for f in model.fields %}
+                {% if f.type == 'input' and f.id not in share.hidden_fields %}
+                    {% set g = f.get('input_group', 'General') %}
+                    {% if g not in grouped_inputs %}{% set _ = grouped_inputs.update({g: []}) %}{% endif %}
+                    {% set _ = grouped_inputs[g].append(f) %}
+                {% endif %}
+            {% endfor %}
+            <div id="sc-inputs">
+            </div>
+            <button class="sc-btn" onclick="scCalculate()">Calculate</button>
+        </div>
+        <div>
+            <div class="sc-card">
+                <div class="sc-section-title">Results</div>
+                <div id="sc-results"><p style="opacity:0.5;text-align:center;padding:30px;">Click Calculate to see results</p></div>
+            </div>
+        </div>
+    </div>
+</div>
+<div class="sc-footer">Powered by Packfora Analytics</div>
+
+<script>
+const MODEL = {{ model | tojson }};
+const SHARE = {{ share | tojson }};
+const LOCKED = new Set(SHARE.locked_fields || []);
+const HIDDEN = new Set(SHARE.hidden_fields || []);
+const DEFAULTS = SHARE.defaults || {};
+
+function scInit() {
+    const container = document.getElementById('sc-inputs');
+    // Group inputs
+    const groups = {};
+    MODEL.fields.forEach(f => {
+        if (f.type !== 'input' || HIDDEN.has(f.id)) return;
+        const g = f.input_group || 'General';
+        if (!groups[g]) groups[g] = [];
+        groups[g].push(f);
+    });
+    let html = '';
+    for (const [group, fields] of Object.entries(groups)) {
+        html += `<div class="sc-section-title">${group}</div>`;
+        fields.forEach(f => {
+            const val = DEFAULTS[f.id] !== undefined ? DEFAULTS[f.id] : (f.default || 0);
+            const locked = LOCKED.has(f.id);
+            const lockCls = locked ? 'sc-input-locked' : '';
+            const lockAttr = locked ? 'readonly disabled' : '';
+            const itype = f.input_type || 'number';
+            let inp;
+            if (itype === 'checkbox') {
+                inp = `<input type="checkbox" id="sc_${f.id}" ${val?'checked':''} ${locked?'disabled':''} style="width:20px;height:20px;">`;
+            } else if (itype === 'dropdown') {
+                const opts = (f.options||'').split(',').map(o=>o.trim()).filter(Boolean);
+                inp = `<select class="sc-input ${lockCls}" id="sc_${f.id}" ${locked?'disabled':''}>${opts.map((o,oi)=>`<option value="${oi}" ${oi==val?'selected':''}>${o}</option>`).join('')}</select>`;
+            } else if (itype === 'percent') {
+                inp = `<div style="display:flex;align-items:center;gap:6px;width:100%;"><input type="range" min="0" max="100" value="${val}" id="sc_${f.id}" ${locked?'disabled':''} style="flex:1;" oninput="document.getElementById('sclbl_${f.id}').textContent=this.value+'%'"><span id="sclbl_${f.id}" style="font-size:0.8rem;min-width:35px;">${val}%</span></div>`;
+            } else if (itype === 'text') {
+                inp = `<input type="text" class="sc-input ${lockCls}" id="sc_${f.id}" value="${val}" ${lockAttr}>`;
+            } else {
+                inp = `<input type="number" class="sc-input ${lockCls}" id="sc_${f.id}" value="${val}" step="any" ${lockAttr}>`;
+            }
+            html += `<div class="sc-row"><label>${f.label||f.id}</label><span class="unit">${f.unit||''}</span>${inp}</div>`;
+        });
+    }
+    container.innerHTML = html;
+}
+
+async function scCalculate() {
+    const inputs = {};
+    MODEL.fields.forEach(f => {
+        if (f.type !== 'input') return;
+        const el = document.getElementById('sc_' + f.id);
+        const itype = f.input_type || 'number';
+        if (!el) { inputs[f.id] = f.default||0; return; }
+        if (itype === 'checkbox') inputs[f.id] = el.checked ? 1 : 0;
+        else if (itype === 'percent') inputs[f.id] = (parseFloat(el.value)||0) / 100;
+        else if (itype === 'text') inputs[f.id] = 0;
+        else inputs[f.id] = parseFloat(el.value) || 0;
+    });
+    try {
+        const r = await fetch('/api/calculate', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({model_id: MODEL.id, inputs})
+        });
+        const data = await r.json();
+        if (data.success) {
+            // Group formulas by section
+            const sections = {};
+            MODEL.fields.forEach(f => {
+                if (f.type !== 'formula' || HIDDEN.has(f.id)) return;
+                const s = f.formula_section || 'Results';
+                if (!sections[s]) sections[s] = [];
+                sections[s].push({...f, value: data.results[f.id]});
+            });
+            let html = '';
+            for (const [sec, fields] of Object.entries(sections)) {
+                html += `<div style="margin-bottom:15px;"><div class="sc-section-title">${sec}</div>`;
+                fields.forEach(f => {
+                    const v = typeof f.value === 'number' ? f.value.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:4}) : (f.value||'—');
+                    html += `<div class="sc-result-row"><span class="sc-result-label">${f.label||f.id}</span><span class="sc-result-value">${v}</span></div>`;
+                });
+                html += '</div>';
+            }
+            document.getElementById('sc-results').innerHTML = html || '<p style="opacity:0.5;">No outputs.</p>';
+        } else {
+            document.getElementById('sc-results').innerHTML = '<p style="color:#ef4444;">Calculation error.</p>';
+        }
+    } catch(e) { document.getElementById('sc-results').innerHTML = '<p style="color:#ef4444;">Error: '+e.message+'</p>'; }
+}
+
+scInit();
+</script>
+</body></html>
 """
 
 BASE_HTML = """
@@ -5944,13 +9756,16 @@ BASE_HTML = """
         <div class="nav-links" id="mainNav">
             <a href="/" class="{{ 'active' if active == 'Dashboard' else '' }}">Dashboard</a>
             <div class="nav-group" onclick="toggleMobileDropdown(event, this)">
-                <button class="nav-group-toggle {{ 'active' if active == 'Resin' else '' }}">
+                <button class="nav-group-toggle {{ 'active' if active in ['Materials','Resin','GlobalMaterials'] else '' }}">
                     Analytics <svg viewBox="0 0 12 12" fill="none"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
                 </button>
                 <div class="nav-dropdown">
-                    <a href="/resin" class="{{ 'active' if active == 'Resin' else '' }}">Resin Tracker</a>
+                    <a href="/materials" class="{{ 'active' if active == 'Materials' else '' }}">Material Price Tracker</a>
+                    <a href="/resin" class="{{ 'active' if active == 'Resin' else '' }}" style="font-size:0.76rem;opacity:0.7;">India Resin (Legacy)</a>
+                    <a href="/global-materials" class="{{ 'active' if active == 'GlobalMaterials' else '' }}" style="font-size:0.76rem;opacity:0.7;">Global Materials (Legacy)</a>
                 </div>
             </div>
+            {% if user_role in ['admin', 'analyst'] %}
             <div class="nav-group" onclick="toggleMobileDropdown(event, this)">
                 <button class="nav-group-toggle {{ 'active' if active in ['Machines','Costs'] else '' }}">
                     Database <svg viewBox="0 0 12 12" fill="none"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
@@ -5960,8 +9775,25 @@ BASE_HTML = """
                     <a href="/costs" class="{{ 'active' if active == 'Costs' else '' }}">Global Variable Costs</a>
                 </div>
             </div>
-            <a href="/calculator" class="{{ 'active' if active == 'Calculator' else '' }}">Calculator</a>
+            {% endif %}
+            <div class="nav-group" onclick="toggleMobileDropdown(event, this)">
+                <button class="nav-group-toggle {{ 'active' if active == 'Calculator' else '' }}">
+                    Cost Calculator <svg viewBox="0 0 12 12" fill="none"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                </button>
+                <div class="nav-dropdown">
+                    <a href="/calculator?view=essentials">Standard Models</a>
+                    {% if user_role in ['admin', 'analyst'] %}
+                    <a href="/calculator?view=advanced">Advanced Models</a>
+                    {% endif %}
+                </div>
+            </div>
+            {% if user_role == 'admin' %}
+            <a href="/admin/model_builder" class="{{ 'active' if active == 'ModelBuilder' else '' }}" style="color:#4CAF50;">Cost Model Builder</a>
             <a href="/admin/login" class="admin-link">Admin</a>
+            {% endif %}
+            {% if session.get('logged_in') %}
+            <a href="/admin/logout" style="font-size:0.72rem; opacity:0.7;">Logout ({{ session.get('username','') }})</a>
+            {% endif %}
         </div>
     </nav>
     <div class="container">{{ content | safe }}</div>
@@ -6091,38 +9923,139 @@ BASE_HTML = """
 """
 
 DASH_HTML = """
+<style>
+/* ── Dashboard Market Intelligence ─────────────────────────── */
+.dash-mi-section { margin-top: 50px; }
+.dash-mi-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-top: 20px; }
+.dash-mi-card {
+    background: rgba(255,255,255,0.15);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 20px;
+    padding: 24px;
+    position: relative;
+    overflow: hidden;
+    min-height: 340px;
+    transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+.dash-mi-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 16px 40px rgba(0,0,0,0.18);
+}
+.dash-mi-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, #E8601C, #ff8f5e);
+}
+.dash-mi-title {
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1.8px;
+    color: var(--orange);
+    margin-bottom: 4px;
+}
+.dash-mi-subtitle { font-size: 0.8rem; opacity: 0.55; margin-bottom: 18px; }
+.dash-price-row {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 14px;
+    border-radius: 12px;
+    background: rgba(255,255,255,0.1);
+    border: 1px solid rgba(255,255,255,0.18);
+    margin-bottom: 8px;
+    transition: background 0.2s;
+}
+.dash-price-row:hover { background: rgba(255,255,255,0.2); }
+.dash-price-label { font-size: 0.9rem; font-weight: 700; }
+.dash-price-val { font-family: 'JetBrains Mono', monospace; font-size: 1.05rem; font-weight: 800; color: var(--orange); }
+.dash-trend-badge {
+    display: inline-flex; align-items: center; gap: 4px;
+    padding: 3px 10px; border-radius: 20px;
+    font-size: 0.72rem; font-weight: 800;
+    font-family: 'JetBrains Mono', monospace;
+}
+.dash-trend-rising { background: rgba(220,53,69,0.2); color: #ff6b7a; border: 1px solid rgba(220,53,69,0.3); }
+.dash-trend-falling { background: rgba(40,167,69,0.2); color: #5ddd8a; border: 1px solid rgba(40,167,69,0.3); }
+.dash-trend-stable { background: rgba(255,193,7,0.2); color: #ffc107; border: 1px solid rgba(255,193,7,0.3); }
+.dash-kpi-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 30px; }
+.dash-kpi-card {
+    background: rgba(255,255,255,0.15);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    border: 1px solid rgba(255,255,255,0.25);
+    border-radius: 20px;
+    padding: 20px 18px;
+    position: relative;
+    overflow: hidden;
+    text-align: center;
+    transition: transform 0.25s ease, box-shadow 0.25s ease;
+}
+.dash-kpi-card:hover {
+    transform: translateY(-4px);
+    box-shadow: 0 16px 40px rgba(0,0,0,0.18);
+}
+.dash-kpi-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, var(--orange), #ff8f5e);
+}
+.dash-kpi-icon { font-size: 1.8rem; margin-bottom: 8px; opacity: 0.85; }
+.dash-kpi-num { font-size: clamp(1.5rem, 4vw, 2.2rem); font-weight: 800; color: var(--orange); margin: 4px 0; }
+.dash-kpi-lbl { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 1.2px; opacity: 0.65; }
+.dash-kpi-sub { font-size: 0.75rem; color: #10b981; margin-top: 6px; }
+.dash-chart-wrap { margin-top: 18px; min-height: 200px; }
+.dash-no-data { text-align: center; opacity: 0.45; padding: 40px 0; font-size: 0.9rem; }
+@media (max-width: 900px) {
+    .dash-mi-grid { grid-template-columns: 1fr; }
+    .dash-kpi-grid { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 480px) {
+    .dash-kpi-grid { grid-template-columns: 1fr; }
+}
+</style>
+
 <div class="section-header">
     <h1>Packfora <span style="color:var(--orange)">Analytics</span></h1>
     <p style="opacity:0.8; margin-top:10px; font-size:1.1rem">Real-time business intelligence for packaging industry</p>
 </div>
 
-<!-- Statistics Overview -->
-<div class="grid-3" id="stats-container">
-    <div class="card stat-card">
-        <div class="stat-label">Resin Types</div>
-        <div class="stat-number" id="stat-resin"><span class="loading"></span></div>
-        <div class="stat-trend">Market Coverage</div>
+<!-- ── KPI Cards ────────────────────────────────────────────── -->
+<div class="dash-kpi-grid" id="stats-container">
+    <div class="dash-kpi-card">
+        <div class="dash-kpi-icon">🧪</div>
+        <div class="dash-kpi-lbl">Resin Types</div>
+        <div class="dash-kpi-num" id="stat-resin"><span class="loading"></span></div>
+        <div class="dash-kpi-sub">Market Coverage</div>
     </div>
-    <div class="card stat-card">
-        <div class="stat-label">Machine Database</div>
-        <div class="stat-number" id="stat-machines"><span class="loading"></span></div>
-        <div class="stat-trend">Equipment Options</div>
+    <div class="dash-kpi-card">
+        <div class="dash-kpi-icon">⚙️</div>
+        <div class="dash-kpi-lbl">Machine Database</div>
+        <div class="dash-kpi-num" id="stat-machines"><span class="loading"></span></div>
+        <div class="dash-kpi-sub">Equipment Options</div>
     </div>
-    <div class="card stat-card">
-        <div class="stat-label">Global Markets</div>
-        <div class="stat-number" id="stat-countries"><span class="loading"></span></div>
-        <div class="stat-trend">Countries Tracked</div>
+    <div class="dash-kpi-card">
+        <div class="dash-kpi-icon">🌍</div>
+        <div class="dash-kpi-lbl">Global Markets</div>
+        <div class="dash-kpi-num" id="stat-countries"><span class="loading"></span></div>
+        <div class="dash-kpi-sub">Countries Tracked</div>
     </div>
 </div>
 
-<!-- Quick Actions -->
-<div class="section-header" style="margin-top:50px;">
+<!-- ── Quick Actions ─────────────────────────────────────────── -->
+<div class="section-header" style="margin-top:40px;">
     <div class="section-title">Quick Actions</div>
 </div>
 <div class="grid-4">
-    <a href="/resin" class="card quick-action">
-        <div class="quick-action-title">Resin Price Analysis</div>
-        <p style="opacity:0.8; margin-top:10px; font-size:0.9rem;">Track real-time pricing trends</p>
+    <a href="/materials" class="card quick-action">
+        <div class="quick-action-title">Material Price Tracker</div>
+        <p style="opacity:0.8; margin-top:10px; font-size:0.9rem;">India resin + global material prices</p>
     </a>
     <a href="/machines" class="card quick-action">
         <div class="quick-action-title">Machine Database</div>
@@ -6138,8 +10071,41 @@ DASH_HTML = """
     </a>
 </div>
 
-<!-- System Status -->
-<div class="card" style="margin-top:50px; padding:20px; background:rgba(255,255,255,0.08);">
+<!-- ── Market Intelligence ─────────────────────────────────────── -->
+<div class="dash-mi-section">
+    <div class="section-header">
+        <div class="section-title">Market Intelligence</div>
+        <p style="opacity:0.65; font-size:0.85rem; margin-top:6px;">Live price signals across Resin &amp; Global Material categories</p>
+    </div>
+    <div class="dash-mi-grid">
+
+        <!-- Resin Prices Card -->
+        <div class="dash-mi-card">
+            <div class="dash-mi-title">🧪 Resin Price Summary</div>
+            <div class="dash-mi-subtitle">Latest average prices by resin type (INR)</div>
+            <div id="dash-resin-list"><div class="dash-no-data"><span class="loading"></span> Loading...</div></div>
+            <div class="dash-chart-wrap"><div id="dash-resin-chart" style="height:200px;"></div></div>
+            <div style="margin-top:14px;text-align:right;">
+                <a href="/materials" style="font-size:0.78rem;color:var(--orange);opacity:0.8;text-decoration:none;font-weight:700;">View Full Tracker →</a>
+            </div>
+        </div>
+
+        <!-- Global Material Prices Card -->
+        <div class="dash-mi-card">
+            <div class="dash-mi-title">🌐 Global Material Prices</div>
+            <div class="dash-mi-subtitle">Latest quarterly average prices by commodity (EUR)</div>
+            <div id="dash-gm-list"><div class="dash-no-data"><span class="loading"></span> Loading...</div></div>
+            <div class="dash-chart-wrap"><div id="dash-gm-chart" style="height:200px;"></div></div>
+            <div style="margin-top:14px;text-align:right;">
+                <a href="/materials" style="font-size:0.78rem;color:var(--orange);opacity:0.8;text-decoration:none;font-weight:700;">View Full Tracker →</a>
+            </div>
+        </div>
+
+    </div>
+</div>
+
+<!-- ── System Status ─────────────────────────────────────────── -->
+<div class="card" style="margin-top:40px; padding:20px;">
     <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:15px;">
         <div style="display:flex; align-items:center; gap:15px;">
             <div style="width:10px; height:10px; border-radius:50%; background:#10b981; box-shadow:0 0 10px #10b981;"></div>
@@ -6154,19 +10120,108 @@ async function loadDashboardData() {
     try {
         const statsRes = await fetch("/api/dashboard_stats");
         if (!statsRes.ok) throw new Error('Failed to load statistics');
-        
         const stats = await statsRes.json();
-        
         document.getElementById('stat-resin').textContent = stats.resin_types;
         document.getElementById('stat-machines').textContent = stats.machines_display;
         document.getElementById('stat-countries').textContent = stats.countries;
         document.getElementById('last-updated').textContent = 'Last updated: ' + stats.last_updated;
-        
     } catch (error) {
-        console.error('Error loading dashboard data:', error);
-        document.getElementById('stat-resin').textContent = '0';
-        document.getElementById('stat-machines').textContent = '0';
-        document.getElementById('stat-countries').textContent = '0';
+        console.error('Error loading dashboard stats:', error);
+        ['stat-resin','stat-machines','stat-countries'].forEach(id => { document.getElementById(id).textContent = '—'; });
+    }
+
+    // ── Market intelligence prices ──────────────────────────────
+    try {
+        const pr = await fetch("/api/dashboard_prices");
+        const pd = await pr.json();
+
+        // ─ Resin ─
+        const resinList = document.getElementById('dash-resin-list');
+        if (pd.resin && pd.resin.length) {
+            let rHtml = '';
+            pd.resin.forEach(r => {
+                const trendCls = r.trend === 'Rising' ? 'dash-trend-rising' : r.trend === 'Falling' ? 'dash-trend-falling' : 'dash-trend-stable';
+                const trendIcon = r.trend === 'Rising' ? '▲' : r.trend === 'Falling' ? '▼' : '●';
+                const sign = r.change_pct > 0 ? '+' : '';
+                rHtml += `<div class="dash-price-row">
+                    <span class="dash-price-label">${r.resin_type}</span>
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <span class="dash-price-val">₹${r.avg_price.toLocaleString(undefined,{minimumFractionDigits:2})}</span>
+                        <span class="dash-trend-badge ${trendCls}">${trendIcon} ${sign}${r.change_pct}%</span>
+                    </div>
+                </div>`;
+            });
+            resinList.innerHTML = rHtml;
+            // Bar chart
+            const names = pd.resin.map(r => r.resin_type);
+            const vals  = pd.resin.map(r => r.avg_price);
+            const cols  = pd.resin.map(r => r.trend === 'Rising' ? '#dc3545' : r.trend === 'Falling' ? '#28a745' : '#E8601C');
+            if (typeof Plotly !== 'undefined') {
+                Plotly.newPlot('dash-resin-chart', [{
+                    x: names, y: vals, type: 'bar',
+                    marker: { color: cols, line: { color: 'rgba(255,255,255,0.2)', width: 1 } },
+                    text: vals.map(v => '₹' + v.toLocaleString()), textposition: 'outside',
+                    textfont: { color: 'white', size: 10 },
+                    hovertemplate: '%{x}<br>₹%{y:,.2f}<extra></extra>'
+                }], {
+                    margin: { t: 10, b: 60, l: 50, r: 10 },
+                    plot_bgcolor: 'rgba(255,255,255,0.05)', paper_bgcolor: 'rgba(0,0,0,0)',
+                    font: { color: 'rgba(255,255,255,0.85)', size: 10, family: 'Outfit' },
+                    xaxis: { color: 'rgba(255,255,255,0.7)', tickangle: -30, tickfont: { size: 9 }, gridcolor: 'rgba(255,255,255,0.1)' },
+                    yaxis: { color: 'rgba(255,255,255,0.7)', gridcolor: 'rgba(255,255,255,0.1)' }
+                }, { responsive: true, displayModeBar: false });
+            }
+        } else {
+            resinList.innerHTML = '<div class="dash-no-data">No resin data available. Upload resin-data.xlsx via Admin.</div>';
+        }
+
+        // ─ Global Materials ─
+        const gmList = document.getElementById('dash-gm-list');
+        if (pd.global_materials && pd.global_materials.length) {
+            let gHtml = '';
+            pd.global_materials.slice(0, 6).forEach(m => {
+                const trendCls = m.trend === 'Rising' ? 'dash-trend-rising' : m.trend === 'Falling' ? 'dash-trend-falling' : 'dash-trend-stable';
+                const trendIcon = m.trend === 'Rising' ? '▲' : m.trend === 'Falling' ? '▼' : '●';
+                const sign = m.change_pct > 0 ? '+' : '';
+                gHtml += `<div class="dash-price-row">
+                    <div>
+                        <span class="dash-price-label">${m.commodity}</span>
+                        <span style="font-size:0.7rem;opacity:0.5;margin-left:6px;">${m.latest_quarter}</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:12px;">
+                        <span class="dash-price-val">€${m.avg_eur.toLocaleString(undefined,{minimumFractionDigits:2})}</span>
+                        <span class="dash-trend-badge ${trendCls}">${trendIcon} ${sign}${m.change_pct}%</span>
+                    </div>
+                </div>`;
+            });
+            gmList.innerHTML = gHtml;
+            // Multi-line trend chart (top 5 commodities)
+            if (typeof Plotly !== 'undefined') {
+                const palette = ['#E8601C','#3b82f6','#10b981','#f59e0b','#8b5cf6'];
+                const traces = pd.global_materials.slice(0, 5).map((m, i) => ({
+                    x: m.quarters, y: m.prices_eur,
+                    type: 'scatter', mode: 'lines+markers', name: m.commodity,
+                    line: { color: palette[i % palette.length], width: 2 },
+                    marker: { size: 5 },
+                    hovertemplate: m.commodity + '<br>%{x}: €%{y:,.2f}<extra></extra>'
+                }));
+                Plotly.newPlot('dash-gm-chart', traces, {
+                    margin: { t: 10, b: 40, l: 50, r: 10 },
+                    plot_bgcolor: 'rgba(255,255,255,0.05)', paper_bgcolor: 'rgba(0,0,0,0)',
+                    font: { color: 'rgba(255,255,255,0.85)', size: 10, family: 'Outfit' },
+                    xaxis: { color: 'rgba(255,255,255,0.7)', tickfont: { size: 9 }, gridcolor: 'rgba(255,255,255,0.1)' },
+                    yaxis: { color: 'rgba(255,255,255,0.7)', gridcolor: 'rgba(255,255,255,0.1)', title: 'EUR / unit' },
+                    legend: { font: { color: 'rgba(255,255,255,0.85)', size: 9 }, orientation: 'h', y: -0.25 }
+                }, { responsive: true, displayModeBar: false });
+            }
+        } else {
+            gmList.innerHTML = '<div class="dash-no-data">No global material data available. Upload global-material-data.xlsx via Admin.</div>';
+        }
+
+    } catch (err) {
+        console.warn('Dashboard prices error:', err);
+        document.getElementById('dash-resin-list').innerHTML = '<div class="dash-no-data">Could not load price data.</div>';
+        document.getElementById('dash-gm-list').innerHTML = '<div class="dash-no-data">Could not load price data.</div>';
     }
 }
 </script>
@@ -6733,7 +10788,6 @@ MACH_HTML = """
 <h2>Machine Database</h2>
 <div style="display:flex;gap:8px;margin-bottom:20px;background:rgba(255,255,255,0.1);padding:8px;border-radius:12px;">
     <button class="mach-tab-btn active" onclick="switchMachTab('search')" data-mtab="search" style="flex:1;padding:12px 20px;background:var(--orange);border:none;border-radius:8px;color:white;font-family:'Outfit',sans-serif;font-size:0.9rem;font-weight:700;cursor:pointer;transition:all 0.3s;box-shadow:0 4px 12px rgba(232,96,28,0.4);">Machine Search</button>
-    <button class="mach-tab-btn" onclick="switchMachTab('tcoRoi')" data-mtab="tcoRoi" style="flex:1;padding:12px 20px;background:rgba(255,255,255,0.15);border:none;border-radius:8px;color:white;font-family:'Outfit',sans-serif;font-size:0.9rem;font-weight:700;cursor:pointer;transition:all 0.3s;">TCO &amp; ROI</button>
 </div>
 
 <div id="mach-tab-search" class="mach-tab-content" style="display:block;">
@@ -6762,180 +10816,7 @@ MACH_HTML = """
 </div>
 </div>
 
-<div id="mach-tab-tcoRoi" class="mach-tab-content" style="display:none;">
-<!-- ========== TCO Simulator ========== -->
-<div class="card">
-    <h3 style="margin-bottom:14px;">TCO Simulator</h3>
-    <div class="mach-input-grid">
-        <div>
-            <label class="lbl-sm">Machine Cost (€)</label>
-            <input id="tco_cost" type="number" placeholder="e.g. 350000" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Power (kW)</label>
-            <input id="tco_power" type="number" placeholder="e.g. 65" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Country (for costs)</label>
-            <select id="tco_country" onchange="onTCOCountryChange()">
-                <option value="">Select…</option>
-            </select>
-            <div id="tco_fx_hint" style="font-size:.65rem;color:rgba(255,255,255,0.45);margin-top:3px;"></div>
-        </div>
-        <div>
-            <label class="lbl-sm">Uptime %</label>
-            <input id="tco_uptime" type="number" value="75" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Maintenance %/yr</label>
-            <input id="tco_maint" type="number" value="5" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Depreciation %/yr</label>
-            <input id="tco_depr" type="number" value="10" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Annual Production (pcs)</label>
-            <input id="tco_pcs" type="number" value="1000000" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Part Weight (kg)</label>
-            <input id="tco_part_weight" type="number" value="0.05" step="0.001" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Cycle Time (sec)</label>
-            <input id="tco_cycle_time" type="number" value="10" step="0.1" class="theme-input">
-        </div>
-    </div>
-    <!-- Material & Logistics row -->
-    <div style="margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.12);">
-        <div style="font-size:.72rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">Material & Logistics</div>
-        <div class="mach-input-grid">
-            <div>
-                <label class="lbl-sm">Resin Type</label>
-                <select id="tco_resin_type" class="theme-input" onchange="fetchResinPrice()" style="padding:11px 14px;">
-                    <option value="">Select…</option>
-                    <option value="HDPE">HDPE</option>
-                    <option value="LDPE">LDPE</option>
-                    <option value="LLDPE">LLDPE</option>
-                    <option value="PP">PP</option>
-                    <option value="PET">PET</option>
-                    <option value="PVC">PVC</option>
-                    <option value="PS">PS</option>
-                    <option value="EVA">EVA</option>
-                    <option value="ABS">ABS</option>
-                    <option value="PA">PA (Nylon)</option>
-                </select>
-                <div id="tco_resin_hint" style="font-size:.62rem;color:rgba(255,255,255,0.4);margin-top:3px;"></div>
-            </div>
-            <div>
-                <label class="lbl-sm" id="tco_resin_lbl">Resin Price (€/kg)</label>
-                <input id="tco_resin_price" type="number" step="0.01" placeholder="auto-fetch or enter" class="theme-input">
-            </div>
-            <div>
-                <label class="lbl-sm">Scrap %</label>
-                <input id="tco_scrap" type="number" value="3" step="0.1" class="theme-input">
-            </div>
-            <div>
-                <label class="lbl-sm">Tooling Amortization (€/yr)</label>
-                <input id="tco_tooling" type="number" value="0" class="theme-input">
-            </div>
-            <div>
-                <label class="lbl-sm">Freight + Duty (€/kg)</label>
-                <input id="tco_freight" type="number" value="0" step="0.01" class="theme-input">
-            </div>
-            <div>
-                <label class="lbl-sm">MOQ Inv. Holding %</label>
-                <input id="tco_moq" type="number" value="2" step="0.1" class="theme-input">
-            </div>
-            <div>
-                <label class="lbl-sm" id="tco_labour_lbl">Labour Override (€/mo, optional)</label>
-                <input id="tco_labour_override" type="number" placeholder="leave blank for geo default" class="theme-input">
-            </div>
-            <div>
-                <label class="lbl-sm" id="tco_revenue_lbl">Hourly Revenue (€, for ROI)</label>
-                <input id="tco_hourly_revenue" type="number" placeholder="optional" class="theme-input">
-            </div>
-        </div>
-    </div>
-    <!-- What-If Sliders -->
-    <div style="margin-top:14px;padding-top:12px;border-top:1px solid rgba(255,255,255,0.12);">
-        <div style="font-size:.72rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;">What-If Analysis</div>
-        <div class="mach-input-grid">
-            <div>
-                <label class="lbl-sm">Resin Price Δ: <span id="ptco_wi_resin_val">0%</span></label>
-                <input id="ptco_wi_resin" type="range" min="-30" max="30" value="0" step="1" class="wi-slider" oninput="updateProcWhatIf()">
-            </div>
-            <div>
-                <label class="lbl-sm">Cycle Time Δ: <span id="ptco_wi_cycle_val">0%</span></label>
-                <input id="ptco_wi_cycle" type="range" min="-30" max="30" value="0" step="1" class="wi-slider" oninput="updateProcWhatIf()">
-            </div>
-            <div>
-                <label class="lbl-sm">Scrap Δ: <span id="ptco_wi_scrap_val">0%</span></label>
-                <input id="ptco_wi_scrap" type="range" min="-50" max="100" value="0" step="5" class="wi-slider" oninput="updateProcWhatIf()">
-            </div>
-        </div>
-        <div id="ptco_wi_impact" style="margin-top:8px;font-size:.78rem;color:rgba(255,255,255,0.6);"></div>
-    </div>
-    <div style="display:flex;gap:10px;margin-top:14px;">
-        <button class="btn-analyze" onclick="runProcurementTCO()">Calculate Full TCO</button>
-        <button class="btn-secondary" onclick="exportProcurement()" style="font-size:.82rem;">Export to Excel</button>
-    </div>
-    <div id="tco_result"></div>
-</div>
 
-<!-- ========== SUPPLIER COMPARISON ========== -->
-<div class="card" style="margin-top:18px;display:none;" id="supplierCompareCard">
-    <h3 style="margin-bottom:12px;">Supplier Cost Comparison</h3>
-    <div id="supplierCompareBody"></div>
-</div>
-
-<!-- ========== REGION COMPARISON ========== -->
-<div class="card" style="margin-top:18px;">
-    <h3 style="margin-bottom:12px;">Region Cost Comparison</h3>
-    <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px;" id="regionCheckboxes"></div>
-    <button class="btn-secondary" onclick="runRegionCompare()" style="font-size:.82rem;">Compare Regions</button>
-    <div id="regionCompareBody" style="margin-top:12px;"></div>
-</div>
-
-<!-- ========== ROI / PAYBACK CALCULATOR ========== -->
-<div class="card" style="margin-top:24px;">
-    <h3 style="margin-bottom:14px;"><span id="roi_title">ROI / Payback Calculator</span></h3>
-    <div class="mach-input-grid">
-        <div>
-            <label class="lbl-sm">Machine Cost (€)</label>
-            <input id="roi_cost" type="number" placeholder="350000" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Power (kW)</label>
-            <input id="roi_power" type="number" placeholder="65" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm" id="roi_rev_lbl">Expected Hourly Revenue (€)</label>
-            <input id="roi_revenue" type="number" placeholder="e.g. 150" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm" id="roi_elec_lbl">Electricity Rate (€/kWh)</label>
-            <input id="roi_elec" type="number" step="0.01" placeholder="0.10" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm" id="roi_labour_lbl">Labour Monthly (€)</label>
-            <input id="roi_labour" type="number" placeholder="2500" class="theme-input">
-        </div>
-        <div>
-            <label class="lbl-sm">Uptime % / Maintenance %</label>
-            <div style="display:flex;gap:6px;">
-                <input id="roi_uptime" type="number" value="75" class="theme-input" style="width:50%;">
-                <input id="roi_maint" type="number" value="5" class="theme-input" style="width:50%;">
-            </div>
-        </div>
-    </div>
-    <input type="hidden" id="roi_euro_rate" value="1">
-    <input type="hidden" id="roi_country" value="">
-    <button class="btn-analyze" style="margin-top:14px;" onclick="runROI()">Calculate ROI</button>
-    <div id="roi_result"></div>
-</div>
-</div>
 
 <style>
 .lbl-sm{display:block;font-size:.7rem;font-weight:800;opacity:.85;margin-bottom:4px;color:rgba(255,255,255,0.9);}
@@ -6946,16 +10827,6 @@ MACH_HTML = """
 .cmp-tbl th,.cmp-tbl td{padding:10px 12px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.12);}
 .cmp-tbl th{background:rgba(255,255,255,0.08);font-weight:800;font-size:.72rem;text-transform:uppercase;color:rgba(255,255,255,0.65);}
 .cmp-tbl td.best{color:var(--orange);font-weight:800;text-shadow:0 0 8px rgba(232,96,28,0.3);}
-.tco-box{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px;}
-.tco-card{background:rgba(255,255,255,0.1);backdrop-filter:blur(12px);border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,0.18);}
-.tco-card h4{margin:0 0 10px;color:var(--orange);font-size:.9rem;text-transform:uppercase;letter-spacing:.5px;}
-.tco-row{display:flex;justify-content:space-between;padding:5px 0;font-size:.82rem;color:rgba(255,255,255,0.85);}
-.tco-row.total{border-top:2px solid var(--orange);margin-top:6px;padding-top:8px;font-weight:800;color:white;}
-.roi-summary{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:16px 0;}
-.roi-stat{text-align:center;padding:18px 14px;background:rgba(255,255,255,0.1);backdrop-filter:blur(12px);border-radius:14px;border:1px solid rgba(255,255,255,0.18);}
-.roi-stat .val{font-size:clamp(1rem,3vw,1.5rem);font-weight:800;color:var(--orange);}
-.roi-stat .lbl{font-size:.7rem;color:rgba(255,255,255,0.6);margin-top:4px;text-transform:uppercase;letter-spacing:.5px;}
-.roi-chart-wrap{position:relative;height:240px;margin-top:14px;background:rgba(0,0,0,0.2);backdrop-filter:blur(12px);border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,0.12);}
 .mach-cb{width:18px;height:18px;cursor:pointer;accent-color:var(--orange);}
 .wi-slider{width:100%;accent-color:var(--orange);cursor:pointer;height:6px;-webkit-appearance:none;appearance:none;background:rgba(255,255,255,0.15);border-radius:3px;outline:none;}
 .wi-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--orange);cursor:pointer;}
@@ -6966,7 +10837,6 @@ MACH_HTML = """
 .cpp-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;margin-top:14px;}
 .cpp-card{background:rgba(255,255,255,0.1);backdrop-filter:blur(12px);border-radius:14px;padding:18px;border:1px solid rgba(255,255,255,0.18);}
 .cpp-card h4{margin:0 0 10px;color:var(--orange);font-size:.85rem;text-transform:uppercase;letter-spacing:.5px;}
-/* Responsive grid class for TCO/ROI 3-col inputs */
 .mach-input-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;}
 .mach-form-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px;}
 /* Machine spec-grid scroll wrapper */
@@ -6982,21 +10852,13 @@ MACH_HTML = """
 @keyframes fadeInMach{from{opacity:0;transform:translateY(5px);}to{opacity:1;transform:translateY(0);}}
 
 @media(max-width:768px){
-    .tco-box{grid-template-columns:1fr;}
-    .roi-summary{grid-template-columns:repeat(2,1fr);}
     .cpp-grid{grid-template-columns:1fr;}
     .mach-input-grid{grid-template-columns:1fr;}
     .mach-form-grid{grid-template-columns:1fr;}
-    .tco-card{padding:14px;}
     .cpp-card{padding:14px;}
-    .roi-chart-wrap{height:200px;padding:12px;}
-    .roi-stat{padding:14px 10px;}
     .theme-input{padding:10px 12px;font-size:.9rem;}
 }
 @media(max-width:480px){
-    .roi-summary{grid-template-columns:1fr;}
-    .tco-row{font-size:.78rem;flex-wrap:wrap;gap:2px;}
-    .roi-chart-wrap{height:180px;padding:10px;}
 }
 </style>
 
@@ -7021,712 +10883,7 @@ function switchMachTab(tab) {
 
 let currentResults = [];
 let selectedForCompare = [];
-let currentGeo = {currency_symbol:'€', currency_code:'EUR', euro_rate:1, electricity_rate:0, labour_monthly:0};
 
-// Called when TCO country dropdown changes
-async function onTCOCountryChange() {
-    const country = document.getElementById('tco_country').value;
-    if (!country) {
-        currentGeo = {currency_symbol:'€', currency_code:'EUR', euro_rate:1, electricity_rate:0, labour_monthly:0};
-        updateCurrencyLabels();
-        return;
-    }
-    try {
-        const r = await fetch('/api/geo_currency_data', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({country})});
-        const d = await r.json();
-        if (!d.error) {
-            currentGeo = d;
-            // Show FX hint
-            const hint = document.getElementById('tco_fx_hint');
-            if (hint) hint.textContent = '1 € = ' + d.euro_rate + ' ' + d.currency_code;
-            // Auto-fill ROI fields from geo data
-            if (d.electricity_rate > 0) document.getElementById('roi_elec').value = d.electricity_rate;
-            if (d.labour_monthly > 0) document.getElementById('roi_labour').value = Math.round(d.labour_monthly);
-            document.getElementById('roi_euro_rate').value = d.euro_rate;
-            document.getElementById('roi_country').value = country;
-            updateCurrencyLabels();
-        }
-    } catch(e) { console.warn('Geo data fetch failed', e); }
-}
-
-function updateCurrencyLabels() {
-    const sym = currentGeo.currency_symbol || '€';
-    const code = currentGeo.currency_code || 'EUR';
-    const el = (id, txt) => { const e = document.getElementById(id); if(e) e.textContent = txt; };
-    el('roi_rev_lbl', 'Expected Hourly Revenue (' + sym + ')');
-    el('roi_elec_lbl', 'Electricity Rate (' + sym + '/kWh)');
-    el('roi_labour_lbl', 'Labour Monthly (' + sym + ')');
-    el('tco_resin_lbl', 'Resin Price (' + sym + '/kg)');
-    el('tco_labour_lbl', 'Labour Override (' + sym + '/mo, optional)');
-    el('tco_revenue_lbl', 'Hourly Revenue (' + sym + ', for ROI)');
-}
-
-async function loadProcs(cat) {
-    if (!cat) return;
-    
-    try {
-        const r = await fetch("/api/procs", {
-            method:"POST", 
-            headers:{"Content-Type":"application/json"}, 
-            body:JSON.stringify({cat})
-        });
-        
-        if (!r.ok) throw new Error('Failed to load processes');
-        
-        const d = await r.json();
-        let s = document.getElementById('proc'); 
-        s.innerHTML = '<option value="">Select Process...</option>';
-        d.forEach(i => { 
-            let o = document.createElement('option'); 
-            o.value=i; 
-            o.text=i; 
-            s.add(o); 
-        });
-        s.disabled = false;
-    } catch (error) {
-        console.error('Error loading processes:', error);
-        alert('Failed to load processes. Please try again.');
-    }
-}
-
-function enableSearch() {
-    const proc = document.getElementById('proc').value;
-    document.getElementById('searchBtn').disabled = !proc;
-}
-
-async function loadMachs() {
-    const cat = document.getElementById('cat').value;
-    const proc = document.getElementById('proc').value;
-    
-    if (!cat || !proc) {
-        alert('Please select both category and process');
-        return;
-    }
-    
-    const btn = document.getElementById('searchBtn');
-    btn.disabled = true;
-    btn.innerHTML = '<span class="loading"></span> Searching...';
-    
-    try {
-        const r = await fetch("/api/mach_res", {
-            method:"POST", 
-            headers:{"Content-Type":"application/json"}, 
-            body:JSON.stringify({cat, proc})
-        });
-        
-        if (!r.ok) throw new Error('Failed to load machines');
-        
-        const d = await r.json();
-        currentResults = d.results;
-        selectedForCompare = [];
-        document.getElementById('comparePanel').style.display = 'none';
-
-        let h = '<div class="card">';
-        h += '<div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; flex-wrap:wrap; gap:10px;">';
-        h += '<h3>Found ' + (d.display_count || d.results.length) + ' Machines</h3>';
-        h += '<div style="display:flex;gap:8px;">';
-        h += '<button class="btn-secondary" id="compareBtn" onclick="compareSelected()" disabled>Compare Selected (0)</button>';
-        h += '<button class="btn-secondary" onclick="exportMachines()">Export to Excel</button>';
-        h += '</div></div>';
-
-        h += '<div class="mach-results-scroll">';
-        h += '<div class="spec-grid" style="grid-template-columns:40px 2fr 1fr 1fr 1fr 1fr;border-bottom:2px solid var(--orange);font-weight:800;padding-bottom:15px;margin-bottom:10px;">';
-        h += '<div></div><div>Machine Model</div><div>Price (€)</div><div>Power (kWh)</div><div>Footprint</div><div>Speed</div></div>';
-
-        d.results.forEach((m, idx) => {
-            let displayName = m.model;
-            if (m.make && !m.model.toLowerCase().trim().startsWith(m.make.toLowerCase().trim())) {
-                displayName = m.make + ' ' + m.model;
-            }
-            h += '<div class="spec-grid" style="grid-template-columns:40px 2fr 1fr 1fr 1fr 1fr;cursor:pointer;" onclick="toggleMachCompare(' + idx + ',event)">';
-            h += '<div><input type="checkbox" class="mach-cb" id="cb_' + idx + '" data-idx="' + idx + '" onclick="toggleMachCompare(' + idx + ',event)"></div>';
-            h += '<div><strong>' + displayName + '</strong></div><div>' + m.cost + '</div><div>' + m.power + '</div><div>' + m.sqm + '</div><div>' + (m.speed || '—') + '</div></div>';
-        });
-
-        h += '</div>';
-        h += '</div>';
-        document.getElementById('m_res').innerHTML = h;
-
-        // Show AI recommendation
-        if (d.recommendation) {
-            const rec = d.recommendation;
-            let dispName = rec.model;
-            if (rec.make && !rec.model.toLowerCase().startsWith(rec.make.toLowerCase())) dispName = rec.make + ' ' + rec.model;
-            document.getElementById('ai_recommendation').innerHTML =
-                '<div class="card" style="border-left:4px solid var(--orange);margin-bottom:0;"><strong style="color:var(--orange);">AI Recommendation:</strong> ' +
-                dispName + ' — ' + rec.reason + ' (analysed ' + rec.total_analyzed + ' machines)</div>';
-        }
-    } catch (error) {
-        console.error('Error loading machines:', error);
-        showError('m_res', 'Failed to load machines. Please try again.');
-    } finally {
-        btn.disabled = false;
-        btn.innerHTML = 'Search Machines';
-    }
-}
-
-function toggleMachCompare(idx, e) {
-    if (e) e.stopPropagation();
-    const cb = document.getElementById('cb_' + idx);
-    if (!cb) return;
-    // If click was on the row but NOT the checkbox itself, toggle it
-    if (e && e.target !== cb) cb.checked = !cb.checked;
-
-    if (cb.checked) {
-        if (!selectedForCompare.includes(idx)) selectedForCompare.push(idx);
-        if (selectedForCompare.length > 4) {
-            const removed = selectedForCompare.shift();
-            const oldCb = document.getElementById('cb_' + removed);
-            if (oldCb) oldCb.checked = false;
-        }
-    } else {
-        selectedForCompare = selectedForCompare.filter(i => i !== idx);
-    }
-    const btn = document.getElementById('compareBtn');
-    if (btn) {
-        btn.textContent = 'Compare Selected (' + selectedForCompare.length + ')';
-        btn.disabled = selectedForCompare.length < 2;
-    }
-}
-
-// ====== COMPARE ======
-async function compareSelected() {
-    if (selectedForCompare.length < 2) { alert('Select at least 2 machines'); return; }
-    const machines = selectedForCompare.map(i => currentResults[i]);
-    try {
-        const r = await fetch("/api/machine_compare", {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body: JSON.stringify({machines})
-        });
-        const d = await r.json();
-        if (d.error) { alert(d.error); return; }
-        renderCompare(d.machines);
-    } catch(err) { alert('Compare failed'); }
-}
-
-function renderCompare(machines) {
-    const metrics = [
-        {key:'cost',label:'Price (€)',raw:'cost_raw',best:'min'},
-        {key:'power',label:'Power (kWh)',raw:'power_raw',best:'min'},
-        {key:'sqm',label:'Footprint (SQM)',raw:'sqm_raw',best:'min'},
-        {key:'speed',label:'Speed / Output',raw:'speed_raw',best:'max'},
-        {key:'efficiency_score',label:'Efficiency Score',raw:'efficiency_score',best:'max'},
-    ];
-    let h = '<div class="cmp-tbl-wrap"><table class="cmp-tbl"><thead><tr><th>Metric</th>';
-    machines.forEach(m => {
-        let nm = m.model; if (m.make && !m.model.toLowerCase().startsWith(m.make.toLowerCase())) nm = m.make+' '+m.model;
-        h += '<th>'+nm+'</th>';
-    });
-    h += '</tr></thead><tbody>';
-    metrics.forEach(mt => {
-        const vals = machines.map(m => m[mt.raw] || 0);
-        const bestVal = mt.best === 'min' ? Math.min(...vals.filter(v=>v>0)) : Math.max(...vals);
-        h += '<tr><td style="font-weight:700;">'+mt.label+'</td>';
-        machines.forEach(m => {
-            const v = m[mt.raw] || 0;
-            const display = mt.raw === 'efficiency_score' ? v.toFixed(1) + '/100' : (m[mt.key] || v.toLocaleString());
-            const cls = v === bestVal && v > 0 ? ' class="best"' : '';
-            h += '<td'+cls+'>'+display+'</td>';
-        });
-        h += '</tr>';
-    });
-    h += '</tbody></table></div>';
-    h += '<p style="font-size:.72rem;color:rgba(255,255,255,0.5);margin-top:8px;">Highlighted values indicate best-in-class for each metric.</p>';
-    document.getElementById('compareBody').innerHTML = h;
-    document.getElementById('comparePanel').style.display = 'block';
-    document.getElementById('comparePanel').scrollIntoView({behavior:'smooth'});
-}
-
-// ====== RESIN PRICE AUTO-FETCH ======
-async function fetchResinPrice() {
-    const resinType = document.getElementById('tco_resin_type').value;
-    const hint = document.getElementById('tco_resin_hint');
-    if (!resinType) { if(hint) hint.textContent=''; return; }
-    try {
-        if(hint) hint.textContent='Fetching latest price…';
-        const r = await fetch('/api/resin_latest_price', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({resin_type:resinType})});
-        const d = await r.json();
-        if (d.price_per_kg > 0) {
-            document.getElementById('tco_resin_price').value = d.price_per_kg;
-            if(hint) hint.innerHTML = resinType + ' latest: ₹' + Number(d.latest_price_per_mt).toLocaleString() + '/MT (' + d.latest_date + ')';
-        } else {
-            if(hint) hint.textContent = 'No price data — enter manually';
-        }
-    } catch(e) { if(hint) hint.textContent = 'Fetch failed — enter manually'; }
-}
-
-// ====== WHAT-IF ANALYSIS ======
-let lastProcurementResult = null;
-function updateProcWhatIf() {
-    const rv = parseInt(document.getElementById('ptco_wi_resin').value);
-    const cv = parseInt(document.getElementById('ptco_wi_cycle').value);
-    const sv = parseInt(document.getElementById('ptco_wi_scrap').value);
-    document.getElementById('ptco_wi_resin_val').textContent = (rv>=0?'+':'') + rv + '%';
-    document.getElementById('ptco_wi_cycle_val').textContent = (cv>=0?'+':'') + cv + '%';
-    document.getElementById('ptco_wi_scrap_val').textContent = (sv>=0?'+':'') + sv + '%';
-
-    if (!lastProcurementResult) {
-        document.getElementById('ptco_wi_impact').textContent = 'Calculate TCO first to see what-if impact.';
-        return;
-    }
-    const base = lastProcurementResult.cost_per_part.total;
-    const baseMat = lastProcurementResult.cost_per_part.material;
-    const baseMach = lastProcurementResult.cost_per_part.machine;
-
-    // Adjust material cost by resin % and scrap %
-    const adjResin = parseFloat(document.getElementById('tco_resin_price').value) * (1 + rv/100);
-    const adjScrap = (parseFloat(document.getElementById('tco_scrap').value) || 3) * (1 + sv/100);
-    const partWt = parseFloat(document.getElementById('tco_part_weight').value) || 0.05;
-    const newMat = adjResin * partWt * (1 + adjScrap/100);
-
-    // Adjust machine cost by cycle time (inverse: faster cycle = more parts = lower per-part)
-    const cycleFactor = 1 / (1 + cv/100);
-    const newMach = baseMach * cycleFactor;
-
-    const newTotal = newMach + newMat + lastProcurementResult.cost_per_part.tooling + lastProcurementResult.cost_per_part.freight + lastProcurementResult.cost_per_part.inventory;
-    const delta = ((newTotal - base) / base * 100);
-    const sym = lastProcurementResult.currency_symbol || '€';
-    const col = delta > 0 ? '#ef4444' : delta < 0 ? '#22c55e' : 'rgba(255,255,255,0.6)';
-    document.getElementById('ptco_wi_impact').innerHTML = 'Adjusted cost/part: <strong style="color:'+col+';">' + sym + ' ' + newTotal.toFixed(4) + '</strong> (' + (delta>=0?'+':'') + delta.toFixed(1) + '% vs base ' + sym + ' ' + base.toFixed(4) + ')';
-}
-
-// ====== FULL PROCUREMENT TCO ======
-async function runProcurementTCO() {
-    const body = {
-        machine_cost: parseFloat(document.getElementById('tco_cost').value) || 0,
-        power_kw:     parseFloat(document.getElementById('tco_power').value) || 0,
-        country:      document.getElementById('tco_country').value,
-        uptime_pct:   parseFloat(document.getElementById('tco_uptime').value) || 75,
-        maintenance_pct: parseFloat(document.getElementById('tco_maint').value) || 5,
-        depreciation_pct: parseFloat(document.getElementById('tco_depr').value) || 10,
-        annual_production: parseFloat(document.getElementById('tco_pcs').value) || 1000000,
-        resin_price_per_kg: parseFloat(document.getElementById('tco_resin_price').value) || 0,
-        part_weight_kg: parseFloat(document.getElementById('tco_part_weight').value) || 0.05,
-        cycle_time_sec: parseFloat(document.getElementById('tco_cycle_time').value) || 10,
-        scrap_pct: parseFloat(document.getElementById('tco_scrap').value) || 3,
-        tooling_amort_yr: parseFloat(document.getElementById('tco_tooling').value) || 0,
-        freight_duty_per_kg: parseFloat(document.getElementById('tco_freight').value) || 0,
-        moq_holding_pct: parseFloat(document.getElementById('tco_moq').value) || 2,
-        labour_override: document.getElementById('tco_labour_override').value || null,
-        hourly_revenue: parseFloat(document.getElementById('tco_hourly_revenue').value) || 0,
-    };
-    if (!body.machine_cost) { alert('Enter machine cost'); return; }
-    try {
-        const r = await fetch("/api/procurement_tco", {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body:JSON.stringify(body)
-        });
-        const d = await r.json();
-        if (d.error) { alert(d.error); return; }
-        lastProcurementResult = d;
-        renderProcurementTCO(d);
-        // Reset what-if sliders
-        document.getElementById('ptco_wi_resin').value = 0;
-        document.getElementById('ptco_wi_cycle').value = 0;
-        document.getElementById('ptco_wi_scrap').value = 0;
-        updateProcWhatIf();
-    } catch(err) { alert('Procurement TCO calculation failed'); }
-}
-
-function renderProcurementTCO(d) {
-    const b = d.breakdown;
-    const cpp = d.cost_per_part;
-    const ann = d.annual_procurement;
-    const sym = d.currency_symbol || '€';
-    const code = d.currency_code || 'EUR';
-    const rate = d.euro_rate || 1;
-    const fmt = (v) => fmtCur(v, sym);
-    const fmtDec = (v, dec) => (sym||'€') + ' ' + Number(v).toFixed(dec||4);
-    let h = '';
-
-    // Conversion banner
-    if (rate !== 1) {
-        h += '<div style="margin-bottom:12px;padding:10px 14px;background:rgba(232,96,28,0.15);border:1px solid rgba(232,96,28,0.3);border-radius:10px;font-size:.78rem;">';
-        h += '<strong style="color:var(--orange);">Currency:</strong> Machine €' + Number(b.machine_cost_eur).toLocaleString() + ' → ' + fmt(b.machine_cost_local) + ' <span style="opacity:.6;">(1 € = ' + rate + ' ' + code + ')</span>';
-        h += '</div>';
-    }
-
-    // Cost per Part summary
-    h += '<div style="margin-top:14px;"><div style="font-size:.72rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">Cost Per Part Breakdown</div></div>';
-    h += '<div class="cpp-grid">';
-    // Card 1: per-part breakdown
-    h += '<div class="cpp-card"><h4>Cost/Part (' + code + ')</h4>';
-    h += tcoRow('Machine', fmtDec(cpp.machine));
-    h += tcoRow('Material', fmtDec(cpp.material));
-    h += tcoRow('Tooling', fmtDec(cpp.tooling));
-    h += tcoRow('Freight + Duty', fmtDec(cpp.freight));
-    h += tcoRow('Inventory Holding', fmtDec(cpp.inventory));
-    h += '<div class="tco-row total"><span>Total/Part</span><span>' + fmtDec(cpp.total) + '</span></div>';
-    h += '<div class="tco-row total"><span>Cost/kg</span><span>' + fmtDec(d.cost_per_kg, 2) + '</span></div>';
-    h += '<div class="tco-row" style="opacity:.6;"><span>Annual Parts</span><span>' + Number(d.annual_parts).toLocaleString() + '</span></div>';
-    h += '</div>';
-    // Card 2: annual costs
-    h += '<div class="cpp-card"><h4>Annual Costs (' + code + ')</h4>';
-    h += tcoRow('Machine OPEX', fmt(ann.machine_opex));
-    h += tcoRow('Material', fmt(ann.material));
-    h += tcoRow('Tooling', fmt(ann.tooling));
-    h += tcoRow('Freight', fmt(ann.freight));
-    h += tcoRow('Inventory', fmt(ann.inventory));
-    h += '<div class="tco-row total"><span>Total Annual</span><span>' + fmt(ann.total) + '</span></div>';
-    h += '</div>';
-    h += '</div>';
-
-    // Cost breakdown bar
-    const parts = [
-        {l:'Machine',v:cpp.machine,c:'#2196F3'},{l:'Material',v:cpp.material,c:'#4CAF50'},
-        {l:'Tooling',v:cpp.tooling,c:'#FF9800'},{l:'Freight',v:cpp.freight,c:'#9C27B0'},
-        {l:'Inventory',v:cpp.inventory,c:'#F44336'}
-    ];
-    const maxV = cpp.total || 1;
-    h += '<div style="margin-top:14px;background:rgba(255,255,255,0.06);border-radius:10px;padding:14px;">';
-    h += '<div style="font-size:.7rem;font-weight:800;color:rgba(255,255,255,0.6);text-transform:uppercase;margin-bottom:8px;">Cost Structure</div>';
-    h += '<div style="display:flex;height:22px;border-radius:6px;overflow:hidden;">';
-    parts.forEach(p => { const pct = (p.v/maxV*100); if(pct>0.5) h += '<div title="'+p.l+': '+pct.toFixed(1)+'%" style="width:'+pct+'%;background:'+p.c+';"></div>'; });
-    h += '</div>';
-    h += '<div style="display:flex;gap:12px;margin-top:6px;flex-wrap:wrap;">';
-    parts.forEach(p => { const pct = (p.v/maxV*100); h += '<div style="font-size:.65rem;color:rgba(255,255,255,0.6);display:flex;align-items:center;gap:3px;"><span style="width:8px;height:8px;border-radius:2px;background:'+p.c+';display:inline-block;"></span>'+p.l+' '+pct.toFixed(0)+'%</div>'; });
-    h += '</div></div>';
-
-    // 5yr / 10yr TCO cards
-    h += '<div class="tco-box">';
-    ['5','10'].forEach(yr => {
-        const y = d.years[yr];
-        h += '<div class="tco-card"><h4>'+yr+'-Year Total Procurement TCO ('+code+')</h4>';
-        h += tcoRow('CAPEX (Machine)', fmt(y.capex));
-        h += tcoRow('Machine OPEX ('+yr+'yr)', fmt(ann.machine_opex * parseInt(yr)));
-        h += tcoRow('Material ('+yr+'yr)', fmt(ann.material * parseInt(yr)));
-        h += tcoRow('Tooling ('+yr+'yr)', fmt(ann.tooling * parseInt(yr)));
-        h += tcoRow('Freight ('+yr+'yr)', fmt(ann.freight * parseInt(yr)));
-        h += tcoRow('Inventory ('+yr+'yr)', fmt(ann.inventory * parseInt(yr)));
-        h += '<div class="tco-row total"><span>Total Cost</span><span>'+fmt(y.total)+'</span></div>';
-        h += '<div class="tco-row total"><span>Per Year</span><span>'+fmt(y.per_year)+'</span></div>';
-        h += '<div class="tco-row total"><span>Per 1,000 pcs</span><span>'+fmt(y.per_1000_pcs)+'</span></div>';
-        h += '</div>';
-    });
-    h += '</div>';
-
-    // ROI / Payback (if hourly revenue was provided)
-    if (d.roi && d.roi.payback_months !== -1) {
-        h += '<div style="margin-top:18px;"><div style="font-size:.72rem;font-weight:800;color:var(--orange);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px;">ROI & Payback</div></div>';
-        h += '<div class="roi-summary">';
-        h += roiStat(d.roi.payback_months > 0 ? d.roi.payback_months + ' mo' : 'N/A', 'Payback Period');
-        h += roiStat(d.roi.annual_roi_pct + '%', 'Annual ROI');
-        h += roiStat(fmt(d.roi.monthly_profit), 'Monthly Profit');
-        h += roiStat(fmt(d.roi.monthly_revenue), 'Monthly Revenue');
-        h += '</div>';
-        if (d.roi.chart && d.roi.chart.length > 0) {
-            h += '<div class="roi-chart-wrap"><canvas id="roiChart" style="width:100%;height:100%;"></canvas></div>';
-        }
-    }
-
-    if (b.electricity_rate) h += '<p style="font-size:.72rem;color:rgba(255,255,255,0.5);margin-top:8px;">Geo data: electricity '+b.electricity_rate+' '+sym+'/kWh, operator '+fmt(b.labour_monthly)+'/mo</p>';
-    document.getElementById('tco_result').innerHTML = h;
-
-    // Draw breakeven chart if applicable
-    if (d.roi && d.roi.chart && d.roi.chart.length > 0) {
-        setTimeout(() => drawBreakevenChart(d.roi.chart, d.roi.payback_months, sym), 50);
-    }
-
-    // Build supplier comparison from machine compare data if available
-    buildSupplierCompare(d);
-}
-
-// ====== SUPPLIER COMPARISON TABLE ======
-function buildSupplierCompare(d) {
-    // If user selected machines for compare, build a supplier cost table
-    if (selectedForCompare.length < 2) {
-        document.getElementById('supplierCompareCard').style.display = 'none';
-        return;
-    }
-    const machines = selectedForCompare.map(i => currentResults[i]);
-    const sym = d.currency_symbol || '€';
-    const rate = d.euro_rate || 1;
-    const resinPrice = parseFloat(document.getElementById('tco_resin_price').value) || 0;
-    const partWt = parseFloat(document.getElementById('tco_part_weight').value) || 0.05;
-    const scrapPct = (parseFloat(document.getElementById('tco_scrap').value) || 3) / 100;
-    const annualPcs = d.annual_parts || 1000000;
-    const cycleSec = parseFloat(document.getElementById('tco_cycle_time').value) || 10;
-    const uptimePct = (parseFloat(document.getElementById('tco_uptime').value) || 75) / 100;
-    const runHrs = 8760 * uptimePct;
-    const elecRate = d.breakdown.electricity_rate;
-    const labourMo = d.breakdown.labour_monthly;
-    const maintPct = (parseFloat(document.getElementById('tco_maint').value) || 5) / 100;
-    const deprPct = (parseFloat(document.getElementById('tco_depr').value) || 10) / 100;
-
-    let h = '<div class="cmp-tbl-wrap"><table class="cmp-tbl"><thead><tr><th>Metric</th>';
-    machines.forEach(m => {
-        let nm = m.model; if (m.make && !m.model.toLowerCase().startsWith(m.make.toLowerCase())) nm = m.make+' '+m.model;
-        h += '<th>'+nm+'</th>';
-    });
-    h += '</tr></thead><tbody>';
-
-    const supplierData = machines.map(m => {
-        const costLocal = (m.cost_raw || 0) * rate;
-        const powerKw = m.power_raw || 0;
-        const energyAnn = powerKw * runHrs * elecRate;
-        const labourAnn = labourMo * 12 * 3;
-        const maintAnn = costLocal * maintPct;
-        const deprAnn = costLocal * deprPct;
-        const machOpex = energyAnn + labourAnn + maintAnn + deprAnn;
-        const machPerPart = annualPcs > 0 ? machOpex / annualPcs : 0;
-        const matPerPart = resinPrice * partWt * (1 + scrapPct);
-        const totalPerPart = machPerPart + matPerPart;
-        return {machine_cost: costLocal, power: powerKw, machine_per_part: machPerPart, material_per_part: matPerPart, total_per_part: totalPerPart, annual_cost: totalPerPart * annualPcs};
-    });
-
-    const metrics = [
-        {l: 'Machine Cost (' + sym + ')', key: 'machine_cost', best: 'min', fmt: v => fmtCur(v, sym)},
-        {l: 'Machine Cost/Part', key: 'machine_per_part', best: 'min', fmt: v => sym + ' ' + v.toFixed(4)},
-        {l: 'Material Cost/Part', key: 'material_per_part', best: 'min', fmt: v => sym + ' ' + v.toFixed(4)},
-        {l: 'Total Cost/Part', key: 'total_per_part', best: 'min', fmt: v => sym + ' ' + v.toFixed(4)},
-        {l: 'Annual Total', key: 'annual_cost', best: 'min', fmt: v => fmtCur(v, sym)},
-    ];
-
-    metrics.forEach(mt => {
-        const vals = supplierData.map(s => s[mt.key]);
-        const bestVal = Math.min(...vals.filter(v => v > 0));
-        h += '<tr><td style="font-weight:700;">'+mt.l+'</td>';
-        supplierData.forEach(s => {
-            const v = s[mt.key];
-            const cls = v === bestVal && v > 0 ? ' class="best"' : '';
-            h += '<td'+cls+'>'+mt.fmt(v)+'</td>';
-        });
-        h += '</tr>';
-    });
-    h += '</tbody></table></div>';
-    document.getElementById('supplierCompareBody').innerHTML = h;
-    document.getElementById('supplierCompareCard').style.display = 'block';
-}
-
-// ====== REGION COMPARISON ======
-async function runRegionCompare() {
-    const boxes = document.querySelectorAll('#regionCheckboxes input:checked');
-    const countries = Array.from(boxes).map(b => b.value);
-    if (countries.length < 2) { alert('Select at least 2 regions'); return; }
-
-    const baseParams = {
-        machine_cost: parseFloat(document.getElementById('tco_cost').value) || 0,
-        power_kw: parseFloat(document.getElementById('tco_power').value) || 0,
-        uptime_pct: parseFloat(document.getElementById('tco_uptime').value) || 75,
-        maintenance_pct: parseFloat(document.getElementById('tco_maint').value) || 5,
-        depreciation_pct: parseFloat(document.getElementById('tco_depr').value) || 10,
-        annual_production: parseFloat(document.getElementById('tco_pcs').value) || 1000000,
-        resin_price_per_kg: parseFloat(document.getElementById('tco_resin_price').value) || 0,
-        part_weight_kg: parseFloat(document.getElementById('tco_part_weight').value) || 0.05,
-        scrap_pct: parseFloat(document.getElementById('tco_scrap').value) || 3,
-        tooling_amort_yr: parseFloat(document.getElementById('tco_tooling').value) || 0,
-        freight_duty_per_kg: parseFloat(document.getElementById('tco_freight').value) || 0,
-        moq_holding_pct: parseFloat(document.getElementById('tco_moq').value) || 2,
-    };
-    if (!baseParams.machine_cost) { alert('Enter machine cost first'); return; }
-
-    try {
-        const r = await fetch('/api/procurement_region_compare', {
-            method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify({countries, base_params: baseParams})
-        });
-        const d = await r.json();
-        if (d.error) { alert(d.error); return; }
-        renderRegionCompare(d.regions);
-    } catch(e) { alert('Region comparison failed'); }
-}
-
-function renderRegionCompare(regions) {
-    if (!regions || regions.length === 0) { document.getElementById('regionCompareBody').innerHTML = '<p>No data</p>'; return; }
-    let h = '<div class="cmp-tbl-wrap"><table class="cmp-tbl"><thead><tr><th>Country</th><th>Elec. Rate</th><th>Labour/mo</th><th>Cost/Part (€)</th><th>Annual Total (€)</th></tr></thead><tbody>';
-    const bestCpp = Math.min(...regions.map(r => r.cost_per_part_eur).filter(v => v > 0));
-    regions.forEach(r => {
-        const isBest = r.cost_per_part_eur === bestCpp && r.cost_per_part_eur > 0;
-        h += '<tr>';
-        h += '<td style="font-weight:700;">' + r.country + ' <span style="opacity:.5;font-size:.7rem;">(' + r.currency_code + ')</span></td>';
-        h += '<td>' + r.electricity_rate + ' ' + r.currency_symbol + '/kWh</td>';
-        h += '<td>' + r.currency_symbol + ' ' + Number(r.labour_monthly).toLocaleString() + '</td>';
-        h += '<td' + (isBest ? ' class="best"' : '') + '>€ ' + r.cost_per_part_eur.toFixed(4) + '</td>';
-        h += '<td' + (isBest ? ' class="best"' : '') + '>€ ' + Number(r.annual_total_eur).toLocaleString() + '</td>';
-        h += '</tr>';
-    });
-    h += '</tbody></table></div>';
-    document.getElementById('regionCompareBody').innerHTML = h;
-}
-
-// ====== EXPORT PROCUREMENT TCO ======
-async function exportProcurement() {
-    if (!lastProcurementResult) { alert('Calculate TCO first'); return; }
-    try {
-        const r = await fetch('/api/procurement_export', {
-            method:'POST', headers:{'Content-Type':'application/json'},
-            body: JSON.stringify(lastProcurementResult)
-        });
-        if (!r.ok) throw new Error('Export failed');
-        const blob = await r.blob();
-        const url = window.URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = 'procurement_tco_' + new Date().getTime() + '.xlsx';
-        document.body.appendChild(a);
-        a.click();
-        window.URL.revokeObjectURL(url);
-        document.body.removeChild(a);
-    } catch(e) { alert('Export failed'); }
-}
-
-function tcoRow(l,v){return '<div class="tco-row"><span>'+l+'</span><span>'+v+'</span></div>';}
-function fmtCur(v,sym){return (sym||'€')+' '+Number(v).toLocaleString(undefined,{minimumFractionDigits:0,maximumFractionDigits:0});}
-function fmtEur(v){return fmtCur(v,'€');}
-
-// ====== ROI / PAYBACK ======
-async function runROI() {
-    const body = {
-        machine_cost:   parseFloat(document.getElementById('roi_cost').value) || 0,
-        hourly_revenue: parseFloat(document.getElementById('roi_revenue').value) || 0,
-        power_kw:       parseFloat(document.getElementById('roi_power').value) || 0,
-        electricity_rate: parseFloat(document.getElementById('roi_elec').value) || 0,
-        labour_monthly: parseFloat(document.getElementById('roi_labour').value) || 0,
-        uptime_pct:     parseFloat(document.getElementById('roi_uptime').value) || 75,
-        maintenance_pct: parseFloat(document.getElementById('roi_maint').value) || 5,
-        euro_rate:      parseFloat(document.getElementById('roi_euro_rate').value) || currentGeo.euro_rate || 1,
-        country:        document.getElementById('roi_country').value || document.getElementById('tco_country').value || '',
-    };
-    if (!body.machine_cost || !body.hourly_revenue) { alert('Enter machine cost and hourly revenue'); return; }
-    try {
-        const r = await fetch("/api/roi_calculate", {
-            method:"POST", headers:{"Content-Type":"application/json"},
-            body:JSON.stringify(body)
-        });
-        const d = await r.json();
-        if (d.error) { alert(d.error); return; }
-        renderROI(d);
-    } catch(err) { alert('ROI calculation failed'); }
-}
-
-function renderROI(d) {
-    const sym = d.currency_symbol || currentGeo.currency_symbol || '€';
-    const code = d.currency_code || currentGeo.currency_code || 'EUR';
-    const rate = d.euro_rate || 1;
-    const fmt = (v) => fmtCur(v, sym);
-    let h = '';
-    // Conversion banner for ROI
-    if (rate !== 1 && d.machine_cost_local) {
-        h += '<div style="margin:12px 0 4px;padding:8px 12px;background:rgba(232,96,28,0.12);border:1px solid rgba(232,96,28,0.25);border-radius:8px;font-size:.75rem;">';
-        h += '<strong style="color:var(--orange);">'+code+'</strong> — Machine cost converted: ' + fmt(d.machine_cost_local);
-        h += '</div>';
-    }
-    h += '<div class="roi-summary">';
-    h += roiStat(d.payback_months > 0 ? d.payback_months + ' mo' : 'N/A', 'Payback Period');
-    h += roiStat(d.annual_roi_pct + '%', 'Annual ROI');
-    h += roiStat(fmt(d.monthly_profit), 'Monthly Profit');
-    h += roiStat(fmt(d.monthly_revenue), 'Monthly Revenue');
-    h += '</div>';
-
-    // Canvas breakeven chart
-    h += '<div class="roi-chart-wrap"><canvas id="roiChart" style="width:100%;height:100%;"></canvas></div>';
-    document.getElementById('roi_result').innerHTML = h;
-    setTimeout(() => drawBreakevenChart(d.chart, d.payback_months, sym), 50);
-}
-
-function roiStat(v,l){return '<div class="roi-stat"><div class="val">'+v+'</div><div class="lbl">'+l+'</div></div>';}
-
-function drawBreakevenChart(data, payback, sym) {
-    sym = sym || '€';
-    const canvas = document.getElementById('roiChart');
-    if (!canvas) return;
-    const ctx = canvas.getContext('2d');
-    const dpr = window.devicePixelRatio || 1;
-    const rect = canvas.parentElement.getBoundingClientRect();
-    canvas.width = rect.width * dpr;
-    canvas.height = (rect.height - 32) * dpr;
-    ctx.scale(dpr, dpr);
-    const W = rect.width, H = rect.height - 32;
-    const pad = {l:70,r:20,t:10,b:30};
-    const gW = W-pad.l-pad.r, gH = H-pad.t-pad.b;
-
-    const xs = data.map(d=>d.month), ys = data.map(d=>d.cumulative);
-    const minY = Math.min(...ys, 0), maxY = Math.max(...ys, 0);
-    const rangeY = maxY - minY || 1;
-
-    function px(m,v){return [pad.l + (m/Math.max(...xs))*gW, pad.t + gH - ((v-minY)/rangeY)*gH];}
-
-    // Grid
-    ctx.strokeStyle='rgba(255,255,255,0.12)'; ctx.lineWidth=0.5;
-    for(let i=0;i<=4;i++){const y=pad.t+gH*(i/4);ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(pad.l+gW,y);ctx.stroke();}
-
-    // Zero line
-    const [,zeroY]=px(0,0);
-    ctx.strokeStyle='rgba(255,255,255,0.35)'; ctx.lineWidth=1; ctx.setLineDash([4,4]);
-    ctx.beginPath(); ctx.moveTo(pad.l,zeroY); ctx.lineTo(pad.l+gW,zeroY); ctx.stroke();
-    ctx.setLineDash([]);
-
-    // Profit line
-    ctx.beginPath(); ctx.strokeStyle='#ff8f5e'; ctx.lineWidth=2.5;
-    data.forEach((d,i)=>{const[x,y]=px(d.month,d.cumulative);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
-    ctx.stroke();
-
-    // Fill under zero = red, above zero = green
-    // Simplified: fill entire area with gradient
-    const grad = ctx.createLinearGradient(0, pad.t, 0, pad.t+gH);
-    grad.addColorStop(0, 'rgba(34,197,94,0.25)');
-    grad.addColorStop((maxY/(rangeY)), 'rgba(34,197,94,0.08)');
-    grad.addColorStop(1, 'rgba(239,68,68,0.15)');
-    ctx.fillStyle = grad;
-    ctx.beginPath();
-    data.forEach((d,i)=>{const[x,y]=px(d.month,d.cumulative);i===0?ctx.moveTo(x,y):ctx.lineTo(x,y);});
-    const[lastX]=px(data[data.length-1].month,0);
-    ctx.lineTo(pad.l+gW,zeroY); ctx.lineTo(pad.l,zeroY); ctx.closePath(); ctx.fill();
-
-    // Breakeven marker
-    if(payback>0){
-        const[bx,by]=px(payback,0);
-        ctx.fillStyle='#e85d04';ctx.beginPath();ctx.arc(bx,by,5,0,Math.PI*2);ctx.fill();
-        ctx.fillStyle='rgba(255,255,255,0.95)';ctx.font='bold 11px sans-serif';ctx.textAlign='center';
-        ctx.fillText('Breakeven: '+payback+' mo',bx,by-12);
-    }
-
-    // Axes labels
-    ctx.fillStyle='rgba(255,255,255,0.55)';ctx.font='10px sans-serif';ctx.textAlign='center';
-    ctx.fillText('Months',pad.l+gW/2,H);
-    ctx.textAlign='right';
-    for(let i=0;i<=4;i++){
-        const v=maxY-rangeY*(i/4);
-        ctx.fillText(fmtCur(v,sym),pad.l-6,pad.t+gH*(i/4)+4);
-    }
-}
-
-// ====== PREFILL FROM MACHINE ROW ======
-function prefillTCO(idx) {
-    const m = currentResults[idx];
-    if (!m) return;
-    document.getElementById('tco_cost').value = m.cost_raw || '';
-    document.getElementById('tco_power').value = m.power_raw || '';
-}
-
-function prefillROI(idx) {
-    const m = currentResults[idx];
-    if (!m) return;
-    document.getElementById('roi_cost').value = m.cost_raw || '';
-    document.getElementById('roi_power').value = m.power_raw || '';
-}
-
-// ====== LOAD TCO COUNTRY DROPDOWN ======
-async function loadTCOCountries() {
-    try {
-        const r = await fetch("/api/init", {method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({module:"costs"})});
-        const countries = await r.json();
-        const sel = document.getElementById('tco_country');
-        const regionDiv = document.getElementById('regionCheckboxes');
-        if (sel && Array.isArray(countries)) {
-            countries.forEach(c => { const o=document.createElement('option');o.value=c;o.text=c;sel.add(o); });
-        }
-        // Populate region checkboxes
-        if (regionDiv && Array.isArray(countries)) {
-            countries.forEach(c => {
-                const lbl = document.createElement('label');
-                lbl.className = 'region-cb';
-                lbl.innerHTML = '<input type="checkbox" value="'+c+'"> '+c;
-                regionDiv.appendChild(lbl);
-            });
-        }
-    } catch(e) { console.warn('Could not load TCO countries'); }
-}
 
 async function exportMachines() {
     if (currentResults.length === 0) {
@@ -7758,9 +10915,6 @@ async function exportMachines() {
     }
 }
 
-// Init TCO countries on page load
-if (document.readyState === 'loading') { document.addEventListener('DOMContentLoaded', loadTCOCountries); }
-else { loadTCOCountries(); }
 </script>
 """
 COST_HTML = """
@@ -7861,6 +11015,23 @@ CALC_HTML = """
 .calculator-view { display: none; }
 .calculator-view.active { display: block; }
 
+/* === Scenario Comparison === */
+.sc-panel{background:rgba(255,255,255,0.05);border:1px solid rgba(255,255,255,0.1);border-radius:12px;padding:20px;margin-top:15px;}
+.sc-saved-list{display:flex;flex-wrap:wrap;gap:8px;margin:10px 0;}
+.sc-chip{padding:6px 14px;border-radius:8px;font-size:0.8rem;font-weight:600;cursor:pointer;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);transition:all .2s;}
+.sc-chip:hover{border-color:var(--orange);}
+.sc-chip.selected{border-color:#4CAF50;background:rgba(76,175,80,0.15);color:#4CAF50;}
+.sc-compare-table{width:100%;border-collapse:collapse;font-size:0.83rem;margin-top:12px;}
+.sc-compare-table th{padding:10px 8px;font-size:0.72rem;text-transform:uppercase;opacity:0.5;border-bottom:2px solid rgba(255,255,255,0.15);text-align:left;}
+.sc-compare-table td{padding:9px 8px;border-bottom:1px solid rgba(255,255,255,0.06);}
+.sc-compare-table .sc-best{color:#4CAF50;font-weight:700;}
+.sc-compare-table .sc-worst{color:#ef4444;opacity:0.7;}
+.sc-delta{font-size:0.7rem;opacity:0.5;margin-left:4px;}
+.sc-delta.positive{color:#ef4444;opacity:1;}
+.sc-delta.negative{color:#4CAF50;opacity:1;}
+/* === Report Export === */
+.rpt-bar{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px;padding:12px;background:rgba(255,255,255,0.04);border-radius:10px;border:1px solid rgba(255,255,255,0.08);}
+
 /* --- NEW STYLES: Sub-Tabs & Login --- */
 .sub-tabs { display: flex; border-bottom: 2px solid rgba(255,255,255,0.1); margin-bottom: 20px; }
 .sub-tab-btn { padding: 10px 20px; background: transparent; border: none; color: rgba(255,255,255,0.6); font-family: 'Outfit'; font-weight: 600; cursor: pointer; border-bottom: 2px solid transparent; transition: all 0.3s; }
@@ -7952,20 +11123,22 @@ CALC_HTML = """
 </div>
 
 <div id="universal-calculator" class="calculator-view active">
-    
+
     <div class="card" style="margin-bottom: 20px; padding: 20px;">
         <div class="sub-tabs">
-            <button class="sub-tab-btn active" onclick="switchSubTab('essentials')" id="btn-essentials">Essential Models</button>
+            <button class="sub-tab-btn active" onclick="switchSubTab('essentials')" id="btn-essentials">Standard Models</button>
             <button class="sub-tab-btn" onclick="switchSubTab('advanced')" id="btn-advanced">Advanced Models</button>
+            <button class="sub-tab-btn" onclick="switchSubTab('bulk')" id="btn-bulk"> Bulk Upload</button>
         </div>
 
         <div id="subtab-essentials" class="sub-tab-content active">
             <div style="display:flex; justify-content:space-between; align-items:center;">
                 <div style="flex:1;">
-                    <label style="display:block; font-size:.75rem; margin-bottom:5px; font-weight:800; opacity:0.9;">SELECT ESSENTIAL MODEL</label>
+                    <label style="display:block; font-size:.75rem; margin-bottom:5px; font-weight:800; opacity:0.9;">SELECT STANDARD MODEL</label>
                     <select id="essentialsSelect" onchange="switchCalcModel(this.value)" style="width:100%; max-width:400px; padding:10px; border-radius:8px; background:rgba(255,255,255,0.1); color:white; border:1px solid rgba(255,255,255,0.3);">
                         <option value="carton">Carton Cost Model</option>
                         <option value="flexibles">Flexibles Cost Model</option>
+                        <!--CUSTOM_ESSENTIALS-->
                     </select>
                 </div>
                 <div class="legend" style="margin:0;">
@@ -7993,6 +11166,7 @@ CALC_HTML = """
                         <select id="advancedSelect" onchange="switchCalcModel(this.value)" style="width:100%; max-width:400px; padding:10px; border-radius:8px; background:rgba(76,175,80,0.1); color:white; border:1px solid #4CAF50;">
                             <option value="ebm" selected>EBM Cost Model</option>
                             <option value="carton-adv">Carton Cost Model</option>
+                            <!--CUSTOM_ADVANCED-->
                         </select>
                     </div>
                     <div>
@@ -8001,6 +11175,79 @@ CALC_HTML = """
                 </div>
             </div>
         </div>
+
+        <div id="subtab-bulk" class="sub-tab-content">
+            <div style="margin-bottom:15px;">
+                <p style="opacity:0.7; font-size:0.85rem; margin-bottom:12px;">Upload an Excel file with multiple SKUs. Each row runs through the cost calculator automatically. Set <strong>model</strong> column in Excel to <code>ebm</code>, <code>carton</code>, <code>carton_advanced</code>, or <code>flexibles</code>.</p>
+                <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:15px;">
+                    <label style="flex:1; min-width:250px; cursor:pointer;">
+                        <div id="bulk-drop-zone" style="border:2px dashed rgba(232,96,28,0.5); border-radius:12px; padding:30px; text-align:center; transition:all 0.3s; background:rgba(232,96,28,0.05);">
+                            <div style="font-size:2rem; margin-bottom:8px;">📁</div>
+                            <div style="font-weight:700; margin-bottom:4px;">Drop Excel file here or click to browse</div>
+                            <div style="font-size:0.8rem; opacity:0.6;" id="bulk-file-name">Supports .xlsx / .xls</div>
+                            <input type="file" id="bulk-file-input" accept=".xlsx,.xls" style="display:none;" onchange="bulkFileSelected(this)">
+                        </div>
+                    </label>
+                </div>
+                <div style="display:flex; gap:10px; flex-wrap:wrap;">
+                    <button class="btn-analyze" onclick="processBulkUpload()" id="bulk-process-btn" disabled style="flex:1; opacity:0.5;">
+                        ⚡ Process All SKUs
+                    </button>
+                    <a href="/api/download_bulk_template" class="btn-secondary" style="text-decoration:none; text-align:center; padding:12px 20px; flex:0 0 auto;">
+                        📥 Download Template
+                    </a>
+                </div>
+            </div>
+            <!-- Progress -->
+            <div id="bulk-progress-container" style="display:none; margin-bottom:20px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:10px;">
+                    <span style="font-weight:700;">Processing SKUs...</span>
+                    <span id="bulk-progress-text" style="font-size:0.85rem; opacity:0.7;">0%</span>
+                </div>
+                <div style="width:100%; height:8px; background:rgba(255,255,255,0.1); border-radius:4px; overflow:hidden;">
+                    <div id="bulk-progress-bar" style="width:0%; height:100%; background:var(--orange); border-radius:4px; transition:width 0.3s;"></div>
+                </div>
+            </div>
+            <!-- Results -->
+            <div id="bulk-results-container" style="display:none;">
+                <div style="display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:12px;">
+                    <div>
+                        <span style="font-weight:700; font-size:1.1rem;">Results</span>
+                        <span id="bulk-summary-badge" style="font-size:0.8rem; margin-left:10px; padding:3px 10px; border-radius:12px; background:rgba(76,175,80,0.2); color:#4CAF50;"></span>
+                        <span id="bulk-error-badge" style="font-size:0.8rem; margin-left:6px; padding:3px 10px; border-radius:12px; background:rgba(239,68,68,0.2); color:#ef4444; display:none;"></span>
+                    </div>
+                    <div style="display:flex; gap:8px;">
+                        <button class="btn-secondary" onclick="exportBulkResults()" style="font-size:0.85rem;">📊 Export Excel</button>
+                        <button class="btn-secondary" onclick="saveAllBulkSKUs()" style="font-size:0.85rem;">💾 Save All SKUs</button>
+                    </div>
+                </div>
+                <div style="overflow-x:auto;">
+                    <table id="bulk-results-table" style="width:100%; border-collapse:collapse; font-size:0.85rem;">
+                        <thead>
+                            <tr style="border-bottom:2px solid var(--orange); text-align:left;">
+                                <th style="padding:10px 8px;">#</th>
+                                <th style="padding:10px 8px;">SKU Name</th>
+                                <th style="padding:10px 8px;">Model</th>
+                                <th style="padding:10px 8px;">Country</th>
+                                <th style="padding:10px 8px; text-align:right;">Material Cost</th>
+                                <th style="padding:10px 8px; text-align:right;">Conversion Cost</th>
+                                <th style="padding:10px 8px; text-align:right;">Total Cost</th>
+                                <th style="padding:10px 8px; text-align:right;">Unit Cost</th>
+                                <th style="padding:10px 8px; text-align:right;">Margin %</th>
+                                <th style="padding:10px 8px; text-align:center;">Save</th>
+                            </tr>
+                        </thead>
+                        <tbody id="bulk-results-body"></tbody>
+                    </table>
+                </div>
+                <!-- Error rows -->
+                <div id="bulk-errors-container" style="display:none; margin-top:15px; padding:12px; border:1px solid rgba(239,68,68,0.3); border-radius:10px;">
+                    <div class="calc-section-title" style="color:#ef4444;">⚠ Error Rows</div>
+                    <div id="bulk-errors-list" style="font-size:0.85rem;"></div>
+                </div>
+            </div>
+        </div>
+
     </div>
 
     <div id="carton-calculator" class="model-view">
@@ -8249,6 +11496,11 @@ CALC_HTML = """
     </div>
 </div>
 
+<!-- CUSTOM MODEL CALCULATOR (dynamically populated) -->
+<div id="custom-model-calculator" class="model-view">
+    <div id="custom-model-content"></div>
+</div>
+
 <!-- ADVANCED CARTON COST MODEL -->
 <div id="carton-adv-calculator" class="model-view">
     <div class="calc-layout">
@@ -8409,6 +11661,7 @@ CALC_HTML = """
     <div id="whatif-chart" style="margin-top:20px;"></div>
 </div>
 
+
 <script>
 // --- Constants ---
 const FILM_OPTIONS = ['PET Film','BOPP Film','CPP Film','METPET Film','MET MDOPE Film','Matt Finish PET Film','AL Foil','BON','HIPS','GPPS','HDPE','MDPE','EAA','EVA','Cellophane','Mono Layer PE','2 Layer All PE','3 Layer All PE','5 Layer All PE','5 Layer EVOH Barrier','5 Layer Nylon Barrier','7 Layer All PE','Gravure','Flexo','Primer','Lamination - Adhesive (Solvent Based)','Lamination - Adhesive (Solvent Less)','Heat Seal Lacquer','Cold Seal','Gloss Varnish','Matte Varnish'];
@@ -8460,11 +11713,13 @@ function switchSubTab(tab) {
     // Buttons
     document.getElementById('btn-essentials').classList.remove('active');
     document.getElementById('btn-advanced').classList.remove('active');
+    document.getElementById('btn-bulk').classList.remove('active');
     document.getElementById('btn-' + tab).classList.add('active');
 
     // Sub-content
     document.getElementById('subtab-essentials').classList.remove('active');
     document.getElementById('subtab-advanced').classList.remove('active');
+    document.getElementById('subtab-bulk').classList.remove('active');
     document.getElementById('subtab-' + tab).classList.add('active');
 
     // CLEAR ALL CALCULATORS FIRST
@@ -8473,7 +11728,7 @@ function switchSubTab(tab) {
     if (tab === 'essentials') {
         const val = document.getElementById('essentialsSelect').value;
         switchCalcModel(val);
-    } else {
+    } else if (tab === 'advanced') {
         if (isAdvancedLoggedIn) {
             document.getElementById('advanced-login-form').style.display = 'none';
             document.getElementById('advanced-secured-content').style.display = 'block';
@@ -8484,6 +11739,9 @@ function switchSubTab(tab) {
             // Hide all models
             document.querySelectorAll('.model-view').forEach(v => v.classList.remove('active'));
         }
+    } else if (tab === 'bulk') {
+        // Bulk tab: hide all model panels, just show bulk content
+        document.querySelectorAll('.model-view').forEach(v => v.classList.remove('active'));
     }
 }
 
@@ -8509,10 +11767,123 @@ function switchCalcModel(model) {
     currentModel = model;
     // Hide ALL model views first
     document.querySelectorAll('.model-view').forEach(c => c.classList.remove('active'));
-    
-    // Show only the selected model view
-    const view = document.getElementById(model + '-calculator');
-    if (view) view.classList.add('active');
+
+    if (model.startsWith('custom_')) {
+        // Load custom model dynamically
+        document.getElementById('custom-model-calculator').classList.add('active');
+        loadCustomModelCalc(model.replace('custom_', ''));
+    } else {
+        // Show only the selected model view
+        const view = document.getElementById(model + '-calculator');
+        if (view) view.classList.add('active');
+    }
+}
+
+async function loadCustomModelCalc(modelId) {
+    const container = document.getElementById('custom-model-content');
+    container.innerHTML = '<p style="opacity:0.6;text-align:center;padding:40px;">Loading model...</p>';
+    try {
+        const r = await fetch('/api/models/' + modelId);
+        const data = await r.json();
+        if (!data.success) { container.innerHTML = '<p style="color:#ef4444;">Model not found.</p>'; return; }
+        renderCustomCalcModel(data.model, container);
+    } catch(e) { container.innerHTML = '<p style="color:#ef4444;">Error loading model.</p>'; }
+}
+
+function renderCustomCalcModel(model, container) {
+    // Group fields by input_group and formula_section
+    const inputGroups = {};
+    const formulaSections = {};
+    (model.fields || []).forEach(f => {
+        if (f.type === 'input') {
+            const g = f.input_group || 'General';
+            if (!inputGroups[g]) inputGroups[g] = [];
+            inputGroups[g].push(f);
+        } else if (f.type === 'formula') {
+            const s = f.formula_section || 'Results';
+            if (!formulaSections[s]) formulaSections[s] = [];
+            formulaSections[s].push(f);
+        }
+    });
+    let html = '<div class="calc-layout"><div><div class="card">';
+    if (model.description) html += `<p style="opacity:0.5;font-size:0.82rem;margin-bottom:15px;">${model.description}</p>`;
+    // Input groups
+    for (const [group, fields] of Object.entries(inputGroups)) {
+        html += `<div class="calc-section"><div class="calc-section-title">${group}</div>`;
+        fields.forEach(f => {
+            const itype = f.input_type || 'number';
+            let inp;
+            if (itype === 'checkbox') {
+                inp = `<input type="checkbox" id="cm_${f.id}" ${f.default?'checked':''} style="width:18px;height:18px;">`;
+            } else if (itype === 'dropdown') {
+                const opts = (f.options||'').split(',').map(o=>o.trim()).filter(Boolean);
+                inp = `<select class="calc-select" id="cm_${f.id}">${opts.map((o,oi)=>`<option value="${oi}">${o}</option>`).join('')}</select>`;
+            } else if (itype === 'percent') {
+                inp = `<div style="display:flex;align-items:center;gap:6px;"><input type="range" min="0" max="100" value="${f.default||0}" id="cm_${f.id}" style="flex:1;" oninput="document.getElementById('cmlbl_${f.id}').textContent=this.value+'%'"><span id="cmlbl_${f.id}" style="font-size:0.78rem;">${f.default||0}%</span></div>`;
+            } else if (itype === 'text') {
+                inp = `<input type="text" class="calc-input calc-input-green" id="cm_${f.id}" value="${f.default||''}">`;
+            } else {
+                inp = `<input type="number" class="calc-input calc-input-green" id="cm_${f.id}" value="${f.default||0}" step="any">`;
+            }
+            html += `<div class="calc-row"><label>${f.label||f.id}</label><span class="unit">${f.unit||''}</span>${inp}</div>`;
+        });
+        html += '</div>';
+    }
+    html += `<button class="btn-analyze" onclick="calcCustomModel('${model.id}')" style="width:100%;margin-top:15px;">Calculate</button>`;
+    html += '</div></div><div>';
+    // Results panel
+    html += '<div class="summary-card" id="cm-summary"><h3 style="margin-bottom:20px;">' + (model.name||'Results') + '</h3>';
+    for (const [section, fields] of Object.entries(formulaSections)) {
+        html += `<div style="margin-bottom:15px;"><div style="font-size:0.8rem;font-weight:700;color:var(--orange);text-transform:uppercase;margin-bottom:8px;border-bottom:1px solid rgba(232,96,28,0.3);padding-bottom:5px;">${section}</div>`;
+        fields.forEach(f => {
+            html += `<div style="display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid rgba(255,255,255,0.05);">
+                <span style="opacity:0.8;">${f.label||f.id}</span>
+                <span style="font-weight:700;" id="cm_out_${f.id}">—</span></div>`;
+        });
+        html += '</div>';
+    }
+    html += '</div></div></div>';
+    container.innerHTML = html;
+}
+
+async function calcCustomModel(modelId) {
+    // Fetch model to get field metadata for input type handling
+    let modelFields = [];
+    try {
+        const mr = await fetch('/api/models/' + modelId);
+        const md = await mr.json();
+        if (md.success) modelFields = md.model.fields || [];
+    } catch(e) {}
+    const inputs = {};
+    modelFields.forEach(f => {
+        if (f.type !== 'input') return;
+        const el = document.getElementById('cm_' + f.id);
+        if (!el) { inputs[f.id] = f.default || 0; return; }
+        const itype = f.input_type || 'number';
+        if (itype === 'checkbox') inputs[f.id] = el.checked ? 1 : 0;
+        else if (itype === 'percent') inputs[f.id] = (parseFloat(el.value)||0) / 100;
+        else if (itype === 'text') inputs[f.id] = 0;
+        else inputs[f.id] = parseFloat(el.value) || 0;
+    });
+    // Fallback: also sweep any cm_ inputs not in modelFields
+    document.querySelectorAll('[id^="cm_"]').forEach(el => {
+        if (el.id.startsWith('cm_out_')) return;
+        const fid = el.id.replace('cm_', '');
+        if (!(fid in inputs)) inputs[fid] = parseFloat(el.value) || 0;
+    });
+    try {
+        const r = await fetch('/api/calculate', {
+            method: 'POST', headers: {'Content-Type':'application/json'},
+            body: JSON.stringify({model_id: modelId, inputs: inputs})
+        });
+        const data = await r.json();
+        if (data.success) {
+            for (const [k, v] of Object.entries(data.results)) {
+                const el = document.getElementById('cm_out_' + k);
+                if (el) el.textContent = typeof v === 'number' ? v.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:4}) : v;
+            }
+        }
+    } catch(e) { alert('Calculation error: ' + e.message); }
 }
 
 // --- CARTON LOGIC ---
@@ -9151,7 +12522,7 @@ function updateWhatIf() {
         newTotal = newMaterial + newConv + newMargin + newPacking + newFreight;
         baseTotal = base.total_cost_per_1000;
     } else {
-        // Simpler models (carton essentials, flexibles)
+        // Simpler models (carton standard, flexibles)
         newMaterial = (base.material_cost || 0) * (1 + resinChg);
         const volFactor = volChg !== 0 ? 1 / (1 + volChg) : 1;
         newConv = (base.conversion_cost || 0) * (1 + (elecChg + labourChg)/2) * volFactor;
@@ -9637,19 +13008,1690 @@ function showSaveSKUButton(model) {
         const btn = document.getElementById(btnId);
         if (btn) btn.style.display = 'block';
     }
+    if (typeof rptUpdateTimestamp === 'function') rptUpdateTimestamp();
+}
+
+// ============================================
+// BULK SKU UPLOAD FEATURE
+// ============================================
+let bulkSelectedFile = null;
+let bulkResults = [];
+
+function bulkFileSelected(input) {
+    const file = input.files[0];
+    if (!file) return;
+    bulkSelectedFile = file;
+    document.getElementById('bulk-file-name').textContent = file.name + ' (' + (file.size / 1024).toFixed(1) + ' KB)';
+    document.getElementById('bulk-drop-zone').style.borderColor = '#4CAF50';
+    document.getElementById('bulk-drop-zone').style.background = 'rgba(76,175,80,0.1)';
+    const btn = document.getElementById('bulk-process-btn');
+    btn.disabled = false;
+    btn.style.opacity = '1';
+}
+
+// Drag & drop
+document.addEventListener('DOMContentLoaded', function() {
+    const dropZone = document.getElementById('bulk-drop-zone');
+    if (!dropZone) return;
+    dropZone.addEventListener('dragover', e => { e.preventDefault(); dropZone.style.borderColor = 'var(--orange)'; dropZone.style.background = 'rgba(232,96,28,0.15)'; });
+    dropZone.addEventListener('dragleave', e => { e.preventDefault(); dropZone.style.borderColor = 'rgba(232,96,28,0.5)'; dropZone.style.background = 'rgba(232,96,28,0.05)'; });
+    dropZone.addEventListener('drop', e => {
+        e.preventDefault();
+        dropZone.style.borderColor = 'rgba(232,96,28,0.5)';
+        dropZone.style.background = 'rgba(232,96,28,0.05)';
+        const files = e.dataTransfer.files;
+        if (files.length > 0) {
+            const f = files[0];
+            if (f.name.match(/\\.xlsx?$/i)) {
+                document.getElementById('bulk-file-input').files = files;
+                bulkFileSelected(document.getElementById('bulk-file-input'));
+            } else {
+                alert('Please drop an Excel file (.xlsx or .xls)');
+            }
+        }
+    });
+    dropZone.addEventListener('click', () => document.getElementById('bulk-file-input').click());
+});
+
+async function processBulkUpload() {
+    if (!bulkSelectedFile) { alert('Please select an Excel file first'); return; }
+
+    const btn = document.getElementById('bulk-process-btn');
+    btn.disabled = true;
+    btn.innerHTML = '⏳ Processing...';
+
+    document.getElementById('bulk-progress-container').style.display = 'block';
+    document.getElementById('bulk-results-container').style.display = 'none';
+    document.getElementById('bulk-progress-bar').style.width = '30%';
+    document.getElementById('bulk-progress-text').textContent = 'Uploading...';
+
+    const formData = new FormData();
+    formData.append('file', bulkSelectedFile);
+
+    try {
+        document.getElementById('bulk-progress-bar').style.width = '60%';
+        document.getElementById('bulk-progress-text').textContent = 'Calculating...';
+
+        const response = await fetch('/api/upload_bulk_skus', { method: 'POST', body: formData });
+        const data = await response.json();
+
+        document.getElementById('bulk-progress-bar').style.width = '100%';
+        document.getElementById('bulk-progress-text').textContent = 'Done!';
+
+        if (!data.success) {
+            alert('Error: ' + data.message);
+            btn.disabled = false;
+            btn.innerHTML = '⚡ Process All SKUs';
+            document.getElementById('bulk-progress-container').style.display = 'none';
+            return;
+        }
+
+        bulkResults = data.results || [];
+        renderBulkResults(data);
+
+        setTimeout(() => {
+            document.getElementById('bulk-progress-container').style.display = 'none';
+        }, 800);
+
+    } catch (err) {
+        alert('Upload failed: ' + err.message);
+    }
+
+    btn.disabled = false;
+    btn.innerHTML = '⚡ Process All SKUs';
+}
+
+function renderBulkResults(data) {
+    const container = document.getElementById('bulk-results-container');
+    container.style.display = 'block';
+
+    // Summary badge
+    document.getElementById('bulk-summary-badge').textContent = data.processed + ' of ' + data.total_rows + ' processed';
+
+    // Error badge
+    const errBadge = document.getElementById('bulk-error-badge');
+    if (data.error_count > 0) {
+        errBadge.style.display = 'inline';
+        errBadge.textContent = data.error_count + ' error(s)';
+    } else {
+        errBadge.style.display = 'none';
+    }
+
+    // Results table
+    const tbody = document.getElementById('bulk-results-body');
+    tbody.innerHTML = '';
+
+    // Find min cost for highlighting (only compare same-model types)
+    let minCost = Infinity;
+    data.results.forEach(r => { if (r.cost_per_piece < minCost) minCost = r.cost_per_piece; });
+
+    data.results.forEach((r, i) => {
+        const isCheapest = data.results.length > 1 && r.cost_per_piece === minCost;
+        const rowStyle = isCheapest ? 'background:rgba(76,175,80,0.12);' : '';
+        const badge = isCheapest ? ' <span style="font-size:0.7rem; padding:2px 6px; border-radius:8px; background:#4CAF50; color:white;">★ Lowest</span>' : '';
+        const lbl1 = r.cost_label_1000 || '/1000';
+        const lbl2 = r.cost_label_piece || '/pc';
+        const unitTag = '<span style="font-size:0.65rem;opacity:0.5;margin-left:2px;">' + lbl1 + '</span>';
+        const unitTag2 = '<span style="font-size:0.65rem;opacity:0.5;margin-left:2px;">' + lbl2 + '</span>';
+        const tr = document.createElement('tr');
+        tr.style.cssText = 'border-bottom:1px solid rgba(255,255,255,0.08);' + rowStyle;
+        tr.innerHTML = `
+            <td style="padding:10px 8px;">${i + 1}</td>
+            <td style="padding:10px 8px; font-weight:600;">${r.sku_name}${badge}</td>
+            <td style="padding:10px 8px; text-transform:uppercase; font-size:0.78rem; opacity:0.7;">${r.model}</td>
+            <td style="padding:10px 8px;">${r.country || '-'}</td>
+            <td style="padding:10px 8px; text-align:right;">${r.material_cost.toLocaleString(undefined, {minimumFractionDigits:2})}${unitTag}</td>
+            <td style="padding:10px 8px; text-align:right;">${r.conversion_cost.toLocaleString(undefined, {minimumFractionDigits:2})}${unitTag}</td>
+            <td style="padding:10px 8px; text-align:right; font-weight:700; color:var(--orange);">${r.total_cost_per_1000.toLocaleString(undefined, {minimumFractionDigits:2})}${unitTag}</td>
+            <td style="padding:10px 8px; text-align:right; font-weight:700;">${r.cost_per_piece.toFixed(4)}${unitTag2}</td>
+            <td style="padding:10px 8px; text-align:right;">${r.margin_pct}%</td>
+            <td style="padding:10px 8px; text-align:center;">
+                <button onclick="saveBulkSKU(${i})" style="background:rgba(76,175,80,0.2); border:1px solid #4CAF50; color:#4CAF50; padding:4px 10px; border-radius:6px; cursor:pointer; font-size:0.75rem; font-family:'Outfit';" id="bulk-save-btn-${i}">Save</button>
+            </td>
+        `;
+        tbody.appendChild(tr);
+    });
+
+    // Error rows
+    const errContainer = document.getElementById('bulk-errors-container');
+    if (data.errors && data.errors.length > 0) {
+        errContainer.style.display = 'block';
+        const errList = document.getElementById('bulk-errors-list');
+        errList.innerHTML = data.errors.map(e =>
+            `<div style="padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.05);">
+                <span style="color:#ef4444; font-weight:600;">Row ${e.row}</span> (${e.sku}): ${e.error}
+            </div>`
+        ).join('');
+    } else {
+        errContainer.style.display = 'none';
+    }
+}
+
+async function exportBulkResults() {
+    if (!bulkResults || bulkResults.length === 0) { alert('No results to export'); return; }
+
+    try {
+        const response = await fetch('/api/export_bulk_results', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ results: bulkResults })
+        });
+        if (!response.ok) { alert('Export failed'); return; }
+        const blob = await response.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = 'packfora_bulk_results.xlsx';
+        a.click();
+        URL.revokeObjectURL(url);
+    } catch (err) {
+        alert('Export error: ' + err.message);
+    }
+}
+
+async function saveBulkSKU(index) {
+    const r = bulkResults[index];
+    if (!r) return;
+
+    const sku = {
+        name: r.sku_name,
+        model: r.model,
+        timestamp: new Date().toISOString(),
+        inputs: r.inputs || {},
+        results: r.full_result || {}
+    };
+
+    // Save locally
+    saveSKUToStorage(sku);
+
+    // Save to server
+    try {
+        const resp = await fetch('/api/save_sku', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify(sku)
+        });
+        const data = await resp.json();
+        const btn = document.getElementById('bulk-save-btn-' + index);
+        if (btn) {
+            btn.textContent = '✓ Saved';
+            btn.style.background = 'rgba(76,175,80,0.4)';
+            btn.disabled = true;
+        }
+        refreshSKUDropdown();
+    } catch (err) {
+        const btn = document.getElementById('bulk-save-btn-' + index);
+        if (btn) { btn.textContent = '⚠ Local'; btn.style.background = 'rgba(255,152,0,0.3)'; }
+    }
+}
+
+async function saveAllBulkSKUs() {
+    if (!bulkResults || bulkResults.length === 0) { alert('No results to save'); return; }
+    if (!confirm('Save all ' + bulkResults.length + ' SKUs?')) return;
+    for (let i = 0; i < bulkResults.length; i++) {
+        await saveBulkSKU(i);
+    }
+    alert('✓ All ' + bulkResults.length + ' SKUs saved!');
+}
+
+// ═══════════════ SCENARIO COMPARISON (Feature 5) ═══════════════
+const SC_STORAGE_KEY = 'packfora_scenarios';
+let scSelectedIds = new Set();
+
+function scGetScenarios() { try { return JSON.parse(localStorage.getItem(SC_STORAGE_KEY) || '[]'); } catch(e) { return []; } }
+function scSaveScenarios(arr) { localStorage.setItem(SC_STORAGE_KEY, JSON.stringify(arr)); }
+
+function scSaveCurrent() {
+    const modelData = captureCurrentModelData();
+    if (!modelData) return;
+    const name = prompt('Scenario name:', `${modelData.model.toUpperCase()} — ${new Date().toLocaleString()}`);
+    if (!name || !name.trim()) return;
+    const sc = {
+        id: 'sc_' + Date.now(),
+        name: name.trim(),
+        model: modelData.model,
+        inputs: modelData.inputs,
+        results: modelData.results,
+        saved_at: new Date().toISOString(),
+    };
+    const arr = scGetScenarios();
+    arr.push(sc);
+    scSaveScenarios(arr);
+    // Also save to server
+    fetch('/api/scenarios', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(sc)}).catch(()=>{});
+    scRenderList();
+    alert('✓ Scenario "' + name + '" saved!');
+}
+
+function scRenderList() {
+    const arr = scGetScenarios();
+    const el = document.getElementById('sc-saved-list');
+    if (!el) return;
+    if (!arr.length) { el.innerHTML = '<span style="opacity:0.4;font-size:0.82rem;">No scenarios saved yet — calculate a model and click Save Scenario.</span>'; return; }
+    el.innerHTML = arr.map(sc =>
+        `<span class="sc-chip ${scSelectedIds.has(sc.id)?'selected':''}" onclick="scToggleSelect('${sc.id}')" title="${sc.model} — ${sc.saved_at}">${sc.name}
+            <span style="opacity:0.3;font-size:0.68rem;margin-left:4px;">${sc.model.toUpperCase()}</span>
+            <span onclick="event.stopPropagation();scDelete('${sc.id}')" style="margin-left:6px;opacity:0.3;cursor:pointer;" title="Delete">✕</span>
+        </span>`
+    ).join('');
+}
+
+function scToggleSelect(id) {
+    if (scSelectedIds.has(id)) scSelectedIds.delete(id);
+    else scSelectedIds.add(id);
+    scRenderList();
+    if (scSelectedIds.size >= 2) scBuildComparison();
+    else document.getElementById('sc-compare-area').style.display = 'none';
+}
+
+function scDelete(id) {
+    if (!confirm('Delete this scenario?')) return;
+    const arr = scGetScenarios().filter(s => s.id !== id);
+    scSaveScenarios(arr);
+    scSelectedIds.delete(id);
+    scRenderList();
+    fetch('/api/scenarios/' + id, {method:'DELETE'}).catch(()=>{});
+    if (scSelectedIds.size >= 2) scBuildComparison();
+    else document.getElementById('sc-compare-area').style.display = 'none';
+}
+
+function scToggleCompare() {
+    if (scSelectedIds.size < 2) {
+        alert('Select at least 2 scenarios to compare (click scenario chips above).');
+        return;
+    }
+    scBuildComparison();
+}
+
+function scBuildComparison() {
+    const all = scGetScenarios();
+    const selected = all.filter(s => scSelectedIds.has(s.id));
+    if (selected.length < 2) return;
+    document.getElementById('sc-compare-area').style.display = 'block';
+
+    // Build comparison table
+    const metrics = [
+        {key:'material_cost', label:'Material Cost'},
+        {key:'conversion_cost', label:'Conversion Cost'},
+        {key:'total_cost_per_1000', label:'Total / 1000'},
+        {key:'cost_per_piece', label:'Cost / Piece'},
+        {key:'margin', label:'Margin'},
+        {key:'margin_pct', label:'Margin %'},
+        {key:'packing_cost', label:'Packing Cost'},
+        {key:'freight_cost', label:'Freight Cost'},
+    ];
+
+    // Find which metrics have data
+    const activeMetrics = metrics.filter(m => selected.some(s => (s.results||{})[m.key] !== undefined && (s.results||{})[m.key] !== 0));
+
+    const thead = document.getElementById('sc-compare-head');
+    thead.innerHTML = '<tr><th>Metric</th>' + selected.map(s => `<th>${s.name}<br><span style="font-size:0.6rem;opacity:0.4;">${s.model.toUpperCase()}</span></th>`).join('') + '<th>Delta</th></tr>';
+
+    const tbody = document.getElementById('sc-compare-body');
+    tbody.innerHTML = '';
+
+    activeMetrics.forEach(m => {
+        const vals = selected.map(s => parseFloat((s.results||{})[m.key]) || 0);
+        const minVal = Math.min(...vals.filter(v => v > 0));
+        const maxVal = Math.max(...vals);
+        const delta = maxVal - minVal;
+        const deltaPct = minVal > 0 ? ((delta / minVal) * 100).toFixed(1) : '0';
+
+        let cells = vals.map(v => {
+            const isBest = v === minVal && vals.filter(x=>x===v).length === 1 && v > 0;
+            const isWorst = v === maxVal && vals.filter(x=>x===v).length === 1 && vals.length > 1 && maxVal !== minVal;
+            const cls = isBest ? 'sc-best' : (isWorst ? 'sc-worst' : '');
+            return `<td class="${cls}">${v > 0 ? v.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:4}) : '—'}${isBest ? ' ★' : ''}</td>`;
+        }).join('');
+
+        const deltaClass = delta > 0 ? 'positive' : '';
+        tbody.innerHTML += `<tr>
+            <td style="font-weight:600;">${m.label}</td>
+            ${cells}
+            <td><span class="sc-delta ${deltaClass}">${delta > 0 ? delta.toLocaleString(undefined,{maximumFractionDigits:2}) + ' (' + deltaPct + '%)' : '—'}</span></td>
+        </tr>`;
+    });
+}
+
+async function scExportComparison() {
+    const all = scGetScenarios();
+    const selected = all.filter(s => scSelectedIds.has(s.id));
+    if (selected.length < 2) { alert('Select at least 2 scenarios to export.'); return; }
+    try {
+        const r = await fetch('/api/export_scenario_report', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify({scenarios: selected})
+        });
+        if (!r.ok) { alert('Export failed.'); return; }
+        const blob = await r.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        a.download = 'Scenario_Comparison.xlsx';
+        a.click();
+        URL.revokeObjectURL(a.href);
+    } catch(e) { alert('Export error: ' + e.message); }
+}
+
+// ═══════════════ REPORT EXPORT (Feature 6) ═══════════════
+function rptUpdateTimestamp() {
+    const el = document.getElementById('rpt-timestamp');
+    if (el) el.textContent = 'Last calc: ' + new Date().toLocaleString();
+}
+
+async function rptExportExcel() {
+    const modelData = captureCurrentModelData();
+    if (!modelData) { alert('Calculate a model first.'); return; }
+    // Use existing generic export + custom model support
+    const modelType = modelData.model;
+    const payload = {model_type: modelType, data: modelData.results};
+    try {
+        const r = await fetch('/api/export_generic_excel', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(payload)
+        });
+        if (!r.ok) { alert('Export failed.'); return; }
+        const blob = await r.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        const ts = new Date().toISOString().slice(0,16).replace(/[:-]/g,'');
+        a.download = `Packfora_${modelType}_Report_${ts}.xlsx`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    } catch(e) { alert('Export error: ' + e.message); }
+}
+
+async function rptExportPDF() {
+    const modelData = captureCurrentModelData();
+    if (!modelData) { alert('Calculate a model first.'); return; }
+    const modelType = modelData.model;
+    const payload = {model_type: modelType, data: modelData.results};
+    try {
+        const r = await fetch('/api/export_generic_pdf', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body:JSON.stringify(payload)
+        });
+        if (!r.ok) {
+            const errData = await r.json().catch(()=>({}));
+            alert('PDF export failed: ' + (errData.error || 'Server error. Ensure reportlab is installed.'));
+            return;
+        }
+        const blob = await r.blob();
+        const a = document.createElement('a');
+        a.href = URL.createObjectURL(blob);
+        const ts = new Date().toISOString().slice(0,16).replace(/[:-]/g,'');
+        a.download = `Packfora_${modelType}_Report_${ts}.pdf`;
+        a.click();
+        URL.revokeObjectURL(a.href);
+    } catch(e) { alert('Export error: ' + e.message); }
 }
 
 // --- INIT ---
 document.addEventListener('DOMContentLoaded', function() {
-    switchSubTab('essentials'); 
+    // Hide advanced tab button for viewers
+    if (window.__userRole === 'viewer') {
+        var advBtn = document.getElementById('btn-advanced');
+        if (advBtn) advBtn.style.display = 'none';
+    }
+    // Auto-switch to view from query param (set by server)
+    var requestedView = window.__calcView || 'essentials';
+    if (requestedView === 'advanced' && window.__userRole !== 'viewer') {
+        // Auto-unlock advanced for authorized users (server already checked role)
+        isAdvancedLoggedIn = true;
+        switchSubTab('advanced');
+    } else {
+        switchSubTab('essentials');
+    }
     if(document.getElementById('flex-layers')) renderFlexLayers();
     if(document.getElementById('country-checkboxes')) initCountryCheckboxes();
     loadMachinesFromDB();
     loadCartonMachinesFromDB();
     refreshSKUDropdown();
+    // Init scenario comparison
+    if (typeof scRenderList === 'function') scRenderList();
+    if (typeof rptUpdateTimestamp === 'function') rptUpdateTimestamp();
 });
 </script>
-"""# ================= APPLICATION STARTUP =================
+"""
+
+# ================= GLOBAL MATERIAL TRACKER — API ENDPOINTS =================
+
+@app.route("/api/gm_init", methods=["GET"])
+@login_required
+def api_gm_init():
+    """Return commodities, countries, portfolios for the global material tracker."""
+    try:
+        df = _load_global_material_df()
+        if df is None:
+            return jsonify({"error": "Global material data not loaded"}), 500
+        commodities = sorted(df['Commodity'].dropna().astype(str).str.strip().unique().tolist())
+        countries = sorted(df['Country'].dropna().astype(str).str.strip().unique().tolist())
+        portfolios = sorted(df['Portfolio'].dropna().astype(str).str.strip().unique().tolist())
+        quarters = _gm_quarter_cols(df)
+        return jsonify({
+            "commodities": commodities,
+            "countries": countries,
+            "portfolios": portfolios,
+            "quarters": [str(q) for q in quarters]
+        })
+    except Exception as e:
+        logger.error(f"gm_init error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gm_search", methods=["POST"])
+@login_required
+def api_gm_search():
+    """Search global material prices. Returns multi-currency price data + trend."""
+    try:
+        d = request.json or {}
+        commodity = d.get('commodity', '')
+        country = d.get('country', '')
+        portfolio = d.get('portfolio', '')
+        quarter = d.get('quarter', 'all')
+
+        df = _load_global_material_df()
+        if df is None:
+            return jsonify({"error": "Data not loaded"}), 500
+
+        mask = pd.Series(True, index=df.index)
+        if commodity:
+            mask &= df['Commodity'].astype(str).str.strip() == commodity.strip()
+        if country:
+            mask &= df['Country'].astype(str).str.strip() == country.strip()
+        if portfolio:
+            mask &= df['Portfolio'].astype(str).str.strip() == portfolio.strip()
+
+        subset = df[mask]
+        if subset.empty:
+            return jsonify({"error": "No data found for selected filters"}), 404
+
+        qcols = _gm_quarter_cols(df)
+        if quarter and quarter != 'all':
+            qcols = [q for q in qcols if str(q).strip() == quarter.strip()]
+        if not qcols:
+            return jsonify({"error": f"No data found for quarter: {quarter}"}), 404
+        rates = _get_fx_rates()
+        eur_to_usd = rates.get('USD', 1.08)
+
+        results = []
+        for _, row in subset.iterrows():
+            loc = str(row.get('Country', '')).strip()
+            comm = str(row.get('Commodity', '')).strip()
+            pf = str(row.get('Portfolio', '')).strip()
+            src = str(row.get('Source', row.get('Data Source', ''))).strip()
+            idx = str(row.get('Index', '')).strip()
+            uom = str(row.get('UOM', 'MT')).strip()
+
+            home_code, home_sym = _country_ccy(loc)
+            eur_to_home = rates.get(home_code, 1.0)
+
+            prices_eur = []
+            labels = []
+            for qc in qcols:
+                try:
+                    v = float(row[qc])
+                    if v > 0:
+                        prices_eur.append(round(v, 2))
+                        labels.append(str(qc))
+                except:
+                    pass
+
+            if not prices_eur:
+                continue
+
+            curr_eur = prices_eur[-1]
+            change_pct = 0
+            if len(prices_eur) > 1 and prices_eur[0] > 0:
+                change_pct = round(((curr_eur - prices_eur[0]) / prices_eur[0]) * 100, 2)
+            trend = 'Rising' if change_pct > 2 else ('Falling' if change_pct < -2 else 'Stable')
+
+            results.append({
+                "commodity": comm,
+                "country": loc,
+                "portfolio": pf,
+                "source": src,
+                "index": idx,
+                "uom": uom,
+                "curr_eur": round(curr_eur, 2),
+                "curr_usd": round(curr_eur * eur_to_usd, 2),
+                "curr_home": round(curr_eur * eur_to_home, 2),
+                "home_code": home_code,
+                "home_symbol": home_sym,
+                "change_pct": change_pct,
+                "trend": trend,
+                "quarters": labels,
+                "prices_eur": prices_eur,
+                "prices_usd": [round(p * eur_to_usd, 2) for p in prices_eur],
+                "prices_home": [round(p * eur_to_home, 2) for p in prices_eur],
+            })
+
+        if not results:
+            return jsonify({"error": "No valid price data found"}), 404
+
+        return jsonify({
+            "results": results,
+            "count": len(results),
+            "fx": {"eur_usd": round(eur_to_usd, 4)}
+        })
+    except Exception as e:
+        logger.error(f"gm_search error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gm_compare", methods=["POST"])
+@login_required
+def api_gm_compare():
+    """Cross-country comparison for a specific commodity."""
+    try:
+        d = request.json or {}
+        commodity = d.get('commodity', '')
+        countries = d.get('countries', [])
+        quarter = d.get('quarter', 'all')
+        if not commodity:
+            return jsonify({"error": "Commodity required"}), 400
+        if len(countries) < 2:
+            return jsonify({"error": "Select at least 2 countries"}), 400
+
+        df = _load_global_material_df()
+        if df is None:
+            return jsonify({"error": "Data not loaded"}), 500
+
+        subset = df[df['Commodity'].astype(str).str.strip() == commodity.strip()]
+        subset = subset[subset['Country'].astype(str).str.strip().isin([c.strip() for c in countries])]
+
+        if subset.empty:
+            return jsonify({"error": "No data found"}), 404
+
+        qcols = _gm_quarter_cols(df)
+        if quarter and quarter != 'all':
+            qcols = [q for q in qcols if str(q).strip() == quarter.strip()]
+        if not qcols:
+            return jsonify({"error": f"No data found for quarter: {quarter}"}), 404
+        rates = _get_fx_rates()
+        eur_to_usd = rates.get('USD', 1.08)
+
+        comparison = []
+        for _, row in subset.iterrows():
+            loc = str(row.get('Country', '')).strip()
+            home_code, home_sym = _country_ccy(loc)
+            eur_to_home = rates.get(home_code, 1.0)
+
+            prices_eur = []
+            labels = []
+            for qc in qcols:
+                try:
+                    v = float(row[qc])
+                    if v > 0:
+                        prices_eur.append(round(v, 2))
+                        labels.append(str(qc))
+                except:
+                    pass
+
+            if not prices_eur:
+                continue
+
+            curr_eur = prices_eur[-1]
+            change_pct = 0
+            if len(prices_eur) > 1 and prices_eur[0] > 0:
+                change_pct = round(((curr_eur - prices_eur[0]) / prices_eur[0]) * 100, 2)
+            trend = 'Rising' if change_pct > 2 else ('Falling' if change_pct < -2 else 'Stable')
+
+            comparison.append({
+                "country": loc,
+                "portfolio": str(row.get('Portfolio', '')).strip(),
+                "source": str(row.get('Source', row.get('Data Source', ''))).strip(),
+                "curr_eur": curr_eur,
+                "curr_usd": round(curr_eur * eur_to_usd, 2),
+                "curr_home": round(curr_eur * eur_to_home, 2),
+                "home_code": home_code,
+                "home_symbol": home_sym,
+                "change_pct": change_pct,
+                "trend": trend,
+                "quarters": labels,
+                "prices_eur": prices_eur,
+                "prices_usd": [round(p * eur_to_usd, 2) for p in prices_eur],
+            })
+
+        if len(comparison) < 2:
+            return jsonify({"error": "Insufficient comparable data (need 2+ countries with data)"}), 404
+
+        comparison.sort(key=lambda x: x['curr_eur'])
+        spread = comparison[-1]['curr_eur'] - comparison[0]['curr_eur']
+
+        return jsonify({
+            "commodity": commodity,
+            "comparison": comparison,
+            "summary": {
+                "cheapest": comparison[0]['country'],
+                "most_expensive": comparison[-1]['country'],
+                "spread_eur": round(spread, 2),
+                "spread_usd": round(spread * eur_to_usd, 2),
+                "total": len(comparison)
+            }
+        })
+    except Exception as e:
+        logger.error(f"gm_compare error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/gm_countries_for_commodity", methods=["POST"])
+@login_required
+def api_gm_countries_for_commodity():
+    """Return countries that have data for a given commodity."""
+    try:
+        d = request.json or {}
+        commodity = d.get('commodity', '')
+        if not commodity:
+            return jsonify({"error": "commodity required"}), 400
+        df = _load_global_material_df()
+        if df is None:
+            return jsonify({"error": "Data not loaded"}), 500
+        subset = df[df['Commodity'].astype(str).str.strip() == commodity.strip()]
+        countries = sorted(subset['Country'].dropna().astype(str).str.strip().unique().tolist())
+        return jsonify({"countries": countries})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+# ================= GLOBAL MATERIAL TRACKER — UI TEMPLATE =================
+# ================= UNIFIED MATERIAL PRICE TRACKER API =================
+
+@app.route("/api/material_init", methods=["GET"])
+@login_required
+def api_material_init():
+    """Return all data needed to populate the unified Material Price Tracker dropdowns."""
+    try:
+        result = {
+            "resin_materials": [],
+            "global_materials": [],
+            "global_countries": [],
+            "global_regions": [],
+        }
+
+        # ── Resin sheets (India) ──
+        try:
+            xls = load_excel_cached('resin')
+            if isinstance(xls, pd.DataFrame):
+                xls = pd.ExcelFile(RESIN_EXCEL)
+            result["resin_materials"] = [s for s in xls.sheet_names if s.lower() != 'unknown']
+        except Exception as e:
+            logger.warning(f"material_init: resin load failed: {e}")
+
+        # ── Global materials ──
+        try:
+            df = _load_global_material_df()
+            if df is not None:
+                result["global_materials"] = sorted(df['Commodity'].dropna().astype(str).str.strip().unique().tolist())
+                result["global_countries"] = sorted(df['Country'].dropna().astype(str).str.strip().unique().tolist())
+                if 'Portfolio' in df.columns:
+                    result["global_portfolios"] = sorted(df['Portfolio'].dropna().astype(str).str.strip().unique().tolist())
+                # Extract quarters for duration filter
+                qcols = _gm_quarter_cols(df)
+                result["global_quarters"] = [str(q) for q in qcols]
+        except Exception as e:
+            logger.warning(f"material_init: global load failed: {e}")
+
+        return jsonify(result)
+    except Exception as e:
+        logger.error(f"material_init error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/material_prices", methods=["GET"])
+@login_required
+def api_material_prices():
+    """Unified Material Price API.
+    Query params: country, material, region, supplier, grade, duration
+    Routes to resin data (India) or global material data (non-India) automatically.
+    """
+    try:
+        country   = request.args.get('country', '').strip()
+        material  = request.args.get('material', '').strip()
+        region    = request.args.get('region', '').strip()
+        supplier  = request.args.get('supplier', '').strip()
+        grade     = request.args.get('grade', '').strip()
+        duration  = request.args.get('duration', '12').strip()
+
+        if not material:
+            return jsonify({"error": "material is required"}), 400
+
+        # ═══════════ INDIA → Resin path ═══════════
+        if country == 'India':
+            df = clean_resin_df(material)
+            meta_cols = ["Supplier", "Country", "Location", "Grade", "Unit"]
+
+            # Apply filters
+            subset = df.copy()
+            if supplier:
+                subset = subset[subset["Location"].astype(str).str.strip() == supplier.strip()]
+            if grade:
+                subset = subset[subset["Grade"].astype(str).str.strip() == grade.strip()]
+
+            if subset.empty:
+                return jsonify({"error": "No data found for selected filters"}), 404
+
+            row = subset.iloc[0]
+
+            all_dates = []
+            all_values = []
+            for col in df.columns:
+                if col not in meta_cols and not str(col).startswith("Unnamed"):
+                    try:
+                        v = float(row[col])
+                        if v > 0:
+                            all_dates.append(str(col))
+                            all_values.append(v)
+                    except:
+                        continue
+
+            iso_all, labels_all, values_all = sort_date_series(all_dates, all_values)
+
+            # Apply duration trim
+            if duration != "all" and iso_all:
+                months_to_keep = int(duration)
+                keep_count = min(months_to_keep, len(iso_all))
+                iso_dates = iso_all[-keep_count:]
+                labels = labels_all[-keep_count:]
+                values = values_all[-keep_count:]
+            else:
+                iso_dates = iso_all
+                labels = labels_all
+                values = values_all
+
+            if not values:
+                return jsonify({"error": "No price data available"}), 404
+
+            curr = values[-1]
+            diff = ((curr - values[0]) / values[0] * 100) if len(values) > 1 and values[0] != 0 else 0
+            avg_price = sum(values) / len(values)
+            status = "BULLISH" if diff > 1.2 else "BEARISH" if diff < -1.2 else "STABLE"
+
+            return jsonify({
+                "material": material,
+                "country": "India",
+                "currency": "INR",
+                "currency_symbol": "₹",
+                "source": "resin",
+                "series": [{"date": d, "label": l, "price": v} for d, l, v in zip(iso_dates, labels, values)],
+                "insights": {
+                    "current": round(curr, 2),
+                    "previous": round(values[0], 2),
+                    "change_pct": round(diff, 2),
+                    "avg": round(avg_price, 2),
+                    "min": round(min(values), 2),
+                    "max": round(max(values), 2),
+                    "status": status,
+                },
+                "meta": {
+                    "supplier": str(row.get("Location", "")),
+                    "grade": str(row.get("Grade", "")),
+                }
+            })
+
+        # ═══════════ NON-INDIA → Global material path ═══════════
+        else:
+            df = _load_global_material_df()
+            if df is None:
+                return jsonify({"error": "Global material data not loaded"}), 500
+
+            mask = df['Commodity'].astype(str).str.strip() == material
+            if country:
+                mask &= df['Country'].astype(str).str.strip() == country
+            if region:
+                # Region could be in Country or Portfolio column
+                mask &= (df['Country'].astype(str).str.strip() == region) | (df.get('Portfolio', pd.Series()).astype(str).str.strip() == region)
+
+            subset = df[mask]
+            if subset.empty:
+                return jsonify({"error": "No data found for selected filters"}), 404
+
+            qcols = _gm_quarter_cols(df)
+            rates = _get_fx_rates()
+
+            row = subset.iloc[0]
+            loc = str(row.get('Country', '')).strip()
+            home_code, home_sym = _country_ccy(loc if loc else country)
+            eur_to_home = rates.get(home_code, 1.0)
+            eur_to_usd = rates.get('USD', 1.08)
+
+            prices_eur = []
+            quarter_labels = []
+            for qc in qcols:
+                try:
+                    v = float(row[qc])
+                    if v > 0:
+                        prices_eur.append(round(v, 2))
+                        quarter_labels.append(str(qc))
+                except:
+                    pass
+
+            if not prices_eur:
+                return jsonify({"error": "No valid price data found"}), 404
+
+            # Apply duration trim for global (approximate: last N quarters)
+            if duration != "all":
+                try:
+                    quarters_to_keep = max(1, int(duration) // 3)
+                    if len(prices_eur) > quarters_to_keep:
+                        prices_eur = prices_eur[-quarters_to_keep:]
+                        quarter_labels = quarter_labels[-quarters_to_keep:]
+                except:
+                    pass
+
+            # Convert to local currency
+            prices_local = [round(p * eur_to_home, 2) for p in prices_eur]
+            prices_usd = [round(p * eur_to_usd, 2) for p in prices_eur]
+
+            curr_eur = prices_eur[-1]
+            change_pct = round(((curr_eur - prices_eur[0]) / prices_eur[0]) * 100, 2) if len(prices_eur) > 1 and prices_eur[0] > 0 else 0
+            trend = 'BULLISH' if change_pct > 2 else ('BEARISH' if change_pct < -2 else 'STABLE')
+
+            return jsonify({
+                "material": material,
+                "country": loc or country,
+                "currency": home_code,
+                "currency_symbol": home_sym,
+                "source": "global",
+                "series": [{"date": q, "label": q, "price": p} for q, p in zip(quarter_labels, prices_local)],
+                "series_eur": [{"date": q, "price": p} for q, p in zip(quarter_labels, prices_eur)],
+                "series_usd": [{"date": q, "price": p} for q, p in zip(quarter_labels, prices_usd)],
+                "insights": {
+                    "current": round(curr_eur * eur_to_home, 2),
+                    "current_eur": round(curr_eur, 2),
+                    "current_usd": round(curr_eur * eur_to_usd, 2),
+                    "previous": round(prices_eur[0] * eur_to_home, 2),
+                    "change_pct": change_pct,
+                    "avg": round(sum(prices_local) / len(prices_local), 2),
+                    "min": round(min(prices_local), 2),
+                    "max": round(max(prices_local), 2),
+                    "status": trend,
+                },
+                "meta": {
+                    "portfolio": str(row.get('Portfolio', '')).strip(),
+                    "source": str(row.get('Source', row.get('Data Source', ''))).strip(),
+                    "uom": str(row.get('UOM', 'MT')).strip(),
+                    "home_code": home_code,
+                    "home_symbol": home_sym,
+                }
+            })
+
+    except Exception as e:
+        logger.error(f"material_prices error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/material_filters", methods=["POST"])
+@login_required
+def api_material_filters():
+    """Return dynamic sub-filters (supplier/grade for India, regions for global)
+    based on selected country + material."""
+    try:
+        d = request.json or {}
+        country = d.get('country', '').strip()
+        material = d.get('material', '').strip()
+
+        if country == 'India' and material:
+            meta = load_resin_meta(material)
+            # Pre-warm cache
+            try:
+                clean_resin_df(material)
+            except:
+                pass
+            return jsonify({
+                "type": "resin",
+                "suppliers": meta.get('locations', []),
+                "grades": meta.get('grades', []),
+            })
+        elif material:
+            df = _load_global_material_df()
+            if df is None:
+                return jsonify({"error": "Global data not loaded"}), 500
+            mask = df['Commodity'].astype(str).str.strip() == material
+            subset = df[mask]
+            countries = sorted(subset['Country'].dropna().astype(str).str.strip().unique().tolist())
+            portfolios = sorted(subset['Portfolio'].dropna().astype(str).str.strip().unique().tolist()) if 'Portfolio' in subset.columns else []
+            return jsonify({
+                "type": "global",
+                "countries": countries,
+                "portfolios": portfolios,
+            })
+        else:
+            return jsonify({"type": "none"})
+    except Exception as e:
+        logger.error(f"material_filters error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+GLOBAL_MATERIAL_UI = """
+<style>
+.gm-tabs { display:flex; gap:10px; margin-bottom:20px; border-bottom:2px solid rgba(232,96,28,0.2); }
+.gm-tab { padding:12px 24px; background:transparent; border:none; color:#e8601c; cursor:pointer; font-weight:700; font-size:0.95rem; transition:all 0.3s; border-bottom:3px solid transparent; }
+.gm-tab:hover { background:rgba(232,96,28,0.1); }
+.gm-tab.active { border-bottom-color:#e8601c; }
+.gm-pane { display:none; }
+.gm-pane.active { display:block; }
+.gm-grid { display:grid; gap:20px; }
+.gm-grid-4 { grid-template-columns:repeat(4,1fr); }
+.gm-grid-3 { grid-template-columns:repeat(3,1fr); }
+.gm-grid-5 { grid-template-columns:repeat(5,1fr); }
+.gm-result-card { background:linear-gradient(135deg,rgba(232,96,28,0.1) 0%,rgba(232,96,28,0.03) 100%); border:2px solid rgba(232,96,28,0.25); border-radius:12px; padding:20px; transition:transform 0.2s; }
+.gm-result-card:hover { transform:translateY(-3px); border-color:#e8601c; }
+.gm-result-card.best { border-color:#28a745; background:linear-gradient(135deg,rgba(40,167,69,0.12) 0%,rgba(40,167,69,0.03) 100%); }
+.gm-result-card.worst { border-color:#dc3545; background:linear-gradient(135deg,rgba(220,53,69,0.12) 0%,rgba(220,53,69,0.03) 100%); }
+.gm-price-primary { font-size:1.5rem; font-weight:900; color:var(--orange); }
+.gm-price-sub { font-size:0.78rem; opacity:0.55; font-family:'JetBrains Mono',monospace; }
+.gm-stat { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.08); }
+.gm-stat-label { opacity:0.65; font-size:0.82rem; }
+.gm-stat-val { font-weight:700; font-size:0.92rem; }
+.gm-badge { display:inline-block; padding:3px 10px; border-radius:15px; font-size:0.75rem; font-weight:700; }
+.gm-rising { background:#dc3545; color:#fff; }
+.gm-falling { background:#28a745; color:#fff; }
+.gm-stable { background:#ffc107; color:#000; }
+.gm-ccy-badge { display:inline-block; padding:2px 7px; background:rgba(232,96,28,0.2); border-radius:4px; font-size:0.7rem; font-weight:700; color:var(--orange); margin-left:5px; }
+.gm-xc-table { width:100%; border-collapse:collapse; font-size:0.88rem; }
+.gm-xc-table th { background:rgba(232,96,28,0.15); padding:12px 14px; text-align:left; font-weight:800; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.5px; color:rgba(255,255,255,0.8); border-bottom:2px solid rgba(232,96,28,0.3); }
+.gm-xc-table td { padding:11px 14px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'JetBrains Mono',monospace; font-size:0.84rem; }
+.gm-xc-table tr:hover { background:rgba(232,96,28,0.06); }
+.gm-xc-best { color:#28a745; font-weight:800; }
+.gm-xc-worst { color:#dc3545; font-weight:700; }
+.gm-pill-group { display:inline-flex; gap:0; background:rgba(255,255,255,0.08); border-radius:8px; overflow:hidden; border:1px solid rgba(255,255,255,0.12); }
+.gm-pill { padding:6px 14px; font-size:0.76rem; font-weight:700; cursor:pointer; border:none; background:transparent; color:rgba(255,255,255,0.5); font-family:'JetBrains Mono',monospace; transition:all 0.2s; }
+.gm-pill.active { background:var(--orange); color:#fff; box-shadow:0 2px 8px rgba(232,96,28,0.4); }
+.gm-pill:hover:not(.active) { background:rgba(255,255,255,0.08); color:#fff; }
+label.gm-cb-label { display:flex; align-items:center; cursor:pointer; padding:7px 10px; border-radius:6px; transition:background 0.2s; font-size:0.88rem; }
+label.gm-cb-label:hover { background:rgba(232,96,28,0.08); }
+label.gm-cb-label input { width:17px; height:17px; margin-right:8px; cursor:pointer; accent-color:var(--orange); }
+@media(max-width:768px){
+    .gm-tabs { gap:0; flex-wrap:nowrap; }
+    .gm-tab { flex:1; padding:10px 6px; font-size:0.82rem; text-align:center; white-space:nowrap; }
+    .gm-grid-4,.gm-grid-3,.gm-grid-5 { grid-template-columns:1fr; gap:12px; }
+}
+</style>
+
+<div class="gm-tabs">
+    <button class="gm-tab active" onclick="gmSwitchTab('search',this)">Material Prices</button>
+    <button class="gm-tab" onclick="gmSwitchTab('compare',this)">Cross-Country</button>
+</div>
+
+<!-- ══════ SEARCH TAB ══════ -->
+<div id="gm-search" class="gm-pane active">
+<h2>Global Material Price Tracker</h2>
+<div class="card">
+    <div class="gm-grid gm-grid-5">
+        <div>
+            <label style="display:block;font-size:.75rem;margin-bottom:10px;font-weight:800;opacity:0.9">COMMODITY</label>
+            <select id="gm-commodity" onchange="gmFilterChanged()"><option value="">Loading...</option></select>
+        </div>
+        <div>
+            <label style="display:block;font-size:.75rem;margin-bottom:10px;font-weight:800;opacity:0.9">COUNTRY / REGION</label>
+            <select id="gm-country"><option value="">All Countries</option></select>
+        </div>
+        <div>
+            <label style="display:block;font-size:.75rem;margin-bottom:10px;font-weight:800;opacity:0.9">PORTFOLIO</label>
+            <select id="gm-portfolio"><option value="">All Portfolios</option></select>
+        </div>
+        <div>
+            <label style="display:block;font-size:.75rem;margin-bottom:10px;font-weight:800;opacity:0.9">DURATION</label>
+            <select id="gm-quarter">
+                <option value="all" selected>All Time</option>
+                <option value="Q1">Q1 2026</option>
+                <option value="Q2">Q2 2026</option>
+                <option value="Q3">Q3 2026</option>
+                <option value="Q4">Q4 2026</option>
+            </select>
+        </div>
+        <div>
+            <label style="display:block;font-size:.75rem;margin-bottom:10px;font-weight:800;opacity:0.9">DISPLAY CURRENCY</label>
+            <div class="gm-pill-group" style="margin-top:8px;">
+                <button class="gm-pill active" onclick="gmSetCcy('eur',this)">EUR</button>
+                <button class="gm-pill" onclick="gmSetCcy('usd',this)">USD</button>
+                <button class="gm-pill" onclick="gmSetCcy('home',this)">Local</button>
+            </div>
+        </div>
+    </div>
+    <button class="btn-analyze" id="gm-search-btn" onclick="gmSearch()">Search Material Prices</button>
+</div>
+<div id="gm-search-results"></div>
+</div>
+
+<!-- ══════ CROSS-COUNTRY TAB ══════ -->
+<div id="gm-compare" class="gm-pane">
+<h2>Cross-Country Material Comparison</h2>
+<p style="opacity:0.65;margin-bottom:20px;font-size:0.88rem;">Compare the same commodity across countries — prices normalised to EUR & USD.</p>
+<div class="card">
+    <div class="gm-grid gm-grid-4">
+        <div>
+            <label style="display:block;font-size:.75rem;margin-bottom:10px;font-weight:800;opacity:0.9">COMMODITY</label>
+            <select id="gm-xc-commodity" onchange="gmLoadXCCountries()"><option value="">Loading...</option></select>
+        </div>
+        <div>
+            <label style="display:block;font-size:.75rem;margin-bottom:10px;font-weight:800;opacity:0.9">DURATION</label>
+            <select id="gm-xc-quarter">
+                <option value="all" selected>All Time</option>
+                <option value="Q1">Q1 2026</option>
+                <option value="Q2">Q2 2026</option>
+                <option value="Q3">Q3 2026</option>
+                <option value="Q4">Q4 2026</option>
+            </select>
+        </div>
+        <div>
+            <label style="display:block;font-size:.75rem;margin-bottom:10px;font-weight:800;opacity:0.9">DISPLAY CURRENCY</label>
+            <select id="gm-xc-ccy">
+                <option value="eur" selected>EUR (€)</option>
+                <option value="usd">USD ($)</option>
+            </select>
+        </div>
+        <div style="display:flex;align-items:end;">
+            <button class="btn-analyze" id="gm-xc-btn" onclick="gmCompare()" disabled style="margin:0;width:100%;">Compare Countries</button>
+        </div>
+    </div>
+    <div style="margin-top:20px;">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;">
+            <label style="font-size:.75rem;font-weight:800;opacity:0.9">SELECT COUNTRIES</label>
+            <button onclick="gmToggleAllXC()" id="gm-xc-toggle" style="padding:5px 14px;font-size:0.78rem;border-radius:5px;border:1px solid var(--orange);background:transparent;color:var(--orange);cursor:pointer;font-weight:700;">Select All</button>
+        </div>
+        <div id="gm-xc-countries" style="display:grid;grid-template-columns:repeat(auto-fill,minmax(180px,1fr));gap:8px;max-height:300px;overflow-y:auto;padding-right:5px;"></div>
+    </div>
+</div>
+<div id="gm-xc-results"></div>
+</div>
+
+<script>
+let _gmCcy = 'eur';
+let _gmData = null;
+
+function gmSwitchTab(id, btn) {
+    document.querySelectorAll('.gm-tab').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('.gm-pane').forEach(p=>p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('gm-'+id).classList.add('active');
+}
+
+function gmSetCcy(c, btn) {
+    _gmCcy = c;
+    document.querySelectorAll('.gm-pill').forEach(p=>p.classList.remove('active'));
+    btn.classList.add('active');
+    if (_gmData) gmRenderResults(_gmData);
+}
+
+function gmFilterChanged() {}
+
+// ── INIT ──
+(async function gmInit() {
+    try {
+        const r = await fetch('/api/gm_init');
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error||'Failed');
+        const cs = document.getElementById('gm-commodity');
+        const xs = document.getElementById('gm-xc-commodity');
+        cs.innerHTML = '<option value="">All Commodities</option>' + d.commodities.map(c=>'<option>'+c+'</option>').join('');
+        xs.innerHTML = '<option value="">Select Commodity...</option>' + d.commodities.map(c=>'<option>'+c+'</option>').join('');
+        const co = document.getElementById('gm-country');
+        co.innerHTML = '<option value="">All Countries</option>' + d.countries.map(c=>'<option>'+c+'</option>').join('');
+        const po = document.getElementById('gm-portfolio');
+        po.innerHTML = '<option value="">All Portfolios</option>' + d.portfolios.map(p=>'<option>'+p+'</option>').join('');
+        // Populate quarter dropdowns from actual data quarters
+        if (d.quarters && d.quarters.length) {
+            const qOpts = '<option value="all">All Time</option>' + d.quarters.map(q=>'<option value="'+q+'">'+q+'</option>').join('');
+            document.getElementById('gm-quarter').innerHTML = qOpts;
+            document.getElementById('gm-xc-quarter').innerHTML = qOpts;
+        }
+    } catch(e) { console.error('gmInit error:', e); }
+})();
+
+// ── SEARCH ──
+async function gmSearch() {
+    const commodity = document.getElementById('gm-commodity').value;
+    const country = document.getElementById('gm-country').value;
+    const portfolio = document.getElementById('gm-portfolio').value;
+    const quarter = document.getElementById('gm-quarter').value;
+    if (!commodity && !country && !portfolio) { alert('Select at least one filter'); return; }
+    const btn = document.getElementById('gm-search-btn');
+    btn.disabled = true; btn.innerHTML = '<span class="loading"></span> Searching...';
+    const res = document.getElementById('gm-search-results');
+    res.innerHTML = '<div class="card"><p style="opacity:0.5;text-align:center"><span class="loading"></span> Loading...</p></div>';
+    try {
+        const r = await fetch('/api/gm_search', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({commodity, country, portfolio, quarter})});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error||'Search failed');
+        _gmData = d;
+        gmRenderResults(d);
+    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#dc3545"><p style="color:#dc3545;text-align:center">'+e.message+'</p></div>'; }
+    finally { btn.disabled = false; btn.innerHTML = 'Search Material Prices'; }
+}
+
+function gmRenderResults(d) {
+    const ccy = _gmCcy;
+    const sym = ccy==='usd'?'$':ccy==='home'?'':'€';
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin:20px 0 10px;"><span style="opacity:0.6;font-size:0.85rem;">'+d.count+' result'+(d.count>1?'s':'')+'</span></div>';
+    html += '<div style="display:grid;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));gap:18px;">';
+    d.results.forEach(r => {
+        const price = ccy==='usd'?r.curr_usd:ccy==='home'?r.curr_home:r.curr_eur;
+        const ps = ccy==='usd'?'$':ccy==='home'?r.home_symbol:'€';
+        const trendCls = r.trend==='Rising'?'gm-rising':r.trend==='Falling'?'gm-falling':'gm-stable';
+        html += '<div class="gm-result-card">';
+        html += '<div style="margin-bottom:12px"><strong style="font-size:1.05rem;">'+r.commodity+'</strong><span class="gm-ccy-badge">'+r.country+'</span></div>';
+        html += '<div class="gm-price-primary">'+ps+price.toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2})+'</div>';
+        html += '<div class="gm-price-sub">€'+r.curr_eur.toLocaleString(undefined,{minimumFractionDigits:2})+' &bull; $'+r.curr_usd.toLocaleString(undefined,{minimumFractionDigits:2});
+        if (r.home_code!=='EUR'&&r.home_code!=='USD') html += ' &bull; '+r.home_symbol+r.curr_home.toLocaleString(undefined,{minimumFractionDigits:2});
+        html += '</div>';
+        html += '<div class="gm-stat"><span class="gm-stat-label">Portfolio</span><span class="gm-stat-val">'+r.portfolio+'</span></div>';
+        html += '<div class="gm-stat"><span class="gm-stat-label">Source</span><span class="gm-stat-val">'+r.source+'</span></div>';
+        html += '<div class="gm-stat"><span class="gm-stat-label">UOM</span><span class="gm-stat-val">'+r.uom+'</span></div>';
+        html += '<div class="gm-stat"><span class="gm-stat-label">Trend</span><span class="gm-badge '+trendCls+'">'+r.trend+' '+r.change_pct+'%</span></div>';
+        html += '<div id="gm-chart-'+r.country.replace(/[^a-zA-Z0-9]/g,'')+'-'+r.commodity.replace(/[^a-zA-Z0-9]/g,'')+'" style="margin-top:12px;height:120px;"></div>';
+        html += '</div>';
+    });
+    html += '</div>';
+    document.getElementById('gm-search-results').innerHTML = html;
+    // Render mini trend charts
+    d.results.forEach(r => {
+        const chartId = 'gm-chart-'+r.country.replace(/[^a-zA-Z0-9]/g,'')+'-'+r.commodity.replace(/[^a-zA-Z0-9]/g,'');
+        const el = document.getElementById(chartId);
+        if (!el) return;
+        const vals = ccy==='usd'?r.prices_usd:ccy==='home'?r.prices_home:r.prices_eur;
+        const p = ccy==='usd'?'$':ccy==='home'?r.home_symbol:'€';
+        Plotly.newPlot(chartId, [{
+            x: r.quarters, y: vals, type:'scatter', mode:'lines+markers',
+            marker:{color:'#E8601C',size:6}, line:{color:'#E8601C',width:2},
+            hovertemplate:'%{x}<br>'+p+'%{y:,.2f}<extra></extra>'
+        }], {
+            margin:{l:45,r:10,t:5,b:25}, height:120,
+            xaxis:{color:'rgba(255,255,255,0.5)',tickfont:{size:9}},
+            yaxis:{color:'rgba(255,255,255,0.5)',tickfont:{size:9},gridcolor:'rgba(255,255,255,0.05)'},
+            plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)', font:{family:'Outfit'}
+        }, {responsive:true, displayModeBar:false});
+    });
+}
+
+// ── CROSS-COUNTRY ──
+async function gmLoadXCCountries() {
+    const comm = document.getElementById('gm-xc-commodity').value;
+    const cont = document.getElementById('gm-xc-countries');
+    cont.innerHTML = '';
+    document.getElementById('gm-xc-btn').disabled = true;
+    if (!comm) return;
+    try {
+        const r = await fetch('/api/gm_countries_for_commodity', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({commodity:comm})});
+        const d = await r.json();
+        (d.countries||[]).forEach(c => {
+            const lbl = document.createElement('label');
+            lbl.className = 'gm-cb-label';
+            const cb = document.createElement('input');
+            cb.type = 'checkbox'; cb.value = c;
+            cb.onchange = () => { document.getElementById('gm-xc-btn').disabled = document.querySelectorAll('#gm-xc-countries input:checked').length < 2; };
+            lbl.appendChild(cb);
+            lbl.appendChild(document.createTextNode(c));
+            cont.appendChild(lbl);
+        });
+    } catch(e) { console.error(e); }
+}
+
+function gmToggleAllXC() {
+    const cbs = document.querySelectorAll('#gm-xc-countries input[type=checkbox]');
+    const btn = document.getElementById('gm-xc-toggle');
+    const all = Array.from(cbs).every(cb=>cb.checked);
+    cbs.forEach(cb=>cb.checked=!all);
+    btn.textContent = all?'Select All':'Deselect All';
+    document.getElementById('gm-xc-btn').disabled = document.querySelectorAll('#gm-xc-countries input:checked').length < 2;
+}
+
+async function gmCompare() {
+    const commodity = document.getElementById('gm-xc-commodity').value;
+    const ccy = document.getElementById('gm-xc-ccy').value;
+    const quarter = document.getElementById('gm-xc-quarter').value;
+    const countries = Array.from(document.querySelectorAll('#gm-xc-countries input:checked')).map(cb=>cb.value);
+    if (!commodity||countries.length<2) { alert('Select commodity and 2+ countries'); return; }
+    const btn = document.getElementById('gm-xc-btn');
+    btn.disabled = true; btn.innerHTML = '<span class="loading"></span> Comparing...';
+    const res = document.getElementById('gm-xc-results');
+    res.innerHTML = '<div class="card"><p style="opacity:0.5;text-align:center"><span class="loading"></span> Building comparison...</p></div>';
+    try {
+        const r = await fetch('/api/gm_compare', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({commodity, countries, quarter})});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error||'Failed');
+        gmRenderXC(d, ccy);
+    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#dc3545"><p style="color:#dc3545;text-align:center">'+e.message+'</p></div>'; }
+    finally { btn.disabled = false; btn.innerHTML = 'Compare Countries'; }
+}
+
+function gmRenderXC(d, ccy) {
+    const isUSD = ccy==='usd';
+    const sym = isUSD?'$':'€';
+    const sorted = [...d.comparison].sort((a,b)=>(isUSD?a.curr_usd:a.curr_eur)-(isUSD?b.curr_usd:b.curr_eur));
+    const bestRaw = isUSD?sorted[0].curr_usd:sorted[0].curr_eur;
+
+    let html = '<div class="card" style="border:2px solid var(--orange);margin-top:20px;overflow-x:auto;">';
+    html += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;flex-wrap:wrap;gap:10px;">';
+    html += '<h3 style="margin:0;">'+d.commodity+' — Cross-Country Benchmark</h3>';
+    html += '<div class="gm-pill-group"><button class="gm-pill '+(ccy==='eur'?'active':'')+'" onclick="gmRenderXC(window._gmXCData,\\'eur\\')">EUR</button><button class="gm-pill '+(ccy==='usd'?'active':'')+'" onclick="gmRenderXC(window._gmXCData,\\'usd\\')">USD</button></div>';
+    html += '</div>';
+
+    // Summary bar
+    html += '<div style="display:flex;gap:30px;flex-wrap:wrap;margin-bottom:18px;padding:14px;background:rgba(255,255,255,0.05);border-radius:10px;font-size:0.88rem;">';
+    html += '<div><span style="opacity:.55">Cheapest:</span> <strong style="color:#28a745">'+d.summary.cheapest+'</strong></div>';
+    html += '<div><span style="opacity:.55">Most Expensive:</span> <strong style="color:#dc3545">'+d.summary.most_expensive+'</strong></div>';
+    html += '<div><span style="opacity:.55">Spread:</span> <strong>'+sym+(isUSD?d.summary.spread_usd:d.summary.spread_eur).toLocaleString(undefined,{minimumFractionDigits:2})+'</strong></div>';
+    html += '<div><span style="opacity:.55">Countries:</span> <strong>'+d.summary.total+'</strong></div>';
+    html += '</div>';
+
+    // Table
+    html += '<table class="gm-xc-table"><thead><tr><th>#</th><th>Country</th><th>Price ('+sym+')</th><th>Portfolio</th><th>Trend</th><th>Home Currency</th><th>vs Best</th></tr></thead><tbody>';
+    sorted.forEach((loc,idx)=>{
+        const price = isUSD?loc.curr_usd:loc.curr_eur;
+        const raw = price;
+        const pctVsBest = bestRaw>0?((raw-bestRaw)/bestRaw*100):0;
+        const isBest = idx===0;
+        const isWorst = idx===sorted.length-1;
+        const cls = isBest?'gm-xc-best':(isWorst?'gm-xc-worst':'');
+        const trendCls = loc.trend==='Rising'?'gm-rising':loc.trend==='Falling'?'gm-falling':'gm-stable';
+        html += '<tr>';
+        html += '<td style="font-weight:800;'+(isBest?'color:#28a745':isWorst?'color:#dc3545':'')+'">'+String(idx+1)+'</td>';
+        html += '<td style="font-weight:700;">'+loc.country+'<span class="gm-ccy-badge">'+loc.home_code+'</span></td>';
+        html += '<td class="'+cls+'">'+sym+price.toLocaleString(undefined,{minimumFractionDigits:2})+(isBest?' ★':'')+'</td>';
+        html += '<td>'+loc.portfolio+'</td>';
+        html += '<td><span class="gm-badge '+trendCls+'">'+loc.trend+' '+loc.change_pct+'%</span></td>';
+        html += '<td>'+loc.home_symbol+loc.curr_home.toLocaleString(undefined,{minimumFractionDigits:2})+'</td>';
+        html += '<td style="font-weight:700;'+(pctVsBest>10?'color:#dc3545':pctVsBest>0?'color:#ffc107':'color:#28a745')+'">'+(pctVsBest>0?'+':'')+pctVsBest.toFixed(1)+'%</td>';
+        html += '</tr>';
+    });
+    html += '</tbody></table>';
+    html += '</div>';
+
+    // Bar chart
+    html += '<div class="card" style="margin-top:18px;"><div id="gm-xc-bar"></div></div>';
+
+    // Trend overlay chart
+    html += '<div class="card" style="margin-top:18px;"><div id="gm-xc-trend"></div></div>';
+
+    document.getElementById('gm-xc-results').innerHTML = html;
+    window._gmXCData = d;
+
+    // Bar chart
+    const barNames = sorted.map(s=>s.country);
+    const barVals = sorted.map(s=>isUSD?s.curr_usd:s.curr_eur);
+    const barColors = sorted.map((s,i)=>i===0?'#28a745':(i===sorted.length-1?'#dc3545':'#E8601C'));
+    Plotly.newPlot('gm-xc-bar', [{
+        x:barNames, y:barVals, type:'bar',
+        marker:{color:barColors, line:{color:'rgba(255,255,255,0.15)',width:1}},
+        text:barVals.map(v=>sym+v.toFixed(2)), textposition:'outside',
+        textfont:{color:'white',family:'JetBrains Mono',size:11},
+        hovertemplate:'%{x}<br>'+sym+'%{y:,.2f}<extra></extra>'
+    }], {
+        title:{text:d.commodity+' — Price by Country ('+sym+')', font:{color:'white',size:16,family:'Outfit'}},
+        xaxis:{color:'white',tickangle:-30,tickfont:{size:10}},
+        yaxis:{title:sym+' / unit',color:'white',gridcolor:'rgba(255,255,255,0.06)'},
+        plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
+        font:{color:'white',family:'Outfit'}, margin:{b:100}
+    }, {responsive:true});
+
+    // Trend overlay chart
+    const traces = sorted.map((loc,i)=>{
+        const vals = isUSD?loc.prices_usd:loc.prices_eur;
+        const colors = ['#E8601C','#3b82f6','#10b981','#f59e0b','#8b5cf6','#ec4899','#06b6d4','#84cc16','#f97316','#6366f1'];
+        return {
+            x:loc.quarters, y:vals, type:'scatter', mode:'lines+markers', name:loc.country,
+            line:{color:colors[i%colors.length],width:2}, marker:{size:5},
+            hovertemplate:loc.country+'<br>%{x}: '+sym+'%{y:,.2f}<extra></extra>'
+        };
+    });
+    Plotly.newPlot('gm-xc-trend', traces, {
+        title:{text:'Quarterly Trend Overlay', font:{color:'white',size:16,family:'Outfit'}},
+        xaxis:{color:'white',tickfont:{size:10}},
+        yaxis:{title:sym+' / unit',color:'white',gridcolor:'rgba(255,255,255,0.06)'},
+        plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
+        font:{color:'white',family:'Outfit'}, legend:{font:{color:'white',size:10}}
+    }, {responsive:true});
+}
+</script>
+"""
+
+# ================= UNIFIED MATERIAL PRICE TRACKER UI =================
+MATERIAL_TRACKER_UI = """
+<style>
+/* ── Unified Material Tracker Styles ── */
+.mt-header { margin-bottom: 28px; }
+.mt-header h2 { font-size: 1.6rem; font-weight: 800; margin-bottom: 6px; }
+.mt-header p { opacity: 0.6; font-size: 0.88rem; }
+
+.mt-form-grid { display: grid; gap: 18px; }
+.mt-grid-5 { grid-template-columns: repeat(5, 1fr); }
+.mt-grid-4 { grid-template-columns: repeat(4, 1fr); }
+.mt-grid-3 { grid-template-columns: repeat(3, 1fr); }
+.mt-grid-2 { grid-template-columns: repeat(2, 1fr); }
+
+.mt-field label {
+    display: block; font-size: 0.72rem; margin-bottom: 8px;
+    font-weight: 800; opacity: 0.85; text-transform: uppercase; letter-spacing: 0.5px;
+}
+.mt-field select, .mt-field input {
+    width: 100%; padding: 10px 14px; border-radius: 8px;
+    border: 1px solid rgba(255,255,255,0.15); background: rgba(255,255,255,0.06);
+    color: white; font-size: 0.9rem; font-family: 'Outfit', sans-serif;
+    transition: border-color 0.2s;
+}
+.mt-field select:focus, .mt-field input:focus {
+    outline: none; border-color: var(--orange);
+}
+.mt-field select option { background: #1e293b; color: white; }
+
+.mt-hidden { display: none !important; }
+
+.mt-kpi-strip {
+    display: grid; grid-template-columns: repeat(6, 1fr); gap: 14px;
+    margin: 22px 0;
+}
+.mt-kpi {
+    background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px; padding: 16px; text-align: center;
+}
+.mt-kpi-label { font-size: 0.7rem; opacity: 0.5; text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 6px; }
+.mt-kpi-value { font-size: 1.15rem; font-weight: 800; }
+.mt-kpi-sub { font-size: 0.72rem; opacity: 0.45; margin-top: 3px; font-family: 'JetBrains Mono', monospace; }
+
+.mt-status-badge {
+    display: inline-block; padding: 5px 14px; border-radius: 20px;
+    font-size: 0.78rem; font-weight: 800; letter-spacing: 0.3px;
+}
+.mt-status-BULLISH { background: #dc3545; color: #fff; }
+.mt-status-BEARISH { background: #28a745; color: #fff; }
+.mt-status-STABLE  { background: #ffc107; color: #000; }
+
+.mt-chart-wrap { margin-top: 22px; }
+
+.mt-source-tag {
+    display: inline-block; padding: 3px 10px; border-radius: 5px;
+    font-size: 0.7rem; font-weight: 700; margin-left: 8px;
+    text-transform: uppercase; letter-spacing: 0.3px;
+}
+.mt-source-resin  { background: rgba(232,96,28,0.2); color: var(--orange); }
+.mt-source-global { background: rgba(59,130,246,0.2); color: #3b82f6; }
+
+.mt-meta-row {
+    display: flex; gap: 24px; flex-wrap: wrap; margin-top: 14px;
+    padding: 12px 16px; background: rgba(255,255,255,0.03);
+    border-radius: 8px; font-size: 0.82rem;
+}
+.mt-meta-item { opacity: 0.6; }
+.mt-meta-item strong { opacity: 1; color: white; margin-left: 4px; }
+
+@media (max-width: 900px) {
+    .mt-grid-5, .mt-grid-4 { grid-template-columns: repeat(2, 1fr); }
+    .mt-kpi-strip { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 600px) {
+    .mt-grid-5, .mt-grid-4, .mt-grid-3 { grid-template-columns: 1fr; }
+    .mt-kpi-strip { grid-template-columns: repeat(2, 1fr); }
+}
+</style>
+
+<div class="mt-header">
+    <h2>Material Price Tracker</h2>
+    <p>Unified commodity intelligence — India resin prices &amp; global material costs in one view.</p>
+</div>
+
+<div class="card" id="mt-filters-card">
+    <div class="mt-form-grid mt-grid-5" id="mt-filter-row">
+        <!-- Country -->
+        <div class="mt-field">
+            <label>Country</label>
+            <select id="mt-country" onchange="mtCountryChanged()">
+                <option value="India">India</option>
+            </select>
+        </div>
+        <!-- Material (dynamic) -->
+        <div class="mt-field">
+            <label>Material</label>
+            <select id="mt-material" onchange="mtMaterialChanged()">
+                <option value="">Select Country First</option>
+            </select>
+        </div>
+        <!-- Supplier (India only) -->
+        <div class="mt-field" id="mt-supplier-wrap">
+            <label>Supplier / Location</label>
+            <select id="mt-supplier"><option value="">Loading...</option></select>
+        </div>
+        <!-- Grade (India only) -->
+        <div class="mt-field" id="mt-grade-wrap">
+            <label>Grade</label>
+            <select id="mt-grade"><option value="">Loading...</option></select>
+        </div>
+        <!-- Region (global only) -->
+        <div class="mt-field mt-hidden" id="mt-region-wrap">
+            <label>Region / Portfolio</label>
+            <select id="mt-region"><option value="">All Regions</option></select>
+        </div>
+        <!-- Duration -->
+        <div class="mt-field">
+            <label>Duration</label>
+            <select id="mt-duration">
+                <option value="3">Last 3 Months</option>
+                <option value="6">Last 6 Months</option>
+                <option value="12" selected>Last 1 Year</option>
+                <option value="24">Last 2 Years</option>
+                <option value="all">All Time</option>
+            </select>
+        </div>
+    </div>
+    <button class="btn-analyze" id="mt-analyze-btn" onclick="mtAnalyze()" disabled>
+        Generate Analysis
+    </button>
+</div>
+
+<div id="mt-results"></div>
+
+<script>
+// ═══════════ Unified Material Tracker JS ═══════════
+let _mtInitData = null;
+
+// ── Init: load all dropdown data ──
+(async function mtInit() {
+    try {
+        const r = await fetch('/api/material_init');
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Init failed');
+        _mtInitData = d;
+
+        // Populate country dropdown: India + all global countries
+        const cSel = document.getElementById('mt-country');
+        let opts = '<option value="India">India</option>';
+        (d.global_countries || []).forEach(c => {
+            if (c !== 'India') opts += '<option value="' + c + '">' + c + '</option>';
+        });
+        cSel.innerHTML = opts;
+
+        // Trigger initial material load for India
+        mtCountryChanged();
+    } catch (e) {
+        console.error('mtInit error:', e);
+    }
+})();
+
+function mtCountryChanged() {
+    if (!_mtInitData) return;
+    const country = document.getElementById('mt-country').value;
+    const matSel = document.getElementById('mt-material');
+    const supWrap = document.getElementById('mt-supplier-wrap');
+    const grdWrap = document.getElementById('mt-grade-wrap');
+    const regWrap = document.getElementById('mt-region-wrap');
+
+    if (country === 'India') {
+        // Show India resin materials
+        const mats = _mtInitData.resin_materials || [];
+        matSel.innerHTML = '<option value="">Select Material...</option>' + mats.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+        supWrap.classList.remove('mt-hidden');
+        grdWrap.classList.remove('mt-hidden');
+        regWrap.classList.add('mt-hidden');
+        // Reset sub-filters
+        document.getElementById('mt-supplier').innerHTML = '<option value="">Select Material First</option>';
+        document.getElementById('mt-grade').innerHTML = '<option value="">Select Material First</option>';
+    } else {
+        // Show global commodity materials
+        const mats = _mtInitData.global_materials || [];
+        matSel.innerHTML = '<option value="">Select Material...</option>' + mats.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+        supWrap.classList.add('mt-hidden');
+        grdWrap.classList.add('mt-hidden');
+        regWrap.classList.remove('mt-hidden');
+        document.getElementById('mt-region').innerHTML = '<option value="">All Regions</option>';
+    }
+    document.getElementById('mt-analyze-btn').disabled = true;
+    document.getElementById('mt-results').innerHTML = '';
+}
+
+async function mtMaterialChanged() {
+    const country = document.getElementById('mt-country').value;
+    const material = document.getElementById('mt-material').value;
+    if (!material) {
+        document.getElementById('mt-analyze-btn').disabled = true;
+        return;
+    }
+
+    document.getElementById('mt-analyze-btn').disabled = false;
+
+    // Fetch sub-filters
+    try {
+        const r = await fetch('/api/material_filters', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({country, material})
+        });
+        const d = await r.json();
+
+        if (d.type === 'resin') {
+            const supSel = document.getElementById('mt-supplier');
+            supSel.innerHTML = (d.suppliers || []).map(s => '<option value="' + s + '">' + s + '</option>').join('');
+            const grdSel = document.getElementById('mt-grade');
+            grdSel.innerHTML = (d.grades || []).map(g => '<option value="' + g + '">' + g + '</option>').join('');
+        } else if (d.type === 'global') {
+            const regSel = document.getElementById('mt-region');
+            let opts = '<option value="">All Regions</option>';
+            (d.portfolios || []).forEach(p => { opts += '<option value="' + p + '">' + p + '</option>'; });
+            regSel.innerHTML = opts;
+        }
+    } catch (e) {
+        console.error('Filter load error:', e);
+    }
+}
+
+async function mtAnalyze() {
+    const country  = document.getElementById('mt-country').value;
+    const material = document.getElementById('mt-material').value;
+    const duration = document.getElementById('mt-duration').value;
+
+    if (!material) { alert('Please select a material'); return; }
+
+    // Build query string
+    let qs = `country=${encodeURIComponent(country)}&material=${encodeURIComponent(material)}&duration=${encodeURIComponent(duration)}`;
+
+    if (country === 'India') {
+        const sup = document.getElementById('mt-supplier').value;
+        const grd = document.getElementById('mt-grade').value;
+        if (sup) qs += `&supplier=${encodeURIComponent(sup)}`;
+        if (grd) qs += `&grade=${encodeURIComponent(grd)}`;
+    } else {
+        const reg = document.getElementById('mt-region').value;
+        if (reg) qs += `&region=${encodeURIComponent(reg)}`;
+    }
+
+    const btn = document.getElementById('mt-analyze-btn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loading"></span> Analyzing...';
+
+    const resCont = document.getElementById('mt-results');
+    resCont.innerHTML = '<div class="card"><p style="opacity:0.5;text-align:center"><span class="loading"></span> Fetching price data...</p></div>';
+
+    try {
+        const r = await fetch('/api/material_prices?' + qs);
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Analysis failed');
+        mtRenderResults(d);
+    } catch (e) {
+        resCont.innerHTML = '<div class="card" style="border-color:#dc3545"><p style="color:#dc3545;text-align:center">' + e.message + '</p></div>';
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = 'Generate Analysis';
+    }
+}
+
+function mtRenderResults(d) {
+    const sym = d.currency_symbol || '€';
+    const ins = d.insights;
+    const src = d.source;
+    const srcClass = src === 'resin' ? 'mt-source-resin' : 'mt-source-global';
+    const srcLabel = src === 'resin' ? 'India Resin' : 'Global';
+
+    let html = '';
+
+    // ── Title bar ──
+    html += '<div class="card" style="margin-top:20px;border:2px solid var(--orange);">';
+    html += '<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:10px;margin-bottom:16px;">';
+    html += '<div>';
+    html += '<h3 style="margin:0;font-size:1.2rem;">' + d.material + ' — ' + d.country;
+    html += '<span class="mt-source-tag ' + srcClass + '">' + srcLabel + '</span></h3>';
+    html += '</div>';
+    html += '<span class="mt-status-badge mt-status-' + ins.status + '">' + ins.status + ' (' + (ins.change_pct > 0 ? '+' : '') + ins.change_pct + '%)</span>';
+    html += '</div>';
+
+    // ── KPI strip ──
+    html += '<div class="mt-kpi-strip">';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Current</div><div class="mt-kpi-value">' + sym + ins.current.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Previous</div><div class="mt-kpi-value">' + sym + ins.previous.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Change</div><div class="mt-kpi-value" style="color:' + (ins.change_pct > 0 ? '#dc3545' : ins.change_pct < 0 ? '#28a745' : '#ffc107') + '">' + (ins.change_pct > 0 ? '+' : '') + ins.change_pct + '%</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Average</div><div class="mt-kpi-value">' + sym + ins.avg.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Min</div><div class="mt-kpi-value" style="color:#28a745">' + sym + ins.min.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Max</div><div class="mt-kpi-value" style="color:#dc3545">' + sym + ins.max.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '</div>';
+
+    // ── Multi-currency info (global only) ──
+    if (src === 'global' && ins.current_eur) {
+        html += '<div class="mt-meta-row">';
+        html += '<div class="mt-meta-item">EUR: <strong>€' + ins.current_eur.toLocaleString(undefined, {minimumFractionDigits:2}) + '</strong></div>';
+        html += '<div class="mt-meta-item">USD: <strong>$' + ins.current_usd.toLocaleString(undefined, {minimumFractionDigits:2}) + '</strong></div>';
+        html += '<div class="mt-meta-item">Local (' + d.currency + '): <strong>' + sym + ins.current.toLocaleString(undefined, {minimumFractionDigits:2}) + '</strong></div>';
+        if (d.meta && d.meta.portfolio) html += '<div class="mt-meta-item">Portfolio: <strong>' + d.meta.portfolio + '</strong></div>';
+        if (d.meta && d.meta.uom) html += '<div class="mt-meta-item">UOM: <strong>' + d.meta.uom + '</strong></div>';
+        if (d.meta && d.meta.source) html += '<div class="mt-meta-item">Source: <strong>' + d.meta.source + '</strong></div>';
+        html += '</div>';
+    }
+
+    // ── Resin meta ──
+    if (src === 'resin' && d.meta) {
+        html += '<div class="mt-meta-row">';
+        html += '<div class="mt-meta-item">Currency: <strong>' + d.currency + '</strong></div>';
+        if (d.meta.supplier) html += '<div class="mt-meta-item">Location: <strong>' + d.meta.supplier + '</strong></div>';
+        if (d.meta.grade) html += '<div class="mt-meta-item">Grade: <strong>' + d.meta.grade + '</strong></div>';
+        html += '</div>';
+    }
+
+    // ── Chart placeholder ──
+    html += '<div class="mt-chart-wrap"><div id="mt-price-chart" style="height:350px;"></div></div>';
+    html += '</div>';
+
+    document.getElementById('mt-results').innerHTML = html;
+
+    // ── Render Plotly chart ──
+    const dates = d.series.map(p => p.label || p.date);
+    const prices = d.series.map(p => p.price);
+    const lineColor = ins.change_pct > 0 ? '#dc3545' : ins.change_pct < 0 ? '#28a745' : '#ffc107';
+
+    Plotly.newPlot('mt-price-chart', [{
+        x: dates, y: prices, type: 'scatter', mode: 'lines+markers',
+        line: {color: '#E8601C', width: 2.5, shape: 'spline'},
+        marker: {color: '#E8601C', size: 7, line: {color: 'white', width: 1}},
+        fill: 'tozeroy', fillcolor: 'rgba(232,96,28,0.08)',
+        hovertemplate: '%{x}<br>' + sym + '%{y:,.2f}<extra></extra>'
+    }], {
+        title: {text: d.material + ' Price Trend — ' + d.country + ' (' + d.currency + ')', font: {color: 'white', size: 15, family: 'Outfit'}},
+        xaxis: {color: 'white', tickfont: {size: 10}, gridcolor: 'rgba(255,255,255,0.04)', tickangle: -30},
+        yaxis: {title: sym + ' / unit', color: 'white', tickfont: {size: 10}, gridcolor: 'rgba(255,255,255,0.06)'},
+        plot_bgcolor: 'rgba(0,0,0,0)', paper_bgcolor: 'rgba(0,0,0,0)',
+        font: {color: 'white', family: 'Outfit'}, margin: {l: 60, r: 20, t: 50, b: 80},
+    }, {responsive: true, displayModeBar: false});
+}
+</script>
+"""
+
+# ================= APPLICATION STARTUP =================
 if __name__ == "__main__":
     files_ok, message = check_files_exist()
     if not files_ok:
