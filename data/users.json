@@ -1,0 +1,14 @@
+{
+  "packfora": {
+    "password": "packfora123",
+    "role": "admin"
+  },
+  "analyst": {
+    "password": "analyst123",
+    "role": "analyst"
+  },
+  "viewer": {
+    "password": "viewer123",
+    "role": "viewer"
+  }
+}

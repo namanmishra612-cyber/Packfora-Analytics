@@ -1,0 +1,80 @@
+[
+  {
+    "name": "Test 1",
+    "model": "carton",
+    "timestamp": "2026-03-16T12:50:46.454Z",
+    "inputs": {
+      "country": "",
+      "box_length": "",
+      "box_width": "",
+      "box_height": "",
+      "board_gsm": "400",
+      "annual_qty": "",
+      "board_cost": "",
+      "printing": "",
+      "conversion": "195"
+    },
+    "results": {
+      "actual_sheet_length": 653,
+      "actual_sheet_width": 818,
+      "area_per_carton": 0.0493914,
+      "area_sheet": 0.534154,
+      "board_consumption_1000": 21.36616,
+      "board_cost": 1198.64,
+      "conversion_cost": 195,
+      "corrugation_cost": 815,
+      "foil_cost": 0,
+      "ink_cost": 41.68,
+      "lamination_cost": 120.3,
+      "other_material_cost": 50,
+      "packing_cost": 54.64,
+      "total_cost_per_1000": 2629.36,
+      "ups_per_sheet": 10,
+      "varnish_cost": 154.1,
+      "material_cost": 2379.7200000000003,
+      "margin": 0,
+      "freight_cost": 0,
+      "model_type": "carton"
+    },
+    "project_id": ""
+  },
+  {
+    "name": "Test 2",
+    "model": "carton",
+    "timestamp": "2026-03-16T12:51:31.005Z",
+    "inputs": {
+      "country": "",
+      "box_length": "",
+      "box_width": "",
+      "box_height": "",
+      "board_gsm": "450",
+      "annual_qty": "",
+      "board_cost": "",
+      "printing": "",
+      "conversion": "195"
+    },
+    "results": {
+      "actual_sheet_length": 777,
+      "actual_sheet_width": 829,
+      "area_per_carton": 0.06,
+      "area_sheet": 0.644133,
+      "board_consumption_1000": 28.98598,
+      "board_cost": 1773.94,
+      "conversion_cost": 195,
+      "corrugation_cost": 1004.79,
+      "foil_cost": 0,
+      "ink_cost": 44.68,
+      "lamination_cost": 143.67,
+      "other_material_cost": 50,
+      "packing_cost": 72.13,
+      "total_cost_per_1000": 3471.41,
+      "ups_per_sheet": 10,
+      "varnish_cost": 187.2,
+      "material_cost": 3204.28,
+      "margin": 0,
+      "freight_cost": 0,
+      "model_type": "carton"
+    },
+    "project_id": ""
+  }
+]
