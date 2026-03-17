@@ -16,6 +16,38 @@ import hashlib
 import ast
 import operator
 import math
+# ── Spend Analytics additional imports ──
+import sqlite3
+import re
+import warnings
+from collections import Counter
+from difflib import SequenceMatcher
+
+# ── AI / ML imports (graceful degradation if package missing) ──
+try:
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.metrics.pairwise import cosine_similarity
+    _SKLEARN_OK = True
+except ImportError:
+    _SKLEARN_OK = False
+
+try:
+    from rapidfuzz import fuzz as _rfuzz
+    _RAPIDFUZZ_OK = True
+except ImportError:
+    _RAPIDFUZZ_OK = False
+
+try:
+    from prophet import Prophet as _Prophet
+    _PROPHET_OK = True
+except ImportError:
+    _PROPHET_OK = False
+
+try:
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing as _HW
+    _STATSMODELS_OK = True
+except ImportError:
+    _STATSMODELS_OK = False
 
 # ================= LOAD ENVIRONMENT VARIABLES =================
 try:
@@ -45,6 +77,10 @@ BACKUP_DIR.mkdir(parents=True, exist_ok=True)
 MODELS_DIR = DATA_DIR / "cost_models"
 MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
+# Projects directory
+PROJECTS_DIR = DATA_DIR / "projects"
+PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
+
 # Share links directory
 SHARES_DIR = DATA_DIR / "shares"
 SHARES_DIR.mkdir(parents=True, exist_ok=True)
@@ -53,7 +89,7 @@ SHARES_DIR.mkdir(parents=True, exist_ok=True)
 # Application constants
 FILE_CHECK_INTERVAL_SECONDS = 30
 MAX_MACHINES_TO_DISPLAY = 100
-CACHE_EXPIRY_MINUTES = 5
+CACHE_EXPIRY_MINUTES = 360  # 6 hours
 
 # Admin credentials (CHANGE THESE!)
 ADMIN_USERNAME = os.getenv('ADMIN_USERNAME', 'packfora')
@@ -110,6 +146,9 @@ RESIN_TYPE_PATTERNS = {
 
 # Priority order for detection (specific before general — LLDPE before LDPE)
 RESIN_TYPE_PRIORITY = ['LLDPE', 'LDPE', 'HDPE', 'PP', 'PET', 'PVC', 'PS', 'EVA', 'ABS', 'PA']
+
+# Polymer materials sourced from Plastemart (India resin path)
+POLYMER_LIST = {'PP', 'HDPE', 'LLDPE', 'LDPE', 'PET', 'PVC', 'PS', 'EVA', 'ABS', 'PA', 'BOPP', 'BOPET', 'CPP'}
 
 # Supplier name variants (keys = canonical, values = search patterns)
 SUPPLIER_PATTERNS = {
@@ -205,16 +244,13 @@ def _get_fx_rates():
             df.columns = [str(c).strip() for c in df.columns]
             for col in df.columns:
                 if 'euro' in col.lower():
-                    for _, row in df.iterrows():
-                        country = str(row.iloc[0]).strip()
-                        ci = COUNTRY_CURRENCY_MAP.get(country)
-                        if ci:
-                            try:
-                                v = float(row[col])
-                                if v > 0:
-                                    rates[ci[0]] = v
-                            except:
-                                pass
+                    countries = df.iloc[:, 0].astype(str).str.strip()
+                    vals = pd.to_numeric(df[col], errors='coerce')
+                    for country, v in zip(countries, vals):
+                        if pd.notna(v) and v > 0:
+                            ci = COUNTRY_CURRENCY_MAP.get(country)
+                            if ci:
+                                rates[ci[0]] = float(v)
                     break
     except:
         pass
@@ -261,7 +297,7 @@ def _load_global_material_df():
     return df
 
 def _gm_quarter_cols(df):
-    """Return list of quarter column names (e.g. Q1'26, Q2'26...) in order."""
+    """Return list of quarter column names (e.g. Q1'26, Q2'26...) sorted chronologically."""
     meta = {'Commodity', 'Portfolio', 'Country', 'Currency', 'UOM', 'Source', 'Index',
             'Region/Country', 'Data Source'}
     qcols = [c for c in df.columns if c not in meta and not str(c).startswith('Unnamed')]
@@ -278,7 +314,27 @@ def _gm_quarter_cols(df):
                 continue  # skip pure numbers that aren't quarter labels
             except:
                 result.append(c)
-    return result if result else qcols
+    cols = result if result else qcols
+
+    # Sort quarter columns chronologically: Q1'24 < Q2'24 < ... < Q4'25 < FY'25
+    def _qsort_key(col_name):
+        cs = str(col_name).strip().upper()
+        q_map = {'Q1': 1, 'Q2': 2, 'Q3': 3, 'Q4': 4, 'FY': 5}
+        try:
+            prefix = cs[:2]
+            q_num = q_map.get(prefix, 9)
+            # Extract year: after Q1 or FY, skip optional ' or space
+            yr_part = cs[2:].lstrip("' -/")
+            yr = int(yr_part) if yr_part else 0
+            # Normalise 2-digit years
+            if yr < 100:
+                yr += 2000
+            return (yr, q_num)
+        except (ValueError, IndexError):
+            return (9999, 9)  # Put unparseable at end
+
+    cols.sort(key=_qsort_key)
+    return cols
 
 
 def detect_resin_type(text):
@@ -589,17 +645,17 @@ def parse_date_col(col_str):
 
 
 def sort_date_series(dates_str, values):
-    """Parse date strings, sort chronologically, return (sorted_iso_dates, sorted_labels, sorted_values)."""
+    """Parse date strings, sort chronologically, return (sorted_iso_dates, sorted_labels, sorted_values).
+    Entries with unparseable dates are excluded to avoid incorrect current/previous price calculations."""
     paired = []
     for d, v in zip(dates_str, values):
         dt_obj = parse_date_col(d)
         if dt_obj:
             paired.append((dt_obj, v, d))
-        else:
-            paired.append((datetime.max, v, d))
+        # Skip entries with unparseable dates instead of putting them at datetime.max
     paired.sort(key=lambda x: x[0])
-    iso_dates = [p[0].strftime('%Y-%m-%d') if p[0] != datetime.max else p[2] for p in paired]
-    labels = [p[0].strftime('%b %Y') if p[0] != datetime.max else p[2] for p in paired]
+    iso_dates = [p[0].strftime('%Y-%m-%d') for p in paired]
+    labels = [p[0].strftime('%b %Y') for p in paired]
     sorted_values = [p[1] for p in paired]
     return iso_dates, labels, sorted_values
 
@@ -1198,15 +1254,10 @@ def api_import_resin_prices():
                     continue
 
                 # --- Phase 2a: Build full-sheet text context ---
-                sheet_text_parts = []
-                scan_rows = min(20, df_raw.shape[0])
-                scan_cols = min(8, df_raw.shape[1])
-                for r in range(scan_rows):
-                    for c in range(scan_cols):
-                        val = df_raw.iloc[r, c]
-                        if pd.notna(val):
-                            sheet_text_parts.append(str(val))
-                sheet_context = " ".join(sheet_text_parts)
+                scan_block = df_raw.iloc[:min(20, df_raw.shape[0]), :min(8, df_raw.shape[1])]
+                sheet_context = " ".join(
+                    str(v) for v in scan_block.values.ravel() if pd.notna(v)
+                )
 
                 # Also use the sheet name itself as context
                 full_context = f"{sname} {sheet_context} {fname}"
@@ -1222,35 +1273,34 @@ def api_import_resin_prices():
                 if sheet_supplier == 'Unknown':
                     sheet_supplier = fname_supplier
 
-                # --- Phase 2d: Find section headers ("Date :") ---
-                section_starts = []
-                for i in range(df_raw.shape[0]):
-                    for col in range(min(5, df_raw.shape[1])):
-                        val = str(df_raw.iloc[i, col]) if pd.notna(df_raw.iloc[i, col]) else ''
-                        if re.search(r'Date\s*:', val, re.IGNORECASE):
-                            section_starts.append(i)
-                            logger.info(f"Found section header at row {i} in sheet '{sname}': {val[:80]}")
-                            break
+                # --- Phase 2d: Find section headers ("Date :") — vectorized ---
+                _str_block5 = df_raw.iloc[:, :min(5, df_raw.shape[1])].fillna('').astype(str)
+                _str_block3 = _str_block5.iloc[:, :min(3, _str_block5.shape[1])]
+
+                def _first_hit(block, pattern):
+                    mask = block.apply(lambda col: col.str.contains(pattern, case=False, regex=True, na=False))
+                    return np.where(mask.any(axis=1))[0].tolist()
+
+                section_starts = _first_hit(_str_block5, r'Date\s*:')
+                for i in section_starts:
+                    hit_val = next((v for v in _str_block5.iloc[i] if re.search(r'Date\s*:', v, re.IGNORECASE)), '')
+                    logger.info(f"Found section header at row {i} in sheet '{sname}': {hit_val[:80]}")
 
                 if not section_starts:
-                    # Alternative: look for other date-like patterns
-                    for i in range(df_raw.shape[0]):
-                        for col in range(min(5, df_raw.shape[1])):
-                            val = str(df_raw.iloc[i, col]) if pd.notna(df_raw.iloc[i, col]) else ''
-                            if re.search(r'(?:Effective|Price|Rate)\s*(?:Date|From|W\.?E\.?F)', val, re.IGNORECASE):
-                                section_starts.append(i)
-                                logger.info(f"Found alt date pattern at row {i} in sheet '{sname}': {val[:80]}")
-                                break
+                    section_starts = _first_hit(_str_block5, r'(?:Effective|Price|Rate)\s*(?:Date|From|W\.?E\.?F)')
+                    for i in section_starts:
+                        hit_val = next((v for v in _str_block5.iloc[i] if re.search(r'(?:Effective|Price|Rate)\s*(?:Date|From|W\.?E\.?F)', v, re.IGNORECASE)), '')
+                        logger.info(f"Found alt date pattern at row {i} in sheet '{sname}': {hit_val[:80]}")
 
                 if not section_starts:
-                    # Last resort: look for any row with "Date" in first few columns
-                    for i in range(df_raw.shape[0]):
-                        for col in range(min(3, df_raw.shape[1])):
-                            val = str(df_raw.iloc[i, col]) if pd.notna(df_raw.iloc[i, col]) else ''
-                            if ('Date' in val or 'DATE' in val) and (':' in val or 'Grade' in val or 'GRADE' in val):
-                                section_starts.append(i)
-                                logger.info(f"Found date-grade pattern at row {i} in sheet '{sname}': {val[:80]}")
-                                break
+                    _date_grade = _str_block3.apply(
+                        lambda col: col.str.contains(r'Date|DATE', na=False) &
+                                    col.str.contains(r'[:\s]|Grade|GRADE', na=False)
+                    )
+                    section_starts = np.where(_date_grade.any(axis=1))[0].tolist()
+                    for i in section_starts:
+                        hit_val = next((v for v in _str_block3.iloc[i] if ('Date' in v or 'DATE' in v)), '')
+                        logger.info(f"Found date-grade pattern at row {i} in sheet '{sname}': {hit_val[:80]}")
 
                 if not section_starts:
                     file_sheet_results.append({
@@ -1262,13 +1312,13 @@ def api_import_resin_prices():
                 sheet_record_count = 0
 
                 for sec_idx, sec_start in enumerate(section_starts):
-                    # --- Section-level context for resin type override ---
-                    section_context = ""
-                    for r in range(max(0, sec_start - 2), min(sec_start + 4, df_raw.shape[0])):
-                        for c in range(min(8, df_raw.shape[1])):
-                            val = df_raw.iloc[r, c]
-                            if pd.notna(val):
-                                section_context += " " + str(val)
+                    # --- Section-level context for resin type override --- vectorized
+                    _r0 = max(0, sec_start - 2)
+                    _r1 = min(sec_start + 4, df_raw.shape[0])
+                    _ctx_block = df_raw.iloc[_r0:_r1, :min(8, df_raw.shape[1])]
+                    section_context = " " + " ".join(
+                        str(v) for v in _ctx_block.values.ravel() if pd.notna(v)
+                    )
 
                     # Override resin type if section has its own type marker
                     section_resin, sec_conf = detect_resin_type(section_context)
@@ -1484,24 +1534,27 @@ def api_import_resin_prices():
                         merged['Country'] = merged['Country'].fillna('India')
                         merged['Unit'] = merged['Unit'].fillna('Rs/ Kg')
 
-                        # Fill Supplier from pivot for new rows
-                        for idx, row in merged.iterrows():
-                            if pd.isna(row.get('Supplier')):
-                                match = pivot[
-                                    (pivot['Supplier'].notna()) &
-                                    (pivot['Location'] == row.get('Location')) &
-                                    (pivot['Grade'] == row.get('Grade'))
-                                ]
-                                if not match.empty:
-                                    merged.at[idx, 'Supplier'] = match.iloc[0]['Supplier']
+                        # Fill Supplier from pivot for new rows — vectorized
+                        sup_null_mask = merged['Supplier'].isna()
+                        if sup_null_mask.any():
+                            _pivot_sup = (pivot[pivot['Supplier'].notna()]
+                                          .drop_duplicates(['Location', 'Grade'])
+                                          .set_index(['Location', 'Grade'])['Supplier'])
+                            def _fill_sup(row):
+                                if pd.isna(row.get('Supplier')):
+                                    key = (row.get('Location'), row.get('Grade'))
+                                    return _pivot_sup.get(key, row.get('Supplier'))
+                                return row['Supplier']
+                            merged['Supplier'] = merged.apply(_fill_sup, axis=1)
 
-                            # Auto-fill Key if missing
-                            if pd.isna(row.get('Key')):
-                                merged.at[idx, 'Key'] = (
-                                    str(merged.at[idx, 'Supplier'] or '') +
-                                    str(merged.at[idx, 'Location'] or '') +
-                                    str(merged.at[idx, 'Grade'] or '')
-                                )
+                        # Auto-fill Key where missing — vectorized
+                        key_null_mask = merged['Key'].isna()
+                        if key_null_mask.any():
+                            merged.loc[key_null_mask, 'Key'] = (
+                                merged.loc[key_null_mask, 'Supplier'].fillna('').astype(str) +
+                                merged.loc[key_null_mask, 'Location'].fillna('').astype(str) +
+                                merged.loc[key_null_mask, 'Grade'].fillna('').astype(str)
+                            )
 
                         merged.to_excel(writer, sheet_name=sheet_name, index=False)
                         new_rows = len(merged) - len(existing_df)
@@ -1584,6 +1637,7 @@ if not SKU_STORAGE_FILE.exists():
     SKU_STORAGE_FILE.write_text('[]')
 
 @app.route('/api/save_sku', methods=['POST'])
+@login_required
 def save_sku():
     """Save SKU configuration to backend storage"""
     try:
@@ -1592,6 +1646,10 @@ def save_sku():
         if not data or 'name' not in data:
             return jsonify({'success': False, 'message': 'Invalid SKU data'}), 400
         
+        # Attach project_id if not already present
+        if 'project_id' not in data or not data['project_id']:
+            data['project_id'] = _get_active_project_id()
+        
         # Load existing SKUs
         try:
             with open(SKU_STORAGE_FILE, 'r') as f:
@@ -1599,8 +1657,9 @@ def save_sku():
         except (FileNotFoundError, json.JSONDecodeError):
             skus = []
         
-        # Remove existing SKU with same name
-        skus = [s for s in skus if s.get('name') != data['name']]
+        # Remove existing SKU with same name AND same project_id
+        pid = data.get('project_id', '')
+        skus = [s for s in skus if not (s.get('name') == data['name'] and s.get('project_id', '') == pid)]
         
         # Add new SKU
         skus.append(data)
@@ -1609,7 +1668,7 @@ def save_sku():
         with open(SKU_STORAGE_FILE, 'w') as f:
             json.dump(skus, f, indent=2)
         
-        logger.info(f"SKU saved: {data['name']} (Model: {data.get('model', 'unknown')})")
+        logger.info(f"SKU saved: {data['name']} (Model: {data.get('model', 'unknown')}, Project: {pid})")
         
         return jsonify({
             'success': True,
@@ -1623,6 +1682,7 @@ def save_sku():
 
 
 @app.route('/api/load_sku/<sku_name>', methods=['GET'])
+@login_required
 def load_sku_api(sku_name):
     """Load specific SKU by name"""
     try:
@@ -1650,9 +1710,15 @@ def load_sku_api(sku_name):
 
 
 @app.route('/api/list_skus', methods=['GET'])
+@login_required
 def list_skus():
-    """List all saved SKUs"""
+    """List all saved SKUs, optionally filtered by project_id and model"""
     try:
+        pid = _get_active_project_id()
+        admin_all = _is_admin_mode()
+        model_filter = request.args.get('model', '')
+        full = request.args.get('full', '') == '1'  # Return full data for comparison
+        
         # Load SKUs
         try:
             with open(SKU_STORAGE_FILE, 'r') as f:
@@ -1660,10 +1726,28 @@ def list_skus():
         except (FileNotFoundError, json.JSONDecodeError):
             skus = []
         
+        # Project filter: show SKUs matching active project OR untagged SKUs
+        if pid and not admin_all:
+            skus = [s for s in skus if s.get('project_id', '') in (pid, '')]
+        
+        # Model filter
+        if model_filter:
+            skus = [s for s in skus if s.get('model', '') == model_filter]
+        
+        if full:
+            # Return full SKU data (for comparison tab)
+            return jsonify({
+                'success': True,
+                'skus': skus,
+                'count': len(skus)
+            })
+        
         # Return summary info only
         sku_list = [{
             'name': s.get('name'),
             'model': s.get('model'),
+            'model_name': s.get('model_name', s.get('model', '')),
+            'project_id': s.get('project_id', ''),
             'timestamp': s.get('timestamp')
         } for s in skus]
         
@@ -1679,6 +1763,7 @@ def list_skus():
 
 
 @app.route('/api/delete_sku/<sku_name>', methods=['DELETE'])
+@login_required
 def delete_sku_api(sku_name):
     """Delete SKU by name"""
     try:
@@ -1880,15 +1965,33 @@ def _extract_result_metrics(model, calc_result, params):
             'cost_label_piece': '/pc',
         }
     else:
-        # EBM — has all keys
-        total_1000 = calc_result.get('total_cost_per_1000', 0)
+        # EBM or Custom model — try to extract standard keys, fall back gracefully
+        is_custom = calc_result.get('_custom', False)
+        results_dict = calc_result.get('results', calc_result) if is_custom else calc_result
+        total_1000 = float(results_dict.get('total_cost_per_1000', 0))
+        mat_cost = float(results_dict.get('material_cost', 0))
+        conv_cost = float(results_dict.get('conversion_cost', 0))
+        margin_val = float(results_dict.get('margin', 0))
+        cost_pp = float(results_dict.get('cost_per_piece', total_1000 / 1000 if total_1000 else 0))
+        margin_pct = float(results_dict.get('margin_pct_total', results_dict.get('margin_pct_input', results_dict.get('margin_pct', 0))))
+        # For custom models, if total is 0 try to find any "total" or "cost" field
+        if is_custom and total_1000 == 0:
+            for k, v in results_dict.items():
+                kl = k.lower()
+                if ('total' in kl or 'final' in kl) and isinstance(v, (int, float)) and v > 0:
+                    total_1000 = float(v)
+                    break
+            if total_1000 == 0:
+                # Sum all positive numeric result values as a fallback
+                total_1000 = sum(float(v) for v in results_dict.values() if isinstance(v, (int, float)) and v > 0)
+            cost_pp = total_1000 / 1000 if total_1000 else 0
         return {
-            'material_cost': round(float(calc_result.get('material_cost', 0)), 2),
-            'conversion_cost': round(float(calc_result.get('conversion_cost', 0)), 2),
-            'margin': round(float(calc_result.get('margin', 0)), 2),
-            'total_cost_per_1000': round(float(total_1000), 2),
-            'cost_per_piece': round(float(calc_result.get('cost_per_piece', total_1000 / 1000 if total_1000 else 0)), 4),
-            'margin_pct': round(float(calc_result.get('margin_pct_total', calc_result.get('margin_pct_input', 0))), 1),
+            'material_cost': round(mat_cost, 2),
+            'conversion_cost': round(conv_cost, 2),
+            'margin': round(margin_val, 2),
+            'total_cost_per_1000': round(total_1000, 2),
+            'cost_per_piece': round(cost_pp, 4),
+            'margin_pct': round(margin_pct, 1),
             'cost_label_1000': '/1000',
             'cost_label_piece': '/pc',
         }
@@ -1918,15 +2021,9 @@ def upload_bulk_skus():
         results = []
         errors = []
 
-        for idx, row in df.iterrows():
-            row_num = idx + 2  # Excel row (1-indexed header + data)
+        for row_num, row in enumerate(df.to_dict('records'), start=2):
             try:
-                params = {}
-                for col in df.columns:
-                    val = row[col]
-                    if pd.isna(val):
-                        continue
-                    params[col] = val
+                params = {col: val for col, val in row.items() if pd.notna(val)}
 
                 sku_name = str(params.get('sku_name', f'Row_{row_num}'))
                 model = str(params.get('model', 'ebm')).strip().lower()
@@ -1936,14 +2033,40 @@ def upload_bulk_skus():
                     calc_result = _run_calc_internal(api_calc_ebm, params)
                 elif model in ('carton', 'folding_carton'):
                     calc_result = _run_calc_internal(api_calc_carton, params)
-                elif model in ('carton_advanced', 'carton_adv'):
+                elif model in ('carton_advanced', 'carton_adv', 'carton-adv'):
                     calc_result = _run_calc_internal(api_calc_carton_advanced, params)
                 elif model in ('flexibles', 'flexible', 'laminate'):
                     flex_params = _build_flexibles_params(params)
                     calc_result = _run_calc_internal(api_calc_flexibles, flex_params)
+                elif model.startswith('custom_') or MODELS_DIR.joinpath(f"{model}.json").exists():
+                    # Custom model from Cost Model Builder
+                    model_id = model.replace('custom_', '')
+                    model_path = MODELS_DIR / f"{model_id}.json"
+                    if not model_path.exists():
+                        errors.append({'row': row_num, 'sku': sku_name,
+                                       'error': f'Custom model "{model_id}" not found'})
+                        continue
+                    with open(model_path, 'r') as fh:
+                        model_def = json.load(fh)
+                    # Build inputs from params — match field IDs in model definition
+                    custom_inputs = {}
+                    for field in model_def.get('fields', []):
+                        fid = field['id']
+                        if field.get('type') == 'input':
+                            if fid in params:
+                                try:
+                                    custom_inputs[fid] = float(params[fid])
+                                except (ValueError, TypeError):
+                                    custom_inputs[fid] = field.get('default', 0)
+                            else:
+                                custom_inputs[fid] = field.get('default', 0)
+                    # Run calculation
+                    calc_result = run_cost_simulation(model_def, custom_inputs)
+                    calc_result['_custom'] = True
+                    calc_result['model_name'] = model_def.get('name', model_id)
                 else:
                     errors.append({'row': row_num, 'sku': sku_name,
-                                   'error': f'Unknown model "{model}". Use: ebm, carton, carton_advanced, flexibles'})
+                                   'error': f'Unknown model "{model}". Use: ebm, carton, carton_advanced, flexibles, or custom_<model_id>'})
                     continue
 
                 if 'error' in calc_result:
@@ -2092,6 +2215,32 @@ def download_bulk_template():
             'conversion_cost': 55,
         }]).to_excel(writer, index=False, sheet_name='Flexibles')
 
+        # --- Custom Models sheets ---
+        try:
+            for mf in sorted(MODELS_DIR.glob("*.json")):
+                with open(mf, 'r') as fh:
+                    mdef = json.load(fh)
+                model_id = mdef.get('id', mf.stem)
+                model_name = mdef.get('name', model_id)
+                input_fields = [f for f in mdef.get('fields', []) if f.get('type') == 'input']
+                if not input_fields:
+                    continue
+                example_row = {'sku_name': f'Example_{model_name}', 'model': f'custom_{model_id}'}
+                for f in input_fields:
+                    example_row[f['id']] = f.get('default', 0)
+                sheet_name = model_name[:31].replace('/', '-')  # Excel sheet name limit
+                pd.DataFrame([example_row]).to_excel(writer, index=False, sheet_name=sheet_name)
+        except Exception:
+            pass
+
+        # --- Instructions sheet ---
+        pd.DataFrame([
+            {'Instructions': 'Supported model values: ebm, carton, carton_advanced, flexibles, custom_<model_id>'},
+            {'Instructions': 'Each row must have sku_name and model columns at minimum.'},
+            {'Instructions': 'For custom models, column headers must match the field IDs defined in the Cost Model Builder.'},
+            {'Instructions': 'See individual sheets for example rows per model type.'},
+        ]).to_excel(writer, index=False, sheet_name='README')
+
     buf.seek(0)
     return send_file(buf, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
                      as_attachment=True, download_name='packfora_bulk_template.xlsx')
@@ -2120,23 +2269,6 @@ def home():
     
     return render_template_string(BASE_HTML.replace("{{ content | safe }}", DASH_HTML), active="Dashboard", user_role=session.get('role', 'viewer'))
 
-@app.route("/resin")
-@login_required
-def resin():
-    """Resin tracker"""
-    try:
-        xls = load_excel_cached('resin')
-        if isinstance(xls, pd.DataFrame):
-            xls = pd.ExcelFile(RESIN_EXCEL)
-        
-        sheets_options = ''.join([f'<option value="{s}">{s}</option>' for s in xls.sheet_names if s.lower() != 'unknown'])
-        resin_content = RESIN_UI.replace("{{SHEETS_OPTIONS}}", sheets_options)
-        return render_template_string(BASE_HTML.replace("{{ content | safe }}", resin_content), active="Resin", user_role=session.get('role', 'viewer'))
-    except Exception as e:
-        logger.error(f"Error loading resin page: {e}")
-        error_msg = f"<div class='card error-card'><h3>Error Loading Resin Data</h3><p>{str(e)}</p></div>"
-        return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_msg), active="Resin", user_role=session.get('role', 'viewer'))
-
 @app.route("/machines")
 @role_required('admin', 'analyst')
 def machines():
@@ -2148,22 +2280,6 @@ def machines():
 def costs():
     """Variable costs"""
     return render_template_string(BASE_HTML.replace("{{ content | safe }}", COST_HTML), active="Costs", user_role=session.get('role', 'viewer'))
-
-@app.route("/global-materials")
-@login_required
-def global_materials():
-    """Global Material Price Tracker — separate from India Resin Tracker"""
-    try:
-        df = _load_global_material_df()
-        if df is None:
-            error_msg = "<div class='card error-card'><h3>Global Material Data Not Found</h3><p>Upload <code>global-material-data.xlsx</code> via Admin → Upload.</p></div>"
-            return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_msg), active="GlobalMaterials", user_role=session.get('role', 'viewer'))
-        return render_template_string(BASE_HTML.replace("{{ content | safe }}", GLOBAL_MATERIAL_UI), active="GlobalMaterials", user_role=session.get('role', 'viewer'))
-    except Exception as e:
-        logger.error(f"Error loading global materials page: {e}")
-        error_msg = f"<div class='card error-card'><h3>Error</h3><p>{str(e)}</p></div>"
-        return render_template_string(BASE_HTML.replace("{{ content | safe }}", error_msg), active="GlobalMaterials", user_role=session.get('role', 'viewer'))
-
 
 @app.route("/materials")
 @login_required
@@ -2245,23 +2361,36 @@ def api_admin_delete_user(username):
 # ================= COST MODEL BUILDER HELPERS =================
 
 def _load_custom_models():
-    """Load all custom cost models."""
+    """Load all custom cost models, optionally filtered by project_id."""
     models = []
+    active_pid = session.get('active_project_id', '') if not _is_admin_mode() else None
     for f in sorted(MODELS_DIR.glob("*.json")):
         try:
             with open(f, 'r') as fh:
                 m = json.load(fh)
                 m['_filename'] = f.name
+                # Project filter: show models matching active project OR untagged models
+                if active_pid is not None and active_pid:
+                    model_pid = m.get('project_id', '')
+                    if model_pid and model_pid != active_pid:
+                        continue
                 models.append(m)
         except Exception:
             pass
     return models
 
 def _save_custom_model(model_data):
-    """Save a custom cost model."""
-    model_id = model_data.get('id') or str(uuid.uuid4())[:8]
+    """Save a custom cost model. New models get a fresh UUID; edits preserve existing id."""
+    is_new = not model_data.get('id')
+    model_id = model_data.get('id') if not is_new else str(uuid.uuid4())[:8]
     model_data['id'] = model_id
-    model_data['updated_at'] = datetime.now().isoformat()
+    now_iso = datetime.now().isoformat()
+    if is_new or 'created_at' not in model_data:
+        model_data['created_at'] = now_iso
+    model_data['updated_at'] = now_iso
+    # Attach project_id if active
+    if 'project_id' not in model_data or not model_data['project_id']:
+        model_data['project_id'] = session.get('active_project_id', '')
     path = MODELS_DIR / f"{model_id}.json"
     with open(path, 'w') as f:
         json.dump(model_data, f, indent=2)
@@ -2283,6 +2412,708 @@ def _save_share(token, share_data):
     path = SHARES_DIR / f"{token}.json"
     with open(path, 'w') as f:
         json.dump(share_data, f, indent=2)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# MULTI-PROJECT SUPPORT
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _projects_db_path():
+    return str(BASE_DIR / "packaging_analytics.db")
+
+def _projects_init_db():
+    """Ensure projects table exists (idempotent)."""
+    c = sqlite3.connect(_projects_db_path())
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS projects (
+            project_id   TEXT PRIMARY KEY,
+            project_name TEXT NOT NULL,
+            description  TEXT DEFAULT '',
+            created_by   TEXT DEFAULT '',
+            color        TEXT DEFAULT '#E8601C',
+            status       TEXT DEFAULT 'active',
+            client_name  TEXT DEFAULT '',
+            created_at   TEXT DEFAULT (datetime('now')),
+            updated_at   TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    # Add project_id column to datasets if missing
+    try:
+        c.execute("ALTER TABLE datasets ADD COLUMN project_id TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass  # Column already exists
+    # Add new columns to existing projects table if missing
+    for col, defn in [('color', "TEXT DEFAULT '#E8601C'"), ('status', "TEXT DEFAULT 'active'"), ('client_name', "TEXT DEFAULT ''")]:
+        try:
+            c.execute(f"ALTER TABLE projects ADD COLUMN {col} {defn}")
+        except sqlite3.OperationalError:
+            pass
+    c.commit()
+    c.close()
+
+# Initialize project tables on import
+try:
+    _projects_init_db()
+except Exception:
+    pass
+
+
+def _get_active_project_id():
+    """Get active project_id from request header or session."""
+    pid = request.headers.get('X-Project-Id', '')
+    if not pid:
+        pid = session.get('active_project_id', '')
+    return pid
+
+
+def _is_admin_mode():
+    """Check if admin cross-project mode is active."""
+    return (session.get('role') == 'admin' and
+            request.headers.get('X-Admin-All-Projects', '') == '1')
+
+
+@app.route("/api/projects", methods=["GET"])
+@login_required
+def api_list_projects():
+    """List all projects."""
+    c = sqlite3.connect(_projects_db_path())
+    c.row_factory = sqlite3.Row
+    rows = c.execute("SELECT * FROM projects ORDER BY created_at DESC").fetchall()
+    c.close()
+    projects = [dict(r) for r in rows]
+    return jsonify({"success": True, "projects": projects})
+
+
+@app.route("/api/projects", methods=["POST"])
+@role_required('admin', 'analyst')
+def api_create_project():
+    """Create a new project."""
+    data = request.get_json()
+    if not data or not data.get('project_name'):
+        return jsonify({"error": "project_name is required"}), 400
+    project_id = data.get('project_id', 'P' + str(uuid.uuid4())[:6].upper())
+    project_name = data['project_name']
+    description = data.get('description', '')
+    created_by = session.get('username', 'unknown')
+    color = data.get('color', '#E8601C')
+    status = data.get('status', 'active')
+    client_name = data.get('client_name', '')
+    c = sqlite3.connect(_projects_db_path())
+    try:
+        c.execute(
+            "INSERT INTO projects (project_id, project_name, description, created_by, color, status, client_name) VALUES (?,?,?,?,?,?,?)",
+            (project_id, project_name, description, created_by, color, status, client_name)
+        )
+        c.commit()
+    except sqlite3.IntegrityError:
+        c.close()
+        return jsonify({"error": f"Project ID '{project_id}' already exists"}), 409
+    c.close()
+    return jsonify({"success": True, "project_id": project_id})
+
+
+@app.route("/api/projects/<project_id>", methods=["PUT"])
+@role_required('admin', 'analyst')
+def api_update_project(project_id):
+    """Update a project."""
+    data = request.get_json()
+    c = sqlite3.connect(_projects_db_path())
+    c.execute(
+        "UPDATE projects SET project_name=?, description=?, color=?, status=?, client_name=?, updated_at=datetime('now') WHERE project_id=?",
+        (data.get('project_name', ''), data.get('description', ''), data.get('color', '#E8601C'), data.get('status', 'active'), data.get('client_name', ''), project_id)
+    )
+    c.commit()
+    c.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/projects/<project_id>/stats", methods=["GET"])
+@login_required
+def api_project_stats(project_id):
+    """Get stats for a specific project (model count, dataset count, SKU count)."""
+    # Count cost models for this project
+    model_count = 0
+    for f in MODELS_DIR.glob("*.json"):
+        try:
+            with open(f, 'r') as fh:
+                m = json.load(fh)
+            if m.get('project_id', '') == project_id:
+                model_count += 1
+        except Exception:
+            pass
+    # Count datasets for this project
+    dataset_count = 0
+    try:
+        c = sqlite3.connect(_projects_db_path())
+        row = c.execute("SELECT COUNT(*) FROM datasets WHERE project_id=?", (project_id,)).fetchone()
+        dataset_count = row[0] if row else 0
+        c.close()
+    except Exception:
+        pass
+    # Count SKUs for this project
+    sku_count = 0
+    try:
+        if SKU_STORAGE_FILE.exists():
+            with open(SKU_STORAGE_FILE, 'r') as f:
+                skus = json.load(f)
+            sku_count = sum(1 for s in skus if s.get('project_id', '') == project_id)
+    except Exception:
+        pass
+    return jsonify({"success": True, "project_id": project_id, "model_count": model_count, "dataset_count": dataset_count, "sku_count": sku_count})
+
+
+@app.route("/api/projects/all_stats", methods=["GET"])
+@login_required
+def api_all_project_stats():
+    """Get stats for all projects in one call."""
+    # Gather all model project_ids
+    model_counts = {}
+    for f in MODELS_DIR.glob("*.json"):
+        try:
+            with open(f, 'r') as fh:
+                m = json.load(fh)
+            pid = m.get('project_id', '')
+            if pid:
+                model_counts[pid] = model_counts.get(pid, 0) + 1
+        except Exception:
+            pass
+    # Gather all dataset project_ids
+    dataset_counts = {}
+    try:
+        c = sqlite3.connect(_projects_db_path())
+        rows = c.execute("SELECT project_id, COUNT(*) FROM datasets WHERE project_id != '' GROUP BY project_id").fetchall()
+        for row in rows:
+            dataset_counts[row[0]] = row[1]
+        c.close()
+    except Exception:
+        pass
+    # Gather all SKU project_ids
+    sku_counts = {}
+    try:
+        if SKU_STORAGE_FILE.exists():
+            with open(SKU_STORAGE_FILE, 'r') as f:
+                skus = json.load(f)
+            for s in skus:
+                pid = s.get('project_id', '')
+                if pid:
+                    sku_counts[pid] = sku_counts.get(pid, 0) + 1
+    except Exception:
+        pass
+    return jsonify({"success": True, "model_counts": model_counts, "dataset_counts": dataset_counts, "sku_counts": sku_counts})
+
+
+@app.route("/api/projects/<project_id>", methods=["DELETE"])
+@role_required('admin')
+def api_delete_project(project_id):
+    """Delete a project (admin only)."""
+    c = sqlite3.connect(_projects_db_path())
+    c.execute("DELETE FROM projects WHERE project_id=?", (project_id,))
+    c.commit()
+    c.close()
+    return jsonify({"success": True})
+
+
+@app.route("/api/projects/set_active", methods=["POST"])
+@login_required
+def api_set_active_project():
+    """Set the active project in server-side session."""
+    data = request.get_json()
+    project_id = data.get('project_id', '')
+    session['active_project_id'] = project_id
+    return jsonify({"success": True, "active_project_id": project_id})
+
+
+@app.route("/api/projects/<project_id>/backup", methods=["POST"])
+@role_required('admin')
+def api_project_backup(project_id):
+    """Create a backup zip for a specific project."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_name = f"{project_id}_{timestamp}.zip"
+    backup_path = BACKUP_DIR / backup_name
+    try:
+        import zipfile
+        with zipfile.ZipFile(str(backup_path), 'w', zipfile.ZIP_DEFLATED) as zf:
+            # Add cost model JSONs tagged with this project
+            for f in MODELS_DIR.glob("*.json"):
+                try:
+                    with open(f, 'r') as fh:
+                        m = json.load(fh)
+                    if m.get('project_id', '') == project_id:
+                        zf.write(str(f), f"cost_models/{f.name}")
+                except Exception:
+                    pass
+            # Export spend datasets for this project
+            c = sqlite3.connect(_projects_db_path())
+            datasets = c.execute("SELECT * FROM datasets WHERE project_id=?", (project_id,)).fetchall()
+            if datasets:
+                ds_data = json.dumps([dict(zip([d[0] for d in c.execute("PRAGMA table_info(datasets)").fetchall()], row)) for row in datasets], indent=2, default=str)
+                zf.writestr("spend_datasets.json", ds_data)
+            c.close()
+        return send_file(str(backup_path), as_attachment=True, download_name=backup_name)
+    except Exception as e:
+        logger.error(f"Project backup error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+# ================= PROJECT MANAGEMENT PAGE =================
+
+PROJECTS_HTML = """
+<style>
+/* ── Project Management Page Styles ── */
+.pm-header { display:flex; justify-content:space-between; align-items:center; margin-bottom:28px; flex-wrap:wrap; gap:16px; }
+.pm-header h1 { font-size:1.8rem; font-weight:800; letter-spacing:-0.5px; }
+.pm-header h1 span { color:var(--orange); }
+.pm-header-actions { display:flex; gap:10px; align-items:center; }
+.pm-search { background:rgba(255,255,255,0.08); border:1px solid rgba(255,255,255,0.12); border-radius:10px; padding:10px 16px; color:white; font-family:'Outfit',sans-serif; font-size:0.88rem; width:240px; outline:none; transition:border-color 0.2s; }
+.pm-search:focus { border-color:var(--orange); }
+.pm-search::placeholder { color:rgba(255,255,255,0.35); }
+.pm-btn-create { background:var(--orange); color:white; border:none; border-radius:10px; padding:10px 22px; font-family:'Outfit',sans-serif; font-weight:700; font-size:0.88rem; cursor:pointer; display:flex; align-items:center; gap:8px; transition:all 0.25s; text-transform:uppercase; letter-spacing:0.5px; }
+.pm-btn-create:hover { background:#d45518; transform:translateY(-1px); box-shadow:0 6px 20px rgba(232,96,28,0.35); }
+.pm-stats-bar { display:grid; grid-template-columns:repeat(auto-fit, minmax(160px, 1fr)); gap:14px; margin-bottom:28px; }
+.pm-stat { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08); border-radius:14px; padding:18px 20px; text-align:center; }
+.pm-stat-num { font-size:2rem; font-weight:800; color:var(--orange); line-height:1; }
+.pm-stat-label { font-size:0.75rem; text-transform:uppercase; letter-spacing:1.5px; opacity:0.5; margin-top:6px; }
+.pm-filter-bar { display:flex; gap:10px; margin-bottom:22px; flex-wrap:wrap; }
+.pm-filter-chip { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:20px; padding:6px 16px; font-size:0.78rem; font-weight:600; cursor:pointer; transition:all 0.2s; font-family:'Outfit',sans-serif; color:rgba(255,255,255,0.7); }
+.pm-filter-chip:hover { background:rgba(255,255,255,0.1); color:white; }
+.pm-filter-chip.active { background:var(--orange); color:white; border-color:var(--orange); }
+.pm-grid { display:grid; grid-template-columns:repeat(auto-fill, minmax(340px, 1fr)); gap:18px; }
+.pm-card { background:rgba(255,255,255,0.07); border:1px solid rgba(255,255,255,0.08); border-radius:16px; padding:0; overflow:hidden; transition:all 0.3s; cursor:pointer; position:relative; }
+.pm-card:hover { transform:translateY(-3px); box-shadow:0 12px 40px rgba(0,0,0,0.25); border-color:rgba(255,255,255,0.15); }
+.pm-card-accent { height:4px; width:100%; }
+.pm-card-body { padding:22px 24px 18px; }
+.pm-card-top { display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px; }
+.pm-card-name { font-size:1.15rem; font-weight:700; line-height:1.3; }
+.pm-card-id { font-size:0.7rem; font-weight:600; opacity:0.4; letter-spacing:1px; text-transform:uppercase; margin-top:2px; }
+.pm-card-status { padding:3px 10px; border-radius:12px; font-size:0.68rem; font-weight:700; text-transform:uppercase; letter-spacing:0.8px; white-space:nowrap; }
+.pm-status-active { background:rgba(16,185,129,0.15); color:#34d399; }
+.pm-status-archived { background:rgba(156,163,175,0.15); color:#9ca3af; }
+.pm-status-draft { background:rgba(251,191,36,0.15); color:#fbbf24; }
+.pm-status-completed { background:rgba(96,165,250,0.15); color:#60a5fa; }
+.pm-card-desc { font-size:0.82rem; opacity:0.55; line-height:1.5; margin-bottom:14px; display:-webkit-box; -webkit-line-clamp:2; -webkit-box-orient:vertical; overflow:hidden; min-height:2.4em; }
+.pm-card-meta { display:flex; gap:16px; padding-top:14px; border-top:1px solid rgba(255,255,255,0.06); }
+.pm-card-meta-item { display:flex; align-items:center; gap:5px; font-size:0.75rem; opacity:0.5; }
+.pm-card-meta-item svg { width:14px; height:14px; opacity:0.6; }
+.pm-card-stats { display:flex; gap:12px; margin-bottom:14px; }
+.pm-card-stat { background:rgba(255,255,255,0.05); border-radius:8px; padding:8px 12px; flex:1; text-align:center; }
+.pm-card-stat-val { font-size:1.1rem; font-weight:800; color:var(--orange); }
+.pm-card-stat-lbl { font-size:0.65rem; text-transform:uppercase; letter-spacing:1px; opacity:0.4; }
+.pm-card-actions { display:flex; gap:6px; margin-top:14px; }
+.pm-card-btn { flex:1; padding:8px 0; border-radius:8px; border:1px solid rgba(255,255,255,0.1); background:rgba(255,255,255,0.04); color:rgba(255,255,255,0.7); font-family:'Outfit',sans-serif; font-size:0.75rem; font-weight:600; cursor:pointer; transition:all 0.2s; text-align:center; }
+.pm-card-btn:hover { background:rgba(255,255,255,0.1); color:white; }
+.pm-card-btn.primary { background:rgba(232,96,28,0.15); border-color:rgba(232,96,28,0.3); color:var(--orange); }
+.pm-card-btn.primary:hover { background:rgba(232,96,28,0.25); }
+.pm-card-btn.danger { color:#f87171; border-color:rgba(248,113,113,0.2); }
+.pm-card-btn.danger:hover { background:rgba(248,113,113,0.1); }
+
+/* ── Modal Styles ── */
+.pm-modal-overlay { display:none; position:fixed; top:0; left:0; right:0; bottom:0; background:rgba(0,0,0,0.6); backdrop-filter:blur(8px); z-index:1000; align-items:center; justify-content:center; padding:20px; }
+.pm-modal-overlay.open { display:flex; }
+.pm-modal { background:linear-gradient(145deg, #1a2744 0%, #0f1d36 100%); border:1px solid rgba(255,255,255,0.1); border-radius:20px; width:100%; max-width:520px; padding:0; overflow:hidden; box-shadow:0 25px 60px rgba(0,0,0,0.5); animation:pmSlideUp 0.3s ease; }
+@keyframes pmSlideUp { from { opacity:0; transform:translateY(20px); } to { opacity:1; transform:translateY(0); } }
+.pm-modal-header { padding:24px 28px 0; display:flex; justify-content:space-between; align-items:center; }
+.pm-modal-header h2 { font-size:1.25rem; font-weight:800; }
+.pm-modal-close { background:none; border:none; color:rgba(255,255,255,0.4); font-size:1.4rem; cursor:pointer; padding:4px 8px; border-radius:8px; transition:all 0.2s; }
+.pm-modal-close:hover { background:rgba(255,255,255,0.1); color:white; }
+.pm-modal-body { padding:20px 28px 28px; }
+.pm-form-group { margin-bottom:16px; }
+.pm-form-label { display:block; font-size:0.78rem; font-weight:600; text-transform:uppercase; letter-spacing:1px; opacity:0.6; margin-bottom:6px; }
+.pm-form-input { width:100%; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:10px; padding:11px 14px; color:white; font-family:'Outfit',sans-serif; font-size:0.9rem; outline:none; transition:border-color 0.2s; }
+.pm-form-input:focus { border-color:var(--orange); }
+.pm-form-input::placeholder { color:rgba(255,255,255,0.25); }
+textarea.pm-form-input { resize:vertical; min-height:70px; }
+.pm-form-row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+.pm-color-grid { display:flex; gap:8px; flex-wrap:wrap; }
+.pm-color-opt { width:32px; height:32px; border-radius:10px; cursor:pointer; border:2px solid transparent; transition:all 0.2s; position:relative; }
+.pm-color-opt:hover { transform:scale(1.15); }
+.pm-color-opt.selected { border-color:white; box-shadow:0 0 12px rgba(255,255,255,0.3); }
+.pm-color-opt.selected::after { content:'✓'; position:absolute; top:50%; left:50%; transform:translate(-50%,-50%); font-size:0.75rem; font-weight:800; color:white; text-shadow:0 1px 3px rgba(0,0,0,0.5); }
+.pm-form-select { width:100%; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.1); border-radius:10px; padding:11px 14px; color:white; font-family:'Outfit',sans-serif; font-size:0.9rem; outline:none; appearance:none; cursor:pointer; background-image:url("data:image/svg+xml,%3Csvg width='12' height='12' viewBox='0 0 12 12' fill='none' xmlns='http://www.w3.org/2000/svg'%3E%3Cpath d='M2 4L6 8L10 4' stroke='white' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E"); background-repeat:no-repeat; background-position:right 14px center; }
+.pm-form-select option { background:#1a2744; color:white; }
+.pm-modal-footer { display:flex; gap:10px; justify-content:flex-end; padding-top:8px; }
+.pm-btn { padding:10px 24px; border-radius:10px; font-family:'Outfit',sans-serif; font-weight:700; font-size:0.85rem; cursor:pointer; transition:all 0.2s; border:none; }
+.pm-btn-secondary { background:rgba(255,255,255,0.08); color:rgba(255,255,255,0.7); }
+.pm-btn-secondary:hover { background:rgba(255,255,255,0.12); color:white; }
+.pm-btn-primary { background:var(--orange); color:white; }
+.pm-btn-primary:hover { background:#d45518; }
+.pm-btn-danger { background:rgba(239,68,68,0.15); color:#f87171; }
+.pm-btn-danger:hover { background:rgba(239,68,68,0.25); }
+
+.pm-empty { text-align:center; padding:60px 20px; }
+.pm-empty-icon { font-size:3rem; margin-bottom:16px; opacity:0.3; }
+.pm-empty-title { font-size:1.2rem; font-weight:700; margin-bottom:8px; opacity:0.6; }
+.pm-empty-sub { font-size:0.85rem; opacity:0.35; }
+.pm-active-badge { display:inline-flex; align-items:center; gap:4px; background:rgba(16,185,129,0.12); color:#34d399; padding:2px 8px; border-radius:6px; font-size:0.65rem; font-weight:700; text-transform:uppercase; letter-spacing:0.5px; margin-left:8px; }
+.pm-active-badge::before { content:''; width:6px; height:6px; background:#34d399; border-radius:50%; }
+@media(max-width:768px) {
+    .pm-header { flex-direction:column; align-items:stretch; }
+    .pm-header-actions { flex-direction:column; }
+    .pm-search { width:100%; }
+    .pm-grid { grid-template-columns:1fr; }
+    .pm-form-row { grid-template-columns:1fr; }
+    .pm-stats-bar { grid-template-columns:repeat(2, 1fr); }
+}
+</style>
+
+<div class="pm-header">
+    <h1>Project <span>Hub</span></h1>
+    <div class="pm-header-actions">
+        <input type="text" class="pm-search" id="pm-search" placeholder="Search projects..." oninput="pmFilterCards()">
+        {% if user_role in ['admin', 'analyst'] %}
+        <button class="pm-btn-create" onclick="pmOpenCreateModal()">
+            <svg width="16" height="16" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+            New Project
+        </button>
+        {% endif %}
+    </div>
+</div>
+
+<div class="pm-stats-bar" id="pm-stats-bar">
+    <div class="pm-stat"><div class="pm-stat-num" id="pm-total-count">—</div><div class="pm-stat-label">Total Projects</div></div>
+    <div class="pm-stat"><div class="pm-stat-num" id="pm-active-count">—</div><div class="pm-stat-label">Active</div></div>
+    <div class="pm-stat"><div class="pm-stat-num" id="pm-models-count">—</div><div class="pm-stat-label">Cost Models</div></div>
+    <div class="pm-stat"><div class="pm-stat-num" id="pm-datasets-count">—</div><div class="pm-stat-label">Datasets</div></div>
+    <div class="pm-stat"><div class="pm-stat-num" id="pm-skus-count">—</div><div class="pm-stat-label">Saved SKUs</div></div>
+</div>
+
+<div class="pm-filter-bar" id="pm-filter-bar">
+    <div class="pm-filter-chip active" data-filter="all" onclick="pmSetFilter('all', this)">All</div>
+    <div class="pm-filter-chip" data-filter="active" onclick="pmSetFilter('active', this)">Active</div>
+    <div class="pm-filter-chip" data-filter="draft" onclick="pmSetFilter('draft', this)">Draft</div>
+    <div class="pm-filter-chip" data-filter="completed" onclick="pmSetFilter('completed', this)">Completed</div>
+    <div class="pm-filter-chip" data-filter="archived" onclick="pmSetFilter('archived', this)">Archived</div>
+</div>
+
+<div class="pm-grid" id="pm-grid"></div>
+
+<!-- Create / Edit Modal -->
+<div class="pm-modal-overlay" id="pm-modal">
+    <div class="pm-modal">
+        <div class="pm-modal-header">
+            <h2 id="pm-modal-title">New Project</h2>
+            <button class="pm-modal-close" onclick="pmCloseModal()">&times;</button>
+        </div>
+        <div class="pm-modal-body">
+            <input type="hidden" id="pm-edit-id">
+            <div class="pm-form-group">
+                <label class="pm-form-label">Project Name *</label>
+                <input type="text" class="pm-form-input" id="pm-name" placeholder="e.g. Q3 Beverage Packaging Audit">
+            </div>
+            <div class="pm-form-row">
+                <div class="pm-form-group">
+                    <label class="pm-form-label">Project ID</label>
+                    <input type="text" class="pm-form-input" id="pm-id" placeholder="Auto-generated">
+                </div>
+                <div class="pm-form-group">
+                    <label class="pm-form-label">Client / Business Unit</label>
+                    <input type="text" class="pm-form-input" id="pm-client" placeholder="e.g. Coca-Cola India">
+                </div>
+            </div>
+            <div class="pm-form-group">
+                <label class="pm-form-label">Description</label>
+                <textarea class="pm-form-input" id="pm-desc" placeholder="Brief project scope and objectives..."></textarea>
+            </div>
+            <div class="pm-form-row">
+                <div class="pm-form-group">
+                    <label class="pm-form-label">Status</label>
+                    <select class="pm-form-select" id="pm-status">
+                        <option value="active">Active</option>
+                        <option value="draft">Draft</option>
+                        <option value="completed">Completed</option>
+                        <option value="archived">Archived</option>
+                    </select>
+                </div>
+                <div class="pm-form-group">
+                    <label class="pm-form-label">Color Tag</label>
+                    <div class="pm-color-grid" id="pm-color-grid"></div>
+                </div>
+            </div>
+            <div class="pm-modal-footer">
+                <button class="pm-btn pm-btn-secondary" onclick="pmCloseModal()">Cancel</button>
+                <button class="pm-btn pm-btn-primary" id="pm-save-btn" onclick="pmSaveProject()">Create Project</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<!-- Delete Confirmation Modal -->
+<div class="pm-modal-overlay" id="pm-delete-modal">
+    <div class="pm-modal" style="max-width:400px;">
+        <div class="pm-modal-header">
+            <h2 style="color:#f87171;">Delete Project</h2>
+            <button class="pm-modal-close" onclick="pmCloseDeleteModal()">&times;</button>
+        </div>
+        <div class="pm-modal-body">
+            <p style="opacity:0.7;font-size:0.9rem;margin-bottom:8px;">Are you sure you want to permanently delete <strong id="pm-del-name"></strong>?</p>
+            <p style="opacity:0.4;font-size:0.8rem;margin-bottom:20px;">This action cannot be undone. Associated cost models and datasets will be unlinked.</p>
+            <input type="hidden" id="pm-del-id">
+            <div class="pm-modal-footer">
+                <button class="pm-btn pm-btn-secondary" onclick="pmCloseDeleteModal()">Cancel</button>
+                <button class="pm-btn pm-btn-danger" onclick="pmConfirmDelete()">Delete Project</button>
+            </div>
+        </div>
+    </div>
+</div>
+
+<script>
+const PM_COLORS = ['#E8601C','#3b82f6','#10b981','#8b5cf6','#f59e0b','#ec4899','#06b6d4','#ef4444','#84cc16','#6366f1','#14b8a6','#f97316'];
+let pmProjects = [];
+let pmStats = { model_counts:{}, dataset_counts:{}, sku_counts:{} };
+let pmCurrentFilter = 'all';
+let pmSelectedColor = '#E8601C';
+
+function pmRenderColorGrid(containerId, selected) {
+    const g = document.getElementById(containerId);
+    g.innerHTML = PM_COLORS.map(c =>
+        `<div class="pm-color-opt ${c===selected?'selected':''}" style="background:${c}" onclick="pmSelectColor('${c}', '${containerId}')"></div>`
+    ).join('');
+}
+
+function pmSelectColor(color, containerId) {
+    pmSelectedColor = color;
+    pmRenderColorGrid(containerId, color);
+}
+
+function pmTimeAgo(dateStr) {
+    if (!dateStr) return '';
+    const d = new Date(dateStr + 'Z');
+    const now = new Date();
+    const diff = Math.floor((now - d) / 1000);
+    if (diff < 60) return 'just now';
+    if (diff < 3600) return Math.floor(diff/60) + 'm ago';
+    if (diff < 86400) return Math.floor(diff/3600) + 'h ago';
+    if (diff < 604800) return Math.floor(diff/86400) + 'd ago';
+    return d.toLocaleDateString('en-US', {month:'short', day:'numeric', year:'numeric'});
+}
+
+function pmRenderCards() {
+    const grid = document.getElementById('pm-grid');
+    const search = (document.getElementById('pm-search').value || '').toLowerCase();
+    const activePid = sessionStorage.getItem('project_id') || '';
+    let filtered = pmProjects.filter(p => {
+        if (pmCurrentFilter !== 'all' && (p.status || 'active') !== pmCurrentFilter) return false;
+        if (search) {
+            const hay = (p.project_name + ' ' + p.project_id + ' ' + (p.description||'') + ' ' + (p.client_name||'')).toLowerCase();
+            if (!hay.includes(search)) return false;
+        }
+        return true;
+    });
+
+    if (filtered.length === 0) {
+        grid.innerHTML = `<div class="pm-empty" style="grid-column:1/-1;"><div class="pm-empty-icon">📁</div><div class="pm-empty-title">${search ? 'No matching projects' : 'No projects yet'}</div><div class="pm-empty-sub">${search ? 'Try a different search term' : 'Create your first project to get started'}</div></div>`;
+        return;
+    }
+
+    grid.innerHTML = filtered.map(p => {
+        const color = p.color || '#E8601C';
+        const status = p.status || 'active';
+        const mc = pmStats.model_counts[p.project_id] || 0;
+        const dc = pmStats.dataset_counts[p.project_id] || 0;
+        const sc = pmStats.sku_counts[p.project_id] || 0;
+        const isActive = p.project_id === activePid;
+        return `
+        <div class="pm-card" data-pid="${p.project_id}">
+            <div class="pm-card-accent" style="background:linear-gradient(90deg, ${color}, ${color}88);"></div>
+            <div class="pm-card-body">
+                <div class="pm-card-top">
+                    <div>
+                        <div class="pm-card-name">${p.project_name}${isActive ? '<span class="pm-active-badge">Current</span>' : ''}</div>
+                        <div class="pm-card-id">${p.project_id}${p.client_name ? ' · ' + p.client_name : ''}</div>
+                    </div>
+                    <div class="pm-card-status pm-status-${status}">${status}</div>
+                </div>
+                <div class="pm-card-desc">${p.description || 'No description provided'}</div>
+                <div class="pm-card-stats">
+                    <div class="pm-card-stat"><div class="pm-card-stat-val">${mc}</div><div class="pm-card-stat-lbl">Models</div></div>
+                    <div class="pm-card-stat"><div class="pm-card-stat-val">${dc}</div><div class="pm-card-stat-lbl">Datasets</div></div>
+                    <div class="pm-card-stat"><div class="pm-card-stat-val">${sc}</div><div class="pm-card-stat-lbl">SKUs</div></div>
+                </div>
+                <div class="pm-card-meta">
+                    <div class="pm-card-meta-item"><svg viewBox="0 0 16 16" fill="none"><path d="M8 4v4l3 2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/><circle cx="8" cy="8" r="6" stroke="currentColor" stroke-width="1.5"/></svg>${pmTimeAgo(p.updated_at || p.created_at)}</div>
+                    <div class="pm-card-meta-item"><svg viewBox="0 0 16 16" fill="none"><path d="M8 2a4 4 0 014 4c0 3-4 7-4 7s-4-4-4-7a4 4 0 014-4z" stroke="currentColor" stroke-width="1.5"/></svg>${p.created_by || '—'}</div>
+                </div>
+                <div class="pm-card-actions">
+                    <button class="pm-card-btn primary" onclick="event.stopPropagation(); pmActivateProject('${p.project_id}')">${isActive ? '✓ Active' : 'Set Active'}</button>
+                    <button class="pm-card-btn" onclick="event.stopPropagation(); pmEditProject('${p.project_id}')">Edit</button>
+                    <button class="pm-card-btn" onclick="event.stopPropagation(); pmBackup('${p.project_id}')">Backup</button>
+                    {% if user_role == 'admin' %}
+                    <button class="pm-card-btn danger" onclick="event.stopPropagation(); pmDeleteProject('${p.project_id}')">✕</button>
+                    {% endif %}
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+}
+
+function pmUpdateStats() {
+    const total = pmProjects.length;
+    const active = pmProjects.filter(p => (p.status||'active') === 'active').length;
+    let totalModels = 0, totalDatasets = 0, totalSKUs = 0;
+    Object.values(pmStats.model_counts).forEach(v => totalModels += v);
+    Object.values(pmStats.dataset_counts).forEach(v => totalDatasets += v);
+    Object.values(pmStats.sku_counts || {}).forEach(v => totalSKUs += v);
+    document.getElementById('pm-total-count').textContent = total;
+    document.getElementById('pm-active-count').textContent = active;
+    document.getElementById('pm-models-count').textContent = totalModels;
+    document.getElementById('pm-datasets-count').textContent = totalDatasets;
+    document.getElementById('pm-skus-count').textContent = totalSKUs;
+}
+
+function pmSetFilter(filter, el) {
+    pmCurrentFilter = filter;
+    document.querySelectorAll('.pm-filter-chip').forEach(c => c.classList.remove('active'));
+    el.classList.add('active');
+    pmRenderCards();
+}
+
+function pmFilterCards() { pmRenderCards(); }
+
+function pmOpenCreateModal() {
+    document.getElementById('pm-modal-title').textContent = 'New Project';
+    document.getElementById('pm-save-btn').textContent = 'Create Project';
+    document.getElementById('pm-edit-id').value = '';
+    document.getElementById('pm-name').value = '';
+    document.getElementById('pm-id').value = '';
+    document.getElementById('pm-id').disabled = false;
+    document.getElementById('pm-client').value = '';
+    document.getElementById('pm-desc').value = '';
+    document.getElementById('pm-status').value = 'active';
+    pmSelectedColor = '#E8601C';
+    pmRenderColorGrid('pm-color-grid', pmSelectedColor);
+    document.getElementById('pm-modal').classList.add('open');
+}
+
+function pmEditProject(pid) {
+    const p = pmProjects.find(x => x.project_id === pid);
+    if (!p) return;
+    document.getElementById('pm-modal-title').textContent = 'Edit Project';
+    document.getElementById('pm-save-btn').textContent = 'Save Changes';
+    document.getElementById('pm-edit-id').value = pid;
+    document.getElementById('pm-name').value = p.project_name;
+    document.getElementById('pm-id').value = p.project_id;
+    document.getElementById('pm-id').disabled = true;
+    document.getElementById('pm-client').value = p.client_name || '';
+    document.getElementById('pm-desc').value = p.description || '';
+    document.getElementById('pm-status').value = p.status || 'active';
+    pmSelectedColor = p.color || '#E8601C';
+    pmRenderColorGrid('pm-color-grid', pmSelectedColor);
+    document.getElementById('pm-modal').classList.add('open');
+}
+
+function pmCloseModal() { document.getElementById('pm-modal').classList.remove('open'); }
+
+async function pmSaveProject() {
+    const editId = document.getElementById('pm-edit-id').value;
+    const name = document.getElementById('pm-name').value.trim();
+    if (!name) { document.getElementById('pm-name').style.borderColor='#ef4444'; return; }
+    const payload = {
+        project_name: name,
+        description: document.getElementById('pm-desc').value.trim(),
+        client_name: document.getElementById('pm-client').value.trim(),
+        status: document.getElementById('pm-status').value,
+        color: pmSelectedColor
+    };
+    if (!editId) {
+        const pid = document.getElementById('pm-id').value.trim();
+        if (pid) payload.project_id = pid;
+    }
+    try {
+        const url = editId ? '/api/projects/' + editId : '/api/projects';
+        const method = editId ? 'PUT' : 'POST';
+        const r = await fetch(url, { method, headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload) });
+        const d = await r.json();
+        if (d.success || d.project_id) {
+            pmCloseModal();
+            await pmLoadAll();
+            if (!editId && d.project_id) pmActivateProject(d.project_id);
+        } else {
+            alert(d.error || 'Save failed');
+        }
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function pmActivateProject(pid) {
+    sessionStorage.setItem('project_id', pid);
+    try {
+        await fetch('/api/projects/set_active', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({project_id:pid}) });
+    } catch(e) {}
+    // Update the nav project switcher too
+    const sel = document.getElementById('project-switcher');
+    if (sel) sel.value = pid;
+    pmRenderCards();
+}
+
+function pmDeleteProject(pid) {
+    const p = pmProjects.find(x => x.project_id === pid);
+    document.getElementById('pm-del-name').textContent = p ? p.project_name : pid;
+    document.getElementById('pm-del-id').value = pid;
+    document.getElementById('pm-delete-modal').classList.add('open');
+}
+
+function pmCloseDeleteModal() { document.getElementById('pm-delete-modal').classList.remove('open'); }
+
+async function pmConfirmDelete() {
+    const pid = document.getElementById('pm-del-id').value;
+    try {
+        await fetch('/api/projects/' + pid, { method:'DELETE' });
+        pmCloseDeleteModal();
+        if (sessionStorage.getItem('project_id') === pid) {
+            sessionStorage.setItem('project_id', '');
+            await fetch('/api/projects/set_active', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({project_id:''}) });
+        }
+        await pmLoadAll();
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function pmBackup(pid) {
+    try {
+        const r = await fetch('/api/projects/' + pid + '/backup', { method:'POST' });
+        if (r.ok) {
+            const blob = await r.blob();
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            a.download = pid + '_backup.zip';
+            a.click();
+            URL.revokeObjectURL(url);
+        } else {
+            const d = await r.json();
+            alert(d.error || 'Backup failed');
+        }
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+async function pmLoadAll() {
+    try {
+        const [pr, sr] = await Promise.all([
+            fetch('/api/projects').then(r => r.json()),
+            fetch('/api/projects/all_stats').then(r => r.json())
+        ]);
+        pmProjects = pr.projects || [];
+        pmStats = { model_counts: sr.model_counts || {}, dataset_counts: sr.dataset_counts || {}, sku_counts: sr.sku_counts || {} };
+    } catch(e) { pmProjects = []; }
+    pmUpdateStats();
+    pmRenderCards();
+}
+
+// Close modals on overlay click
+document.addEventListener('click', e => {
+    if (e.target.id === 'pm-modal') pmCloseModal();
+    if (e.target.id === 'pm-delete-modal') pmCloseDeleteModal();
+});
+document.addEventListener('keydown', e => { if (e.key === 'Escape') { pmCloseModal(); pmCloseDeleteModal(); } });
+
+pmLoadAll();
+</script>
+"""
+
+@app.route("/projects")
+@login_required
+def projects_page():
+    """Project Management Hub"""
+    user_role = session.get('role', 'viewer')
+    return render_template_string(BASE_HTML.replace("{{ content | safe }}", PROJECTS_HTML), active="Projects", user_role=user_role)
+
 
 # ================= MODEL BUILDER ROUTES =================
 
@@ -2574,6 +3405,311 @@ def api_duplicate_model(model_id):
 
 
 # ================= NEW UX UPGRADE APIS =================
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE 2: REUSABLE BLOCKS (Sub-Models)
+# ═══════════════════════════════════════════════════════════════════════════
+REUSABLE_BLOCKS = {
+    "factory_overhead": {
+        "name": "Factory Overhead Block",
+        "description": "Standard electricity, rent, and management salary overhead calculations.",
+        "category": "Overhead",
+        "fields": [
+            {"id":"electricity_rate","label":"Electricity Rate","type":"input","input_type":"number","unit":"₹/kWh","default":8,"input_group":"Overhead","data_source":"variable_cost","data_key":"electricity"},
+            {"id":"power_kw","label":"Power Consumption","type":"input","input_type":"number","unit":"kW","default":50,"input_group":"Machine"},
+            {"id":"rent_per_month","label":"Factory Rent","type":"input","input_type":"number","unit":"₹/month","default":200000,"input_group":"Overhead"},
+            {"id":"mgmt_salary","label":"Management Salary","type":"input","input_type":"number","unit":"₹/month","default":80000,"input_group":"Overhead"},
+            {"id":"mgmt_heads","label":"Mgmt Headcount","type":"input","input_type":"number","unit":"pcs","default":2,"input_group":"Overhead"},
+            {"id":"monthly_output","label":"Monthly Output","type":"input","input_type":"number","unit":"pcs","default":500000,"input_group":"Machine"},
+            {"id":"energy_cost_per_1000","label":"Energy Cost / 1000 pcs","type":"formula","formula":"(power_kw * electricity_rate * 8 * 26) / (monthly_output / 1000)","unit":"₹","formula_section":"Overhead Breakdown"},
+            {"id":"rent_per_1000","label":"Rent / 1000 pcs","type":"formula","formula":"rent_per_month / (monthly_output / 1000)","unit":"₹","formula_section":"Overhead Breakdown"},
+            {"id":"mgmt_per_1000","label":"Mgmt Cost / 1000 pcs","type":"formula","formula":"(mgmt_salary * mgmt_heads) / (monthly_output / 1000)","unit":"₹","formula_section":"Overhead Breakdown"},
+            {"id":"total_overhead_per_1000","label":"Total Overhead / 1000 pcs","type":"formula","formula":"energy_cost_per_1000 + rent_per_1000 + mgmt_per_1000","unit":"₹","formula_section":"Overhead Breakdown"},
+        ]
+    },
+    "depreciation": {
+        "name": "Machine Depreciation Block",
+        "description": "Standard depreciation calculation (straight-line, 5yr life).",
+        "category": "Machine",
+        "fields": [
+            {"id":"machine_cost","label":"Machine Cost","type":"input","input_type":"number","unit":"₹","default":5000000,"input_group":"Machine","data_source":"machine"},
+            {"id":"machine_life_months","label":"Machine Life","type":"input","input_type":"number","unit":"months","default":60,"input_group":"Machine"},
+            {"id":"monthly_output","label":"Monthly Output","type":"input","input_type":"number","unit":"pcs","default":500000,"input_group":"Machine"},
+            {"id":"depreciation_per_1000","label":"Depreciation / 1000 pcs","type":"formula","formula":"(machine_cost / machine_life_months) / (monthly_output / 1000)","unit":"₹","formula_section":"Cost Breakdown"},
+        ]
+    },
+    "labour_cost": {
+        "name": "Labour Cost Block",
+        "description": "Multi-shift labour cost calculation with shift allowance.",
+        "category": "Labour",
+        "fields": [
+            {"id":"operators","label":"Operators/Shift","type":"input","input_type":"number","unit":"pcs","default":2,"input_group":"Labour"},
+            {"id":"operator_salary","label":"Operator Salary","type":"input","input_type":"number","unit":"₹/month","default":18000,"input_group":"Labour","data_source":"variable_cost","data_key":"labour"},
+            {"id":"shifts_per_day","label":"Shifts / Day","type":"input","input_type":"number","unit":"","default":3,"input_group":"Machine"},
+            {"id":"shift_allowance_pct","label":"Night Shift Allowance","type":"input","input_type":"percent","unit":"%","default":10,"input_group":"Labour"},
+            {"id":"monthly_output","label":"Monthly Output","type":"input","input_type":"number","unit":"pcs","default":500000,"input_group":"Machine"},
+            {"id":"labour_per_1000","label":"Labour / 1000 pcs","type":"formula","formula":"(operators * operator_salary * shifts_per_day * (1 + shift_allowance_pct / 100 * (shifts_per_day - 1) / shifts_per_day)) / (monthly_output / 1000)","unit":"₹","formula_section":"Cost Breakdown"},
+        ]
+    },
+    "logistics": {
+        "name": "Logistics & Freight Block",
+        "description": "Domestic freight, handling and warehousing costs.",
+        "category": "General",
+        "fields": [
+            {"id":"freight_per_kg","label":"Freight Rate","type":"input","input_type":"number","unit":"₹/kg","default":3.5,"input_group":"General"},
+            {"id":"part_weight","label":"Part Weight","type":"input","input_type":"number","unit":"g","default":25,"input_group":"Material"},
+            {"id":"handling_per_1000","label":"Handling / 1000 pcs","type":"input","input_type":"number","unit":"₹","default":15,"input_group":"General"},
+            {"id":"warehousing_pct","label":"Warehousing %","type":"input","input_type":"percent","unit":"%","default":1.5,"input_group":"General"},
+            {"id":"freight_per_1000","label":"Freight / 1000 pcs","type":"formula","formula":"freight_per_kg * part_weight / 1000 * 1000","unit":"₹","formula_section":"Logistics"},
+            {"id":"logistics_per_1000","label":"Total Logistics / 1000","type":"formula","formula":"freight_per_1000 + handling_per_1000","unit":"₹","formula_section":"Logistics"},
+        ]
+    },
+    "printing_cost": {
+        "name": "Printing Cost Block",
+        "description": "Multi-color printing cost (ink, cylinder/plate, setup).",
+        "category": "Material",
+        "fields": [
+            {"id":"colors","label":"No. of Colors","type":"input","input_type":"number","unit":"","default":8,"input_group":"Material"},
+            {"id":"ink_cost_per_kg","label":"Ink Cost","type":"input","input_type":"number","unit":"₹/kg","default":850,"input_group":"Material"},
+            {"id":"ink_coverage","label":"Ink Coverage","type":"input","input_type":"number","unit":"g/sqm","default":3.5,"input_group":"Material"},
+            {"id":"print_area","label":"Print Area","type":"input","input_type":"number","unit":"sqm","default":0.03,"input_group":"Dimensions"},
+            {"id":"cylinder_cost","label":"Cylinder/Plate Cost","type":"input","input_type":"number","unit":"₹","default":25000,"input_group":"Machine"},
+            {"id":"order_qty","label":"Order Quantity","type":"input","input_type":"number","unit":"pcs","default":100000,"input_group":"General"},
+            {"id":"ink_per_pc","label":"Ink Cost / pc","type":"formula","formula":"print_area * ink_coverage * ink_cost_per_kg / 1000 * colors","unit":"₹","formula_section":"Printing"},
+            {"id":"cylinder_per_pc","label":"Cylinder / pc","type":"formula","formula":"(cylinder_cost * colors) / order_qty","unit":"₹","formula_section":"Printing"},
+            {"id":"total_print_per_pc","label":"Total Print / pc","type":"formula","formula":"ink_per_pc + cylinder_per_pc","unit":"₹","formula_section":"Printing"},
+        ]
+    },
+}
+
+
+@app.route("/api/model_blocks", methods=["GET"])
+@login_required
+def api_list_blocks():
+    """List all reusable model blocks."""
+    blocks = []
+    for bid, block in REUSABLE_BLOCKS.items():
+        blocks.append({
+            "id": bid,
+            "name": block["name"],
+            "description": block["description"],
+            "category": block["category"],
+            "field_count": len(block["fields"]),
+            "input_count": sum(1 for f in block["fields"] if f["type"] == "input"),
+            "formula_count": sum(1 for f in block["fields"] if f["type"] == "formula"),
+        })
+    return jsonify({"success": True, "blocks": blocks})
+
+
+@app.route("/api/model_blocks/<block_id>", methods=["GET"])
+@login_required
+def api_get_block(block_id):
+    """Get a single reusable block's fields."""
+    block = REUSABLE_BLOCKS.get(block_id)
+    if not block:
+        return jsonify({"success": False, "message": "Block not found"}), 404
+    return jsonify({"success": True, "block": block})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE 3: UNIT TESTING FOR COST MODELS
+# ═══════════════════════════════════════════════════════════════════════════
+
+@app.route("/api/models/<model_id>/test_cases", methods=["GET"])
+@login_required
+def api_get_test_cases(model_id):
+    """Get saved test cases for a model."""
+    path = MODELS_DIR / f"{model_id}.json"
+    if not path.exists():
+        return jsonify({"success": False, "message": "Model not found"}), 404
+    with open(path, 'r') as f:
+        model = json.load(f)
+    return jsonify({"success": True, "test_cases": model.get("test_cases", [])})
+
+
+@app.route("/api/models/<model_id>/test_cases", methods=["POST"])
+@role_required('admin')
+def api_save_test_cases(model_id):
+    """Save test cases for a model."""
+    path = MODELS_DIR / f"{model_id}.json"
+    if not path.exists():
+        return jsonify({"success": False, "message": "Model not found"}), 404
+    data = request.get_json()
+    test_cases = data.get('test_cases', [])
+    with open(path, 'r') as f:
+        model = json.load(f)
+    model['test_cases'] = test_cases
+    model['updated_at'] = datetime.now().isoformat()
+    with open(path, 'w') as f:
+        json.dump(model, f, indent=2)
+    return jsonify({"success": True})
+
+
+@app.route("/api/models/<model_id>/run_tests", methods=["POST"])
+@login_required
+def api_run_model_tests(model_id):
+    """Run all test cases against the model and return pass/fail results."""
+    path = MODELS_DIR / f"{model_id}.json"
+    if not path.exists():
+        return jsonify({"success": False, "message": "Model not found"}), 404
+    with open(path, 'r') as f:
+        model = json.load(f)
+    test_cases = model.get('test_cases', [])
+    if not test_cases:
+        return jsonify({"success": True, "results": [], "message": "No test cases defined"})
+
+    # Load global namespace
+    global_ns = _build_global_namespace()
+    results = []
+    for tc in test_cases:
+        tc_inputs = tc.get('inputs', {})
+        tc_expected = tc.get('expected', {})
+        tolerance_pct = tc.get('tolerance_pct', 2.0)
+
+        # Build namespace: global + inputs
+        ns = dict(global_ns)
+        for field in model.get('fields', []):
+            fid = field['id']
+            if field.get('type') == 'input':
+                val = tc_inputs.get(fid, field.get('default', 0))
+                try:
+                    ns[fid] = float(val)
+                except (ValueError, TypeError):
+                    ns[fid] = 0
+        # Evaluate all formulas
+        computed = {}
+        for field in model.get('fields', []):
+            fid = field['id']
+            if field.get('type') == 'formula':
+                expr = field.get('formula', '0')
+                value, err = safe_eval_formula(expr, ns)
+                ns[fid] = value
+                computed[fid] = round(value, 4)
+
+        # Check expected values
+        checks = []
+        for field_id, expected_val in tc_expected.items():
+            actual = computed.get(field_id, ns.get(field_id, None))
+            if actual is None:
+                checks.append({"field": field_id, "expected": expected_val, "actual": None, "pass": False, "error": "Field not found"})
+                continue
+            try:
+                exp = float(expected_val)
+                act = float(actual)
+                tol = abs(exp * tolerance_pct / 100) if exp != 0 else 0.01
+                passed = abs(act - exp) <= tol
+                deviation_pct = ((act - exp) / exp * 100) if exp != 0 else 0
+                checks.append({
+                    "field": field_id, "expected": round(exp, 4), "actual": round(act, 4),
+                    "pass": passed, "deviation_pct": round(deviation_pct, 2)
+                })
+            except (ValueError, TypeError):
+                checks.append({"field": field_id, "expected": expected_val, "actual": actual, "pass": False, "error": "Cannot compare"})
+
+        all_passed = all(c.get('pass', False) for c in checks)
+        results.append({
+            "name": tc.get('name', 'Unnamed'),
+            "passed": all_passed,
+            "checks": checks,
+            "computed": computed,
+        })
+
+    total = len(results)
+    passed = sum(1 for r in results if r['passed'])
+    return jsonify({
+        "success": True,
+        "results": results,
+        "summary": {"total": total, "passed": passed, "failed": total - passed},
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE 5: GLOBAL NAMESPACE INHERITANCE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_global_namespace():
+    """Build a global variable namespace from database files (variable-geo.xlsx, resin-data.xlsx).
+    Model builders can reference these as global_india_electricity_rate etc."""
+    ns = {}
+    try:
+        # Load country-specific variable costs
+        cost_df = load_excel_cached('cost', sheet_name="Data", header=9)
+        if isinstance(cost_df, pd.DataFrame) and not cost_df.empty:
+            _cdf = cost_df.copy()
+            _cdf['_country_key'] = _cdf.get('Country', _cdf.iloc[:, 0]).astype(str).str.strip().str.lower().str.replace(' ', '_', regex=False)
+            _cdf = _cdf[_cdf['_country_key'].str.len() > 0].drop(columns=['Country'], errors='ignore')
+            _cdf = _cdf.set_index('_country_key').select_dtypes(include='number')
+            for (country, col), val in _cdf.stack().items():
+                try:
+                    key = f"global_{country}_{_re.sub(r'[^a-z0-9_]', '_', col.lower().strip()).strip('_')}"
+                    ns[key] = float(val)
+                except (ValueError, TypeError):
+                    pass
+    except Exception:
+        pass
+
+    try:
+        # Load latest resin prices
+        xls = load_excel_cached('resin')
+        if isinstance(xls, pd.ExcelFile):
+            for sheet_name in xls.sheet_names:
+                if sheet_name.lower() == 'unknown':
+                    continue
+                try:
+                    df = pd.read_excel(xls, sheet_name=sheet_name)
+                    if df.empty:
+                        continue
+                    # Get the latest price (last numeric column)
+                    for col in reversed(df.columns.tolist()):
+                        try:
+                            vals = pd.to_numeric(df[col], errors='coerce').dropna()
+                            if len(vals) > 0:
+                                avg_price = vals.mean()
+                                key = f"global_resin_{_re.sub(r'[^a-z0-9_]', '_', sheet_name.lower().strip()).strip('_')}_price"
+                                ns[key] = round(float(avg_price), 2)
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # Common packaging industry constants
+    ns['global_days_per_month'] = 26
+    ns['global_hours_per_shift'] = 8
+    ns['global_shifts_per_day'] = 3
+    ns['global_pi'] = 3.14159265
+    return ns
+
+
+@app.route("/api/global_namespace", methods=["GET"])
+@login_required
+def api_global_namespace():
+    """Return all available global namespace variables for use in formulas."""
+    ns = _build_global_namespace()
+    # Organize by prefix
+    organized = {}
+    for key, val in sorted(ns.items()):
+        parts = key.split('_', 2)
+        category = parts[1] if len(parts) > 1 else "general"
+        if category not in organized:
+            organized[category] = []
+        organized[category].append({"id": key, "value": val})
+    return jsonify({"success": True, "namespace": ns, "organized": organized, "count": len(ns)})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# FEATURE 6: HIDDEN FORMULAS (Formula Staging)
+# ═══════════════════════════════════════════════════════════════════════════
+# Hidden formulas are regular formulas with "hidden": true in the JSON.
+# They are evaluated in the AST namespace but not shown to end-users in the
+# shared calculator. The Model Builder UI allows toggling visibility.
+# Implementation: The `api_calculate_custom` function already evaluates all
+# formulas — hidden ones are simply filtered from the DISPLAY, not from
+# computation. The share/calc page JS checks field.hidden before rendering.
+
+
 
 # ── TEMPLATE LIBRARY ──
 PACKAGING_TEMPLATES = {
@@ -3149,7 +4285,7 @@ def api_db_lookup():
         try:
             df = load_excel_cached('machine', sheet_name="Database", header=2)
             machines = []
-            for _, r in df.head(20).iterrows():
+            for r in df.head(20).to_dict('records'):
                 cost = r.get("Machine Cost In €") or r.get("Machine Cost") or 0
                 if pd.isna(cost):
                     cost = 0
@@ -3224,17 +4360,76 @@ def api_field_suggest():
 @role_required('admin')
 def api_excel_to_model():
     """Parse uploaded .xlsx and auto-detect inputs vs formulas.
-    Returns a model JSON with field mappings for preview."""
+    Supports Named Ranges and LLM-style smart tagging for input_group & unit."""
     if 'file' not in request.files:
         return jsonify({"success": False, "message": "No file uploaded"})
     file = request.files['file']
     if not file.filename.endswith(('.xlsx', '.xls')):
         return jsonify({"success": False, "message": "Only .xlsx/.xls files accepted"})
 
+    # ── Smart tagging keyword maps ──
+    _GROUP_KEYWORDS = {
+        "Material": ["resin","material","polymer","film","gsm","ink","adhesive","layer","substrate","foil","board","paper","weight","density","price per kg","raw material","laminate","coating"],
+        "Machine": ["machine","cycle","cavities","cavity","tonnage","speed","rpm","power","kw","motor","print speed","output","line speed","mould","mold","press","equipment","cutter"],
+        "Dimensions": ["length","width","height","diameter","thick","micron","gauge","size","area","circumference","neck","mm","cm","inch"],
+        "Labour": ["labour","labor","operator","salary","wage","worker","manpower","staff","shift","hrly","hourly"],
+        "Overhead": ["electricity","rent","overhead","utility","water","maintenance","insurance","admin","management","factory","indirect"],
+        "General": ["margin","rejection","waste","scrap","working days","moq","order","quantity","batch","lot","markup","profit"],
+    }
+    _UNIT_KEYWORDS = {
+        "₹/kg": ["price.*kg","rate.*kg","cost.*kg","per kg","rs/kg","inr/kg"],
+        "g": ["gram","weight.*g","gsm","grm"],
+        "kg": ["kilogram","weight.*kg"],
+        "%": ["percent","pct","margin","rejection","waste","scrap","markup"],
+        "mm": ["millimeter","mm","length","width","height","diameter","thickness","gauge"],
+        "₹": ["cost","price","rate","amount","rs","inr","₹"],
+        "kW": ["power","kw","kilowatt","motor"],
+        "sec": ["cycle time","second","sec"],
+        "m/min": ["speed.*m","meter.*min"],
+        "pcs": ["pieces","pcs","quantity","cavit"],
+        "₹/kWh": ["electricity","kwh"],
+        "₹/month": ["salary","wage","month"],
+        "days": ["working day","days"],
+        "gsm": ["gsm"],
+        "g/sqm": ["coverage","g/sqm","gram.*sqm"],
+        "sqm": ["area","sqm","square meter"],
+    }
+
+    def _smart_group(label_text):
+        lt = label_text.lower()
+        best_group, best_score = "General", 0
+        for grp, kws in _GROUP_KEYWORDS.items():
+            score = sum(1 for kw in kws if kw in lt)
+            if score > best_score:
+                best_score = score
+                best_group = grp
+        return best_group
+
+    def _smart_unit(label_text):
+        lt = label_text.lower()
+        for unit, patterns in _UNIT_KEYWORDS.items():
+            for p in patterns:
+                if _re.search(p, lt):
+                    return unit
+        return ""
+
     try:
         import openpyxl
         wb = openpyxl.load_workbook(file, data_only=False)
         ws = wb.active
+
+        # ── Pass 0: Read Named Ranges → cell-to-name map ──
+        named_range_map = {}   # "B12" -> "Mould_Cavitation"
+        try:
+            for dn in wb.defined_names.definedName:
+                name = dn.name
+                if name.startswith('_') or '!' not in (dn.attr_text or ''):
+                    continue
+                for title, coord_str in dn.destinations:
+                    if title == ws.title:
+                        named_range_map[coord_str] = _re.sub(r'[^a-z0-9_]', '_', name.lower().strip()).strip('_')
+        except Exception:
+            pass  # Some workbooks may have unusual named ranges
 
         cell_map = {}      # A1 -> {"value": ..., "formula": ...}
         fields = []
@@ -3285,11 +4480,15 @@ def api_excel_to_model():
             if not label:
                 label = f"field_{coord.lower()}"
 
-            # Generate field ID from label
-            fid = _re.sub(r'[^a-z0-9_]', '_', label.lower().strip())
-            fid = _re.sub(r'_+', '_', fid).strip('_')[:30]
-            if not fid:
-                fid = f"cell_{coord.lower()}"
+            # ── Priority 1: Use Named Range as field ID ──
+            if coord in named_range_map:
+                fid = named_range_map[coord]
+            else:
+                # Generate field ID from label
+                fid = _re.sub(r'[^a-z0-9_]', '_', label.lower().strip())
+                fid = _re.sub(r'_+', '_', fid).strip('_')[:30]
+                if not fid:
+                    fid = f"cell_{coord.lower()}"
 
             # Ensure unique
             base_fid = fid
@@ -3300,13 +4499,17 @@ def api_excel_to_model():
 
             field_id_map[coord] = fid
 
+            # ── Smart tagging: auto-detect input_group and unit ──
+            auto_group = _smart_group(label)
+            auto_unit = _smart_unit(label)
+
             if info['is_formula']:
                 fields.append({
                     "id": fid,
                     "label": label,
                     "type": "formula",
                     "formula": "",  # Will be resolved in pass 4
-                    "unit": "",
+                    "unit": auto_unit,
                     "formula_section": "Cost Breakdown",
                     "_raw_formula": str(info['value']),
                     "_cell": coord,
@@ -3316,10 +4519,10 @@ def api_excel_to_model():
                     "id": fid,
                     "label": label,
                     "type": "input",
-                    "input_type": "number",
+                    "input_type": "percent" if auto_unit == "%" else "number",
                     "default": float(info['value']) if isinstance(info['value'], (int, float)) else 0,
-                    "unit": "",
-                    "input_group": "General",
+                    "unit": auto_unit,
+                    "input_group": auto_group,
                     "_cell": coord,
                 })
 
@@ -3350,12 +4553,17 @@ def api_excel_to_model():
                 "type": f['type'],
                 "formula": f.get('formula', ''),
                 "default": f.get('default', ''),
+                "named_range": coord in named_range_map,
+                "auto_group": f.get('input_group', ''),
+                "auto_unit": f.get('unit', ''),
             })
 
         # Clean internal keys
         for f in fields:
             f.pop('_raw_formula', None)
             f.pop('_cell', None)
+
+        named_count = sum(1 for c in named_range_map if c in field_id_map)
 
         model_json = {
             "name": file.filename.rsplit('.', 1)[0].replace('_', ' ').title(),
@@ -3371,6 +4579,8 @@ def api_excel_to_model():
             "cell_count": len(cell_map),
             "input_count": sum(1 for f in fields if f['type'] == 'input'),
             "formula_count": sum(1 for f in fields if f['type'] == 'formula'),
+            "named_ranges_used": named_count,
+            "smart_tagged": sum(1 for f in fields if f.get('unit') or f.get('input_group','General') != 'General'),
         })
     except Exception as e:
         logger.error(f"Excel→Model parse error: {e}", exc_info=True)
@@ -3496,8 +4706,9 @@ def api_calculate_custom():
     # Evaluate formulas
     results = {}
     errors = {}
-    # Build namespace from inputs
-    ns = {}
+    hidden_fields = []
+    # Build namespace: GLOBAL vars first, then user inputs override
+    ns = _build_global_namespace()
     for field in model.get('fields', []):
         fid = field['id']
         if field.get('type') == 'input':
@@ -3516,7 +4727,316 @@ def api_calculate_custom():
             results[fid] = round(value, 4)
             if err:
                 errors[fid] = err
-    return jsonify({"success": True, "results": results, "errors": errors})
+            if field.get('hidden'):
+                hidden_fields.append(fid)
+    return jsonify({"success": True, "results": results, "errors": errors, "hidden_fields": hidden_fields})
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UNIVERSAL COST SIMULATION ENGINE
+# ═══════════════════════════════════════════════════════════════════════════
+
+def run_cost_simulation(model_json, inputs):
+    """Evaluate any cost model (JSON) with given inputs and return results dict.
+    Works with Cost Model Builder models and built-in model result dicts."""
+    if not model_json:
+        return {}
+    ns = _build_global_namespace()
+    results = {}
+    errors = {}
+    fields = model_json.get('fields', [])
+    # Populate inputs
+    for field in fields:
+        fid = field['id']
+        if field.get('type') == 'input':
+            val = inputs.get(fid, field.get('default', 0))
+            try:
+                ns[fid] = float(val)
+            except (ValueError, TypeError):
+                ns[fid] = 0
+    # Evaluate formulas in order
+    for field in fields:
+        fid = field['id']
+        if field.get('type') == 'formula':
+            expr = field.get('formula', '0')
+            value, err = safe_eval_formula(expr, ns)
+            ns[fid] = value
+            results[fid] = round(value, 4)
+            if err:
+                errors[fid] = err
+    return results
+
+
+def _map_model_to_cost_structure(model_json, results):
+    """Auto-detect standard cost categories from custom model fields.
+    Returns dict with: material_cost, conversion_cost, margin, packing_cost, freight_cost, total_cost_per_1000."""
+    fields = model_json.get('fields', [])
+    field_map = {f['id']: f for f in fields}
+    mapped = {
+        'material_cost': 0, 'conversion_cost': 0, 'margin': 0,
+        'packing_cost': 0, 'freight_cost': 0, 'total_cost_per_1000': 0,
+        'cost_per_piece': 0,
+    }
+    # Keywords for auto-detection
+    _kw_map = {
+        'material_cost': ['material_cost', 'mat_cost', 'resin_cost', 'raw_material', 'total_material'],
+        'conversion_cost': ['conversion_cost', 'conv_cost', 'processing_cost', 'manufacturing_cost', 'total_conversion'],
+        'margin': ['margin', 'profit', 'markup'],
+        'packing_cost': ['packing_cost', 'packaging_cost', 'pack_cost', 'secondary_pack'],
+        'freight_cost': ['freight_cost', 'transport_cost', 'logistics_cost', 'shipping_cost'],
+        'total_cost_per_1000': ['total_cost', 'total_per_1000', 'grand_total', 'final_cost', 'cost_per_1000'],
+        'cost_per_piece': ['cost_per_piece', 'unit_cost', 'per_unit', 'cost_per_unit'],
+    }
+    for std_key, keywords in _kw_map.items():
+        for fid, val in results.items():
+            fid_lower = fid.lower()
+            label_lower = field_map.get(fid, {}).get('label', '').lower()
+            for kw in keywords:
+                if kw in fid_lower or kw in label_lower:
+                    mapped[std_key] = float(val)
+                    break
+            if mapped[std_key] != 0:
+                break
+    # If total not found, sum the parts
+    if mapped['total_cost_per_1000'] == 0:
+        mapped['total_cost_per_1000'] = sum([
+            mapped['material_cost'], mapped['conversion_cost'],
+            mapped['margin'], mapped['packing_cost'], mapped['freight_cost']
+        ])
+    # If still 0, use the largest result value as total
+    if mapped['total_cost_per_1000'] == 0 and results:
+        mapped['total_cost_per_1000'] = max(results.values())
+    return mapped
+
+
+@app.route("/api/simulate", methods=["POST"])
+@login_required
+def api_simulate():
+    """Universal cost simulation — evaluate any cost model with given inputs."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "No data"}), 400
+    model_id = data.get('model_id')
+    inputs = data.get('inputs', {})
+    model_path = MODELS_DIR / f"{model_id}.json"
+    if not model_path.exists():
+        return jsonify({"error": "Model not found"}), 404
+    with open(model_path, 'r') as f:
+        model = json.load(f)
+    results = run_cost_simulation(model, inputs)
+    mapped = _map_model_to_cost_structure(model, results)
+    return jsonify({
+        "success": True,
+        "results": results,
+        "mapped": mapped,
+        "model_name": model.get('name', 'Custom Model'),
+    })
+
+
+@app.route("/api/export_pdf", methods=["POST"])
+@login_required
+def api_export_universal_pdf():
+    """Universal PDF export — works with ANY model (EBM, carton, custom builder models)."""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data"}), 400
+        try:
+            from reportlab.lib import colors
+            from reportlab.lib.pagesizes import A4
+            from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+            from reportlab.lib.units import mm
+            from reportlab.platypus import SimpleDocTemplate, Table, TableStyle, Paragraph, Spacer, HRFlowable
+            from reportlab.lib.enums import TA_CENTER
+        except ImportError:
+            return jsonify({"error": "PDF requires reportlab. Install: pip install reportlab"}), 500
+
+        model_name = data.get('model_name', data.get('model_type', 'Cost Model'))
+        country = data.get('country', 'N/A')
+        currency = data.get('currency', 'INR')
+        sku = data.get('sku_description', data.get('sku', 'N/A'))
+
+        # Gather cost items — use mapped standard fields or raw breakdown
+        cost_items = []
+        if data.get('cost_breakdown'):
+            for item in data['cost_breakdown']:
+                cost_items.append([str(item.get('label', '')), f"{float(item.get('value', 0)):,.2f}"])
+        else:
+            _std_keys = [
+                ('Material Cost', 'material_cost'), ('Conversion Cost', 'conversion_cost'),
+                ('Margin', 'margin'), ('Packing Cost', 'packing_cost'),
+                ('Freight Cost', 'freight_cost'),
+            ]
+            for label, key in _std_keys:
+                v = data.get(key, 0)
+                if v and float(v) > 0:
+                    cost_items.append([label, f"{float(v):,.2f}"])
+
+        total = data.get('total_cost_per_1000', data.get('total_cost', 0))
+        cost_items.append(['TOTAL', f"{float(total):,.2f}"])
+
+        # Extra fields from custom model results
+        extra_items = []
+        if data.get('all_results'):
+            for k, v in data['all_results'].items():
+                if isinstance(v, (int, float)) and v != 0:
+                    label = k.replace('_', ' ').title()
+                    extra_items.append([label, f"{float(v):,.4f}"])
+
+        output = io.BytesIO()
+        doc = SimpleDocTemplate(output, pagesize=A4, topMargin=20*mm, bottomMargin=20*mm, leftMargin=15*mm, rightMargin=15*mm)
+        styles = getSampleStyleSheet()
+        ts = ParagraphStyle('T', parent=styles['Title'], fontSize=18, textColor=colors.HexColor('#E8601C'), spaceAfter=6)
+        ss = ParagraphStyle('S', parent=styles['Normal'], fontSize=10, textColor=colors.HexColor('#666'), spaceAfter=12)
+        hs = ParagraphStyle('H', parent=styles['Heading2'], fontSize=12, textColor=colors.HexColor('#1e40af'), spaceBefore=14, spaceAfter=8)
+        o = colors.HexColor('#E8601C')
+
+        els = []
+        els.append(Paragraph('Packfora Analytics', ts))
+        els.append(Paragraph(f'{model_name} — Cost Report', ss))
+        els.append(Paragraph(f'SKU: {sku} | Country: {country} | {currency}', ss))
+        els.append(Paragraph(f'Generated: {datetime.now().strftime("%B %d, %Y %I:%M %p")}', ss))
+        els.append(HRFlowable(width="100%", thickness=2, color=o))
+        els.append(Spacer(1, 10))
+
+        # Input parameters table
+        input_items = data.get('input_params', {})
+        if input_items:
+            els.append(Paragraph('Input Parameters', hs))
+            ip_data = [['Parameter', 'Value']]
+            for k, v in input_items.items():
+                ip_data.append([k.replace('_', ' ').title(), str(v)])
+            t_ip = Table(ip_data, colWidths=[250, 180])
+            t_ip.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 9),
+                ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#ddd')),
+                ('TOPPADDING', (0, 0), (-1, -1), 5),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ]))
+            els.append(t_ip)
+            els.append(Spacer(1, 10))
+
+        # Cost breakdown table
+        els.append(Paragraph('Cost Breakdown', hs))
+        cd = [['Component', 'Amount']] + cost_items
+        t = Table(cd, colWidths=[250, 180])
+        t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), o),
+            ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+            ('BACKGROUND', (0, -1), (-1, -1), colors.HexColor('#FFF3ED')),
+            ('FONTNAME', (0, -1), (-1, -1), 'Helvetica-Bold'),
+            ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#ddd')),
+            ('TOPPADDING', (0, 0), (-1, -1), 6),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+        ]))
+        els.append(t)
+        els.append(Spacer(1, 10))
+
+        # Extra computed fields
+        if extra_items:
+            els.append(Paragraph('Detailed Computed Fields', hs))
+            ed = [['Field', 'Value']] + extra_items[:30]
+            t_e = Table(ed, colWidths=[250, 180])
+            t_e.setStyle(TableStyle([
+                ('BACKGROUND', (0, 0), (-1, 0), colors.HexColor('#1e40af')),
+                ('TEXTCOLOR', (0, 0), (-1, 0), colors.white),
+                ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                ('FONTSIZE', (0, 0), (-1, -1), 8),
+                ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                ('GRID', (0, 0), (-1, -1), 0.5, colors.HexColor('#ddd')),
+                ('TOPPADDING', (0, 0), (-1, -1), 4),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ]))
+            els.append(t_e)
+
+        els.append(Spacer(1, 15))
+        els.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor('#ccc')))
+        els.append(Paragraph('Confidential - Packfora Analytics', ParagraphStyle('F', parent=styles['Normal'], fontSize=8, textColor=colors.grey, alignment=TA_CENTER)))
+        doc.build(els)
+        output.seek(0)
+        fname = f'{model_name.replace(" ", "_")}_Report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.pdf'
+        return send_file(output, mimetype='application/pdf', as_attachment=True, download_name=fname)
+    except Exception as e:
+        logger.error(f"Universal PDF export error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/export_excel", methods=["POST"])
+@login_required
+def api_export_universal_excel():
+    """Universal Excel export — works with ANY model."""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "No data"}), 400
+
+        model_name = data.get('model_name', data.get('model_type', 'Cost Model'))
+
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine='openpyxl') as writer:
+            # Sheet 1: Inputs
+            input_params = data.get('input_params', {})
+            if input_params:
+                pd.DataFrame([{'Parameter': k.replace('_', ' ').title(), 'Value': v} for k, v in input_params.items()]).to_excel(writer, sheet_name='Inputs', index=False)
+
+            # Sheet 2: Cost Breakdown
+            cost_rows = []
+            if data.get('cost_breakdown'):
+                for item in data['cost_breakdown']:
+                    cost_rows.append({'Component': item.get('label', ''), 'Amount': float(item.get('value', 0))})
+            else:
+                _std_keys = [
+                    ('Material Cost', 'material_cost'), ('Conversion Cost', 'conversion_cost'),
+                    ('Margin', 'margin'), ('Packing Cost', 'packing_cost'),
+                    ('Freight Cost', 'freight_cost'),
+                ]
+                for label, key in _std_keys:
+                    v = data.get(key, 0)
+                    if v and float(v) > 0:
+                        cost_rows.append({'Component': label, 'Amount': float(v)})
+            total = data.get('total_cost_per_1000', data.get('total_cost', 0))
+            cost_rows.append({'Component': 'TOTAL', 'Amount': float(total)})
+            pd.DataFrame(cost_rows).to_excel(writer, sheet_name='Cost Breakdown', index=False)
+
+            # Sheet 3: All Results (for custom models)
+            if data.get('all_results'):
+                rows = [{'Field': k.replace('_', ' ').title(), 'Value': v} for k, v in data['all_results'].items() if isinstance(v, (int, float))]
+                if rows:
+                    pd.DataFrame(rows).to_excel(writer, sheet_name='All Results', index=False)
+
+            # Sheet 4: Scenario results (if present)
+            if data.get('scenarios'):
+                pd.DataFrame(data['scenarios']).to_excel(writer, sheet_name='Scenarios', index=False)
+
+            # Format headers
+            from openpyxl.styles import Font, PatternFill
+            for sn in writer.sheets:
+                ws = writer.sheets[sn]
+                for cell in ws[1]:
+                    cell.font = Font(bold=True, color='FFFFFF')
+                    cell.fill = PatternFill(start_color='E8601C', end_color='E8601C', fill_type='solid')
+                for row in ws.iter_rows(min_row=2):
+                    for cell in row:
+                        if isinstance(cell.value, (int, float)):
+                            cell.number_format = '#,##0.00'
+                for col in ws.columns:
+                    ml = max(len(str(c.value or '')) for c in col) + 4
+                    ws.column_dimensions[col[0].column_letter].width = min(ml, 35)
+
+        output.seek(0)
+        fname = f'{model_name.replace(" ", "_")}_Report_{datetime.now().strftime("%Y%m%d_%H%M%S")}.xlsx'
+        return send_file(output, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', as_attachment=True, download_name=fname)
+    except Exception as e:
+        logger.error(f"Universal Excel export error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
 
 # ================= API ENDPOINTS =================
 
@@ -3800,29 +5320,29 @@ def api_mach_res():
             f = f.head(MAX_MACHINES_TO_DISPLAY)
         
         res = []
-        
-        for _, r in f.iterrows():
+        _cost_cols = [col for col in df.columns if any(k in str(col) for k in ["€", "Cost", "Price"])]
+        _speed_cols = [col for col in df.columns if 'speed' in str(col).lower() or 'output' in str(col).lower()]
+
+        for r in f.to_dict('records'):
             cost = r.get("Machine Cost In €") or r.get("Machine Cost") or r.get("Price")
             if pd.isna(cost) or cost == 0:
-                for col in df.columns:
-                    if any(k in str(col) for k in ["€", "Cost", "Price"]): 
-                        cost = r[col]
-                        break
-            
+                for col in _cost_cols:
+                    cost = r.get(col)
+                    break
+
             power = r.get("Power Consumption")
             sqm = r.get("Machine Footprint SQM")
-            
+
             # Extract speed/output if column exists
             speed = 0
-            for col in df.columns:
-                if 'speed' in str(col).lower() or 'output' in str(col).lower():
-                    val = r.get(col)
-                    if not pd.isna(val):
-                        try:
-                            speed = float(val)
-                        except:
-                            speed = 0
-                    break
+            for col in _speed_cols:
+                val = r.get(col)
+                if val is not None and not pd.isna(val):
+                    try:
+                        speed = float(val)
+                    except:
+                        speed = 0
+                break
             
             res.append({
                 "make": str(r.get("Make", "")), 
@@ -3835,11 +5355,9 @@ def api_mach_res():
                 "sqm_raw": float(sqm) if not pd.isna(sqm) else 0
             })
         
-        recommendation = analyze_machines_ai(res)
-        
         display_count = "100+" if show_100_plus else str(len(res))
         
-        return jsonify({"results": res, "recommendation": recommendation, "display_count": display_count, "total_unique": total_before_dedup})
+        return jsonify({"results": res, "display_count": display_count, "total_unique": total_before_dedup})
     except Exception as e:
         logger.error(f"Error in mach_res: {e}")
         return jsonify({"error": str(e)}), 500
@@ -4308,7 +5826,8 @@ def api_carton_machine_db():
     try:
         df = load_excel_cached('machine', sheet_name="Database", header=2)
         machines_by_process = {}
-        for _, r in df.iterrows():
+        _speed_cols = [col for col in df.columns if 'speed' in str(col).lower() or 'output' in str(col).lower()]
+        for r in df.to_dict('records'):
             process = str(r.get("Process", "")).strip()
             if not process or process == 'nan':
                 continue
@@ -4339,15 +5858,14 @@ def api_carton_machine_db():
             except:
                 sqm = 0
             speed = 0
-            for col in df.columns:
-                if 'speed' in str(col).lower() or 'output' in str(col).lower():
-                    val = r.get(col)
-                    if not pd.isna(val):
-                        try:
-                            speed = float(val)
-                        except:
-                            speed = 0
-                    break
+            for col in _speed_cols:
+                val = r.get(col)
+                if val is not None and not pd.isna(val):
+                    try:
+                        speed = float(val)
+                    except:
+                        speed = 0
+                break
             if process not in machines_by_process:
                 machines_by_process[process] = []
             machines_by_process[process].append({
@@ -4571,18 +6089,19 @@ def api_calc_carton_advanced():
             'Liner Carton Machine': {'cost_eur': 14300, 'power_kw': 50, 'speed': 12000, 'sqm': 5},
         }
 
-        # Try loading from Excel DB
+        # Try loading from Excel DB — use cached read, not direct pd.read_excel
         try:
-            mdb = pd.read_excel(os.path.join(DATA_DIR, 'machine-database.xlsx'), sheet_name='carton-machine', header=0)
-            for _, row in mdb.iterrows():
-                name = str(row.get('Machine Name', row.get('machine_name', ''))).strip()
-                if name:
-                    machine_db[name] = {
-                        'cost_eur': float(row.get('Cost EUR', row.get('cost_eur', 0)) or 0),
-                        'power_kw': float(row.get('Power KW', row.get('power_kw', 0)) or 0),
-                        'speed': float(row.get('Speed', row.get('speed', 0)) or 0),
-                        'sqm': float(row.get('SQM', row.get('sqm', 0)) or 0),
-                    }
+            mdb = load_excel_cached('machine', sheet_name='carton-machine', header=0)
+            if isinstance(mdb, pd.DataFrame):
+                for row in mdb.to_dict('records'):
+                    name = str(row.get('Machine Name', row.get('machine_name', ''))).strip()
+                    if name:
+                        machine_db[name] = {
+                            'cost_eur': float(row.get('Cost EUR', row.get('cost_eur', 0)) or 0),
+                            'power_kw': float(row.get('Power KW', row.get('power_kw', 0)) or 0),
+                            'speed': float(row.get('Speed', row.get('speed', 0)) or 0),
+                            'sqm': float(row.get('SQM', row.get('sqm', 0)) or 0),
+                        }
         except:
             pass
 
@@ -5751,12 +7270,12 @@ def api_machine_db_for_calc():
         else:
             f = df
         machines = []
-        for _, r in f.iterrows():
+        _cost_cols = [col for col in df.columns if any(k in str(col) for k in ["€", "Cost", "Price"])]
+        for r in f.to_dict('records'):
             cost = r.get("Machine Cost In €") or r.get("Machine Cost") or r.get("Price")
             if pd.isna(cost) or cost == 0:
-                for col in df.columns:
-                    if any(k in str(col) for k in ["€", "Cost", "Price"]):
-                        cost = r[col]; break
+                for col in _cost_cols:
+                    cost = r.get(col); break
             power = r.get("Power Consumption")
             sqm = r.get("Machine Footprint SQM")
             make = str(r.get("Make", "")); model = str(r.get("Model", ""))
@@ -5790,13 +7309,63 @@ def api_variable_cost_for_calc():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/country_defaults", methods=["POST"])
+@login_required
+def api_country_defaults():
+    """Return editable default parameters for selected countries.
+    Used by Multi-Country Comparison to pre-populate override fields."""
+    try:
+        data = request.json or {}
+        countries = data.get('countries', [])
+        # Country cost database — mirrors cdb in multi_country_ebm
+        cdb = {
+            'India':{'elec':10.72,'labour':541800,'euro':104.27,'freight':8341.60,'material_price':95},
+            'China':{'elec':0.794,'labour':420000,'euro':8.19,'freight':6500,'material_price':95},
+            'Vietnam':{'elec':1744,'labour':139920000,'euro':30390.27,'freight':7200,'material_price':95},
+            'Turkey':{'elec':4.35,'labour':281880,'euro':49.29,'freight':7800,'material_price':95},
+            'Indonesia':{'elec':1114.74,'labour':7332000,'euro':19314.2,'freight':7000,'material_price':95},
+            'Brazil':{'elec':0.657,'labour':73000,'euro':6.23,'freight':9500,'material_price':95},
+            'United States':{'elec':0.149,'labour':98250.6,'euro':1.16,'freight':5500,'material_price':95},
+            'United Kingdom':{'elec':0.346,'labour':39900,'euro':0.88,'freight':6000,'material_price':95},
+            'Germany':{'elec':0.251,'labour':46692,'euro':1,'freight':5000,'material_price':95},
+            'France':{'elec':0.153,'labour':34800,'euro':1,'freight':5200,'material_price':95},
+            'Mexico':{'elec':3.972,'labour':180000,'euro':21.26,'freight':7500,'material_price':95},
+            'Pakistan':{'elec':41.99,'labour':504000,'euro':328.52,'freight':8000,'material_price':95},
+            'Philippines':{'elec':8.847,'labour':242880,'euro':67.87,'freight':7100,'material_price':95},
+            'South Africa':{'elec':1.795,'labour':231858,'euro':19.88,'freight':9000,'material_price':95},
+            'Spain':{'elec':0.126,'labour':55960,'euro':1,'freight':5300,'material_price':95},
+            'Poland':{'elec':0.829,'labour':83388,'euro':4.21,'freight':5500,'material_price':95},
+            'Thailand':{'elec':4.086,'labour':303544.8,'euro':36.6,'freight':6800,'material_price':95},
+            'Bangladesh':{'elec':12.39,'labour':1521720,'euro':142.84,'freight':8200,'material_price':95},
+            'Sri Lanka':{'elec':16.59,'labour':1060800,'euro':362.96,'freight':8500,'material_price':95},
+            'Argentina':{'elec':129.15,'labour':9792000,'euro':1684.16,'freight':10000,'material_price':95},
+            'Canada':{'elec':0.144,'labour':65650,'euro':1.62,'freight':5800,'material_price':95},
+            'Costa Rica':{'elec':115.84,'labour':8329800,'euro':581.9,'freight':9200,'material_price':95},
+        }
+        defaults = {}
+        for c in countries:
+            d = cdb.get(c, {})
+            defaults[c] = {
+                'volume': 62975559,
+                'material_price': d.get('material_price', 95),
+                'freight_cost': d.get('freight', 8341.60),
+                'electricity_rate': d.get('elec', 0),
+                'labour_rate': d.get('labour', 0),
+                'exchange_rate': d.get('euro', 1),
+            }
+        return jsonify({"defaults": defaults})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/multi_country_ebm", methods=["POST"])
 def api_multi_country_ebm():
-    """Run EBM across multiple countries (Feature 3)"""
+    """Run EBM across multiple countries (Feature 3) — with user-editable overrides"""
     try:
         data = request.json
         countries = data.get('countries', [])
         bp = data.get('base_params', {})
+        country_overrides = data.get('country_overrides', {})  # {country: {volume, material_price, freight_cost, electricity_rate, labour_rate, exchange_rate}}
         if len(countries) < 2: return jsonify({"error": "Select at least 2 countries"}), 400
         if len(countries) > 6: return jsonify({"error": "Max 6 countries"}), 400
 
@@ -5894,8 +7463,21 @@ def api_multi_country_ebm():
         for c in countries:
             cv = cdb.get(c)
             if not cv: continue
+            # Apply user overrides for this country
+            ov = country_overrides.get(c, {})
+            cv = dict(cv)  # copy to avoid mutating defaults
+            if ov.get('electricity_rate'): cv['elec'] = float(ov['electricity_rate'])
+            if ov.get('labour_rate'): cv['labour'] = float(ov['labour_rate'])
+            if ov.get('exchange_rate'): cv['euro'] = float(ov['exchange_rate'])
+            if ov.get('freight_cost'):
+                bp = dict(bp)
+                bp['freight_per_container'] = float(ov['freight_cost'])
+            # Override volume and material_price through bp
+            bp_ov = dict(bp)
+            if ov.get('volume'): bp_ov['annual_volume'] = float(ov['volume'])
+            if ov.get('material_price'): bp_ov['l1_polymer_rate'] = float(ov['material_price'])
             try:
-                r = calc_ebm_for_country(cv, bp)
+                r = calc_ebm_for_country(cv, bp_ov)
                 r['country'] = c
                 results.append(r)
             except Exception as ce:
@@ -5917,6 +7499,7 @@ def api_multi_country_generic():
         base_result = data.get('base_result', {})
         base_country = data.get('base_country', 'India')
         base_params = data.get('base_params', {})
+        country_overrides = data.get('country_overrides', {})  # {country: {volume, material_price, freight_cost, electricity_rate, labour_rate, exchange_rate}}
         if len(countries) < 2: return jsonify({"error": "Select at least 2 countries"}), 400
         if len(countries) > 6: return jsonify({"error": "Max 6 countries"}), 400
 
@@ -5970,6 +7553,12 @@ def api_multi_country_generic():
                 results.append({'country': c, 'error': 'Country not found'})
                 continue
             try:
+                # Apply user overrides for this country
+                ov = country_overrides.get(c, {})
+                cv = dict(cv)  # copy to avoid mutating defaults
+                if ov.get('electricity_rate'): cv['elec'] = float(ov['electricity_rate'])
+                if ov.get('labour_rate'): cv['labour'] = float(ov['labour_rate'])
+                if ov.get('exchange_rate'): cv['euro'] = float(ov['exchange_rate'])
                 er = cv['euro']
                 # Labour cost index for target country
                 tgt_labour_idx = cv['labour'] * 0.60 + cv['engineer'] * 0.25 + cv['pm'] * 0.15
@@ -5979,12 +7568,22 @@ def api_multi_country_generic():
                 labour_ratio = (tgt_labour_idx / er) / (base_labour_idx / base_euro) if (base_labour_idx / base_euro) > 0 else 1
                 elec_ratio = tgt_elec_eur / base_elec_eur if base_elec_eur > 0 else 1
 
-                # Material: same raw material price globally, just convert via EUR
-                mat_eur = base_mat / base_euro if base_euro > 0 else 0
+                # Material: use override or same raw material price globally via EUR
+                if ov.get('material_price'):
+                    mat_eur = float(ov['material_price']) / er if er > 0 else 0
+                else:
+                    mat_eur = base_mat / base_euro if base_euro > 0 else 0
 
-                # Conversion: scale by weighted factor (60% labour, 40% electricity)
+                # Volume scaling for conversion (if overridden)
+                vol_factor = 1
+                if ov.get('volume') and base_params:
+                    base_vol = float(base_params.get('annual_volume', 0) or base_result.get('annual_volume', 0) or 1)
+                    if base_vol > 0:
+                        vol_factor = base_vol / float(ov['volume'])
+
+                # Conversion: scale by weighted factor (60% labour, 40% electricity) * volume
                 conv_factor = labour_ratio * 0.60 + elec_ratio * 0.40
-                conv_local_scaled = base_conv * conv_factor
+                conv_local_scaled = base_conv * conv_factor * vol_factor
                 conv_eur = conv_local_scaled / base_euro if base_euro > 0 else 0
 
                 # Margin: proportional to conversion (same margin %)
@@ -5994,8 +7593,11 @@ def api_multi_country_generic():
                 # Packing: scale by EUR rate ratio
                 pkg_eur = base_pkg / base_euro if base_euro > 0 else 0
 
-                # Freight: same in EUR (international shipping)
-                frt_eur = base_frt / base_euro if base_euro > 0 else 0
+                # Freight: override or same in EUR (international shipping)
+                if ov.get('freight_cost'):
+                    frt_eur = float(ov['freight_cost']) / er if er > 0 else 0
+                else:
+                    frt_eur = base_frt / base_euro if base_euro > 0 else 0
 
                 total_eur = mat_eur + conv_eur + margin_eur + pkg_eur + frt_eur
                 total_local = total_eur * er
@@ -7668,6 +9270,7 @@ MODEL_BUILDER_HTML = """
         <div class="wiz-step" onclick="wizGoTo(2)"><span class="wiz-num">3</span>Inputs</div>
         <div class="wiz-step" onclick="wizGoTo(3)"><span class="wiz-num">4</span>Formulas</div>
         <div class="wiz-step" onclick="wizGoTo(4)"><span class="wiz-num">5</span>Preview</div>
+        <div class="wiz-step" onclick="wizGoTo(5)"><span class="wiz-num">6</span>Tests</div>
     </div>
 
     <!-- STEP 0: Model Type -->
@@ -7752,7 +9355,9 @@ MODEL_BUILDER_HTML = """
         </div>
         <div style="margin-bottom:10px;display:flex;gap:8px;flex-wrap:wrap;">
             <button class="mb-btn mb-btn-primary mb-btn-sm" onclick="mbAddField('input')">+ Input Field</button>
+            <button class="mb-btn mb-btn-green mb-btn-sm" onclick="mbShowBlocks()">📦 Import Block</button>
             <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="beOpen()" style="border-color:rgba(100,149,237,0.4);color:cornflowerblue;">⊞ Bulk Edit</button>
+            <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbShowGlobalNS()" style="border-color:rgba(255,193,7,0.4);color:#ffc107;">🌐 Global Vars</button>
             <span style="flex:1;"></span>
             <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbImportJSON()">Import JSON</button>
             <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbExportJSON()">Export JSON</button>
@@ -7799,8 +9404,48 @@ MODEL_BUILDER_HTML = """
             <button class="mb-btn mb-btn-secondary" onclick="mbTogglePreview()" id="mb-preview-toggle">▶ Show Live Preview</button>
         </div>
         <div id="mb-preview-panel"></div>
-        <div class="wiz-nav"><button class="mb-btn mb-btn-secondary" onclick="wizPrev()">← Back</button><span></span></div>
+        <div class="wiz-nav"><button class="mb-btn mb-btn-secondary" onclick="wizPrev()">← Back</button><button class="mb-btn mb-btn-primary" onclick="wizNext()">Next → Tests</button></div>
     </div>
+
+    <!-- STEP 5: Test Cases -->
+    <div class="wiz-panel" id="wiz-p-5">
+        <div style="margin-bottom:12px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+            <button class="mb-btn mb-btn-primary mb-btn-sm" onclick="mbAddTestCase()">+ Add Test Case</button>
+            <button class="mb-btn mb-btn-green mb-btn-sm" onclick="mbRunTests()">▶ Run All Tests</button>
+            <span id="mb-test-summary" style="font-size:0.82rem;color:rgba(255,255,255,0.5);margin-left:auto;"></span>
+        </div>
+        <p style="font-size:0.8rem;color:rgba(255,255,255,0.45);margin-bottom:14px;">
+            Define benchmark SKUs with known costs. After editing any formula, click "Run Tests" to validate.
+        </p>
+        <div id="mb-test-cases-container"></div>
+        <div id="mb-test-results" style="margin-top:14px;"></div>
+        <div class="wiz-nav"><button class="mb-btn mb-btn-secondary" onclick="wizPrev()">← Back</button><button class="mb-btn mb-btn-green" onclick="mbSaveModel()"> Save Model</button></div>
+    </div>
+</div>
+
+<!-- ======================== BLOCK IMPORT MODAL ======================== -->
+<div id="mb-block-modal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;">
+  <div style="background:#1a1a2e;border:1px solid rgba(255,255,255,0.15);border-radius:14px;padding:28px;max-width:650px;width:90%;max-height:80vh;overflow-y:auto;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h3 style="margin:0;">📦 Import Reusable Block</h3>
+      <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="mbCloseBlocks()">✕</button>
+    </div>
+    <p style="font-size:0.82rem;color:rgba(255,255,255,0.5);margin-bottom:14px;">Click a block to inject its fields and formulas into your model.</p>
+    <div id="mb-blocks-list" style="display:grid;gap:10px;"></div>
+  </div>
+</div>
+
+<!-- ======================== GLOBAL NAMESPACE MODAL ======================== -->
+<div id="mb-gns-modal" style="display:none;position:fixed;inset:0;z-index:1000;background:rgba(0,0,0,0.7);display:none;align-items:center;justify-content:center;">
+  <div style="background:#1a1a2e;border:1px solid rgba(255,255,255,0.15);border-radius:14px;padding:28px;max-width:700px;width:90%;max-height:80vh;overflow-y:auto;">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+      <h3 style="margin:0;">🌐 Global Variables (Auto-injected into formulas)</h3>
+      <button class="mb-btn mb-btn-secondary mb-btn-sm" onclick="document.getElementById('mb-gns-modal').style.display='none'">✕</button>
+    </div>
+    <p style="font-size:0.82rem;color:rgba(255,255,255,0.5);margin-bottom:14px;">These variables are automatically available in all formula evaluations. Use them directly — no input field needed.</p>
+    <input id="mb-gns-search" class="mb-input" placeholder="Search global variables..." style="margin-bottom:12px;" oninput="mbFilterGNS(this.value)">
+    <div id="mb-gns-list" style="font-size:0.82rem;"></div>
+  </div>
 </div>
 
 <!-- ======================== SAVED MODELS ======================== -->
@@ -7934,6 +9579,7 @@ MODEL_BUILDER_HTML = """
 <script>
 let mbFields = [];
 let mbEditingId = null;
+let mbCurrentModelId = null;
 let mbPreviewOpen = false;
 let mbDragIdx = null;
 let wizStep = 0;
@@ -7962,7 +9608,7 @@ function wizGoTo(step) {
     if (step === 3) mbRenderFormulaFields();
     if (step === 4) { mbPreviewOpen = true; mbUpdatePreview(); }
 }
-function wizNext() { if (wizStep < 4) wizGoTo(wizStep + 1); }
+function wizNext() { if (wizStep < 5) wizGoTo(wizStep + 1); }
 function wizPrev() { if (wizStep > 0) wizGoTo(wizStep - 1); }
 
 function wizPkgTypeChanged() {
@@ -8180,7 +9826,7 @@ function mbRenderFormulaFields() {
         const lastCol = `<div class="mb-formula-wrap">
             <input class="mb-formula-input" placeholder="e.g. price * qty" value="${(f.formula||'').replace(/"/g,'&quot;')}"
                 oninput="mbFields[${i}].formula=this.value;mbFormulaInput(this,${i})"
-                onfocus="mbShowAC(${i})" onblur="setTimeout(()=>mbHideAC(${i}),200)"
+                onfocus="mbShowAC(${i});mbHighlightDeps(${i})" onblur="setTimeout(()=>mbHideAC(${i}),200)"
                 id="mb-formula-${i}" autocomplete="off">
             <div class="mb-ac-popup" id="mb-ac-${i}"></div>
             <div style="display:flex;gap:4px;margin-top:3px;">
@@ -8205,6 +9851,7 @@ function mbRenderFormulaFields() {
             <input class="mb-input" placeholder="unit" value="${f.unit||''}" onchange="mbFields[${i}].unit=this.value;mbUpdatePreview()">
             ${lastCol}
             <button class="mb-btn mb-btn-danger" onclick="mbFields.splice(${i},1);mbRenderFormulaFields();mbUpdatePreview()" style="padding:5px 9px;font-size:0.78rem;">✕</button>
+            <button class="db-link-btn ${f.hidden?'linked':''}" onclick="mbFields[${i}].hidden=!mbFields[${i}].hidden;mbRenderFormulaFields();mbUpdatePreview()" title="${f.hidden?'Hidden from end-user — click to show':'Visible to end-user — click to hide'}" style="padding:3px 6px;">${f.hidden?'👁️‍🗨️':'👁️'}</button>
         `;
         c.appendChild(row);
     });
@@ -8250,8 +9897,16 @@ function mbShowAC(idx) {
     let items = [];
     ids.forEach(f => { if (!word || f.id.toLowerCase().includes(word)) items.push({text:f.id, desc:f.type==='formula'?'formula':'input', type:'field'}); });
     SAFE_FUNCS.forEach(fn => { if (!word || fn.includes(word)) items.push({text:fn+'()', desc:'function', type:'func'}); });
+    // Add global namespace vars when user types 'global' prefix
+    if (word.startsWith('global') && _gnsData && _gnsData.namespace) {
+        Object.keys(_gnsData.namespace).forEach(k => {
+            if (k.includes(word) && !items.find(it => it.text === k)) {
+                items.push({text: k, desc: '🌐 ' + _gnsData.namespace[k], type: 'global'});
+            }
+        });
+    }
     if (items.length === 0) { popup.classList.remove('show'); return; }
-    popup.innerHTML = items.slice(0,15).map(it =>
+    popup.innerHTML = items.slice(0,20).map(it =>
         `<div class="mb-ac-item" onmousedown="mbInsertAC(${idx},'${it.text}')"><span>${it.text}</span><span class="ac-type">${it.desc}</span></div>`
     ).join('');
     popup.classList.add('show');
@@ -8468,7 +10123,8 @@ function mbUpdatePreview() {
     for (const [sec, fields] of Object.entries(formulaSections)) {
         html += `<div class="pv-section">${sec}</div>`;
         fields.forEach(f => {
-            html += `<div class="pv-result"><span>${f.label||f.id} <span style="opacity:0.4;font-size:0.7rem;">${f.unit||''}</span></span><span class="pv-val" id="pv_out_${f.id}">—</span></div>`;
+            const hiddenBadge = f.hidden ? ' <span style="font-size:0.65rem;opacity:0.4;background:rgba(255,255,255,0.08);padding:1px 5px;border-radius:4px;">HIDDEN</span>' : '';
+            html += `<div class="pv-result" style="${f.hidden?'opacity:0.4;':''}">${hiddenBadge}<span>${f.label||f.id} <span style="opacity:0.4;font-size:0.7rem;">${f.unit||''}</span></span><span class="pv-val" id="pv_out_${f.id}">—</span></div>`;
         });
     }
     html += '</div></div>';
@@ -8523,13 +10179,14 @@ async function mbSaveModel() {
     const ids = mbFields.map(f => f.id).filter(Boolean);
     if (ids.length !== mbFields.length) { alert('All fields must have an ID.'); return; }
     if (new Set(ids).size !== ids.length) { alert('Duplicate field IDs detected.'); return; }
-    const payload = { name, category, description, fields: mbFields };
+    const payload = { name, category, description, fields: mbFields, test_cases: mbTestCases };
     if (mbEditingId) payload.id = mbEditingId;
     const r = await fetch('/api/models', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)});
     const data = await r.json();
     if (data.success) {
         alert('Model saved! ID: ' + data.id);
-        mbEditingId = null;
+        mbEditingId = data.id;
+        mbCurrentModelId = data.id;
         mbClearForm();
         mbLoadModels();
     } else { alert('Error: ' + data.message); }
@@ -8540,9 +10197,12 @@ function mbClearForm() {
     document.getElementById('mb-description').value = '';
     mbFields = [];
     mbEditingId = null;
+    mbCurrentModelId = null;
+    mbTestCases = [];
     wizSelectedTemplate = null;
     mbRenderInputFields();
     mbRenderFormulaFields();
+    mbRenderTestCases();
     if (mbPreviewOpen) mbUpdatePreview();
     wizGoTo(0);
 }
@@ -8628,6 +10288,9 @@ async function mbEditModel(id) {
     document.getElementById('mb-category').value = m.category || 'essentials';
     mbFields = m.fields || [];
     mbEditingId = m.id;
+    mbCurrentModelId = m.id;
+    mbTestCases = m.test_cases || [];
+    mbRenderTestCases();
     wizGoTo(2); // Jump to Inputs step
     window.scrollTo({top:0, behavior:'smooth'});
 }
@@ -8893,7 +10556,7 @@ function vfbBuildFormula() {
         else if (t.type === 'paren') parts.push(t.value);
         else parts.push(t.value);
     });
-    return parts.join('').replace(/\s+/g, ' ').trim();
+    return parts.join('').replace(/\\s+/g, ' ').trim();
 }
 
 async function vfbValidate(formula) {
@@ -8953,13 +10616,21 @@ async function excUpload(file) {
         document.getElementById('exc-mapping-preview').style.display = 'block';
         document.getElementById('exc-input-count').textContent = data.input_count + ' inputs';
         document.getElementById('exc-formula-count').textContent = data.formula_count + ' formulas';
+        // Show Named Range & Smart Tagging stats
+        const statsExtra = [];
+        if (data.named_ranges_used) statsExtra.push('🏷️ ' + data.named_ranges_used + ' Named Ranges');
+        if (data.smart_tagged) statsExtra.push('🤖 ' + data.smart_tagged + ' Auto-tagged');
+        if (statsExtra.length) {
+            const el = document.getElementById('exc-formula-count');
+            if (el) el.textContent += '  ·  ' + statsExtra.join('  ·  ');
+        }
         const tbody = document.getElementById('exc-mapping-body');
         tbody.innerHTML = data.mapping.map(m => `<tr>
-            <td style="font-family:monospace;color:cornflowerblue;">${m.cell}</td>
+            <td style="font-family:monospace;color:cornflowerblue;">${m.cell}${m.named_range?' <span style="color:#4CAF50;font-size:0.7rem;">NR</span>':''}</td>
             <td><span class="exc-badge ${m.type}">${m.type}</span></td>
             <td style="font-family:monospace;">${m.field_id}</td>
             <td>${m.label}</td>
-            <td style="font-family:monospace;font-size:0.75rem;opacity:0.6;max-width:200px;overflow:hidden;text-overflow:ellipsis;">${m.type==='formula'?m.formula:m.default}</td>
+            <td style="font-family:monospace;font-size:0.75rem;opacity:0.6;max-width:200px;overflow:hidden;text-overflow:ellipsis;">${m.type==='formula'?m.formula:m.default}${m.auto_group?' <span style="color:var(--orange);font-size:0.65rem;">['+m.auto_group+']</span>':''}${m.auto_unit?' <span style="color:#4CAF50;font-size:0.65rem;">'+m.auto_unit+'</span>':''}</td>
         </tr>`).join('');
     } catch(e) { alert('Upload failed: ' + e.message); }
 }
@@ -9134,10 +10805,222 @@ function beApply() {
     alert('✓ Applied ' + mbFields.length + ' fields from bulk edit.');
 }
 
+// ═══════════════ REUSABLE BLOCKS (Feature 2) ═══════════════
+async function mbShowBlocks() {
+    const modal = document.getElementById('mb-block-modal');
+    modal.style.display = 'flex';
+    const list = document.getElementById('mb-blocks-list');
+    list.innerHTML = '<p style="opacity:0.5;">Loading blocks...</p>';
+    try {
+        const r = await fetch('/api/model_blocks');
+        const d = await r.json();
+        if (!d.success || !d.blocks.length) { list.innerHTML = '<p style="opacity:0.5;">No blocks available.</p>'; return; }
+        list.innerHTML = d.blocks.map(b => `
+            <div class="tmpl-card" onclick="mbImportBlock('${b.id}')">
+                <h4>📦 ${b.name}</h4>
+                <p>${b.description}</p>
+                <div class="tmpl-meta"><span>${b.input_count} inputs</span><span>${b.formula_count} formulas</span><span>${b.category}</span></div>
+            </div>
+        `).join('');
+    } catch(e) { list.innerHTML = '<p style="color:#ef4444;">Failed to load blocks.</p>'; }
+}
+function mbCloseBlocks() { document.getElementById('mb-block-modal').style.display = 'none'; }
+async function mbImportBlock(blockId) {
+    try {
+        const r = await fetch('/api/model_blocks/' + blockId);
+        const d = await r.json();
+        if (!d.success) { alert('Failed to load block'); return; }
+        const block = d.block;
+        // Merge fields — skip duplicates by ID
+        const existingIds = new Set(mbFields.map(f => f.id));
+        let added = 0;
+        block.fields.forEach(f => {
+            if (!existingIds.has(f.id)) {
+                mbFields.push(JSON.parse(JSON.stringify(f)));
+                existingIds.add(f.id);
+                added++;
+            }
+        });
+        mbRenderInputFields();
+        mbRenderFormulaFields();
+        mbUpdatePreview();
+        mbCloseBlocks();
+        alert('✅ Imported "' + block.name + '" — ' + added + ' new fields added (' + (block.fields.length - added) + ' duplicates skipped).');
+    } catch(e) { alert('Error: ' + e.message); }
+}
+
+// ═══════════════ GLOBAL NAMESPACE BROWSER (Feature 5) ═══════════════
+let _gnsData = null;
+async function mbShowGlobalNS() {
+    const modal = document.getElementById('mb-gns-modal');
+    modal.style.display = 'flex';
+    const list = document.getElementById('mb-gns-list');
+    if (_gnsData) { _renderGNS(_gnsData, ''); return; }
+    list.innerHTML = '<p style="opacity:0.5;">Loading...</p>';
+    try {
+        const r = await fetch('/api/global_namespace');
+        const d = await r.json();
+        _gnsData = d;
+        _renderGNS(d, '');
+    } catch(e) { list.innerHTML = '<p style="color:#ef4444;">Failed to load.</p>'; }
+}
+function mbFilterGNS(q) { if (_gnsData) _renderGNS(_gnsData, q); }
+function _renderGNS(d, q) {
+    const list = document.getElementById('mb-gns-list');
+    const ns = d.namespace || {};
+    const keys = Object.keys(ns).filter(k => !q || k.includes(q.toLowerCase()));
+    if (!keys.length) { list.innerHTML = '<p style="opacity:0.4;">No matching variables.</p>'; return; }
+    list.innerHTML = '<div style="display:grid;grid-template-columns:1fr auto;gap:4px 12px;max-height:400px;overflow-y:auto;padding:4px;">' +
+        keys.map(k => `<div style="font-family:monospace;color:#4CAF50;cursor:pointer;padding:2px 0;" onclick="navigator.clipboard.writeText('${k}');this.style.color='var(--orange)';setTimeout(()=>this.style.color='#4CAF50',600)" title="Click to copy">${k}</div><div style="opacity:0.6;padding:2px 0;">${ns[k]}</div>`).join('') +
+    '</div>';
+}
+
+// ═══════════════ TEST CASES (Feature 3) ═══════════════
+let mbTestCases = [];
+
+function mbAddTestCase() {
+    const inputs = {};
+    const expected = {};
+    // Pre-populate input defaults
+    mbFields.forEach(f => {
+        if (f.type === 'input') inputs[f.id] = f.default || 0;
+    });
+    mbTestCases.push({
+        name: 'Test Case ' + (mbTestCases.length + 1),
+        inputs: inputs,
+        expected: expected,
+        tolerance_pct: 2.0
+    });
+    mbRenderTestCases();
+}
+
+function mbRenderTestCases() {
+    const c = document.getElementById('mb-test-cases-container');
+    if (!c) return;
+    c.innerHTML = mbTestCases.map((tc, i) => {
+        const inputFields = mbFields.filter(f => f.type === 'input');
+        const formulaFields = mbFields.filter(f => f.type === 'formula');
+        return `<div class="mb-card" style="padding:16px;margin-bottom:10px;">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                <input class="mb-input" style="width:250px;font-weight:700;" value="${tc.name}" onchange="mbTestCases[${i}].name=this.value" placeholder="Test case name">
+                <div style="display:flex;gap:6px;align-items:center;">
+                    <label style="font-size:0.72rem;opacity:0.5;">Tolerance %:</label>
+                    <input class="mb-input" type="number" style="width:60px;" value="${tc.tolerance_pct}" onchange="mbTestCases[${i}].tolerance_pct=parseFloat(this.value)||2">
+                    <button class="mb-btn mb-btn-danger mb-btn-sm" onclick="mbTestCases.splice(${i},1);mbRenderTestCases()">✕</button>
+                </div>
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:14px;">
+                <div>
+                    <div class="mb-label">Test Inputs</div>
+                    <div style="max-height:200px;overflow-y:auto;">${inputFields.map(f => `
+                        <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px;font-size:0.8rem;">
+                            <span style="opacity:0.6;min-width:120px;">${f.label||f.id}</span>
+                            <input class="mb-input" type="number" style="width:100px;" value="${tc.inputs[f.id]||f.default||0}"
+                                onchange="mbTestCases[${i}].inputs['${f.id}']=parseFloat(this.value)||0">
+                        </div>
+                    `).join('')}</div>
+                </div>
+                <div>
+                    <div class="mb-label">Expected Outputs <span style="font-weight:400;opacity:0.4;">(leave blank to skip)</span></div>
+                    <div style="max-height:200px;overflow-y:auto;">${formulaFields.map(f => `
+                        <div style="display:flex;gap:6px;align-items:center;margin-bottom:4px;font-size:0.8rem;">
+                            <span style="opacity:0.6;min-width:120px;">${f.label||f.id}</span>
+                            <input class="mb-input" type="number" style="width:100px;" value="${tc.expected[f.id]||''}" placeholder="—"
+                                onchange="if(this.value)mbTestCases[${i}].expected['${f.id}']=parseFloat(this.value);else delete mbTestCases[${i}].expected['${f.id}']">
+                        </div>
+                    `).join('')}</div>
+                </div>
+            </div>
+        </div>`;
+    }).join('');
+    if (!mbTestCases.length) c.innerHTML = '<p style="opacity:0.4;font-size:0.82rem;">No test cases yet. Click "+ Add Test Case" to create one.</p>';
+}
+
+async function mbRunTests() {
+    const modelId = document.getElementById('mb-model-id')?.value || mbCurrentModelId;
+    if (!modelId) { alert('Save the model first before running tests.'); return; }
+    // Save test cases to model first
+    try {
+        await fetch('/api/models/' + modelId + '/test_cases', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({test_cases: mbTestCases})
+        });
+    } catch(e) {}
+    const results = document.getElementById('mb-test-results');
+    results.innerHTML = '<p style="opacity:0.5;">Running tests...</p>';
+    try {
+        const r = await fetch('/api/models/' + modelId + '/run_tests', {
+            method:'POST', headers:{'Content-Type':'application/json'},
+            body: JSON.stringify({})
+        });
+        const d = await r.json();
+        if (!d.success) throw new Error(d.message || 'Test run failed');
+        const s = d.summary;
+        document.getElementById('mb-test-summary').innerHTML =
+            `<span style="color:${s.failed?'#ef4444':'#4CAF50'};font-weight:700;">${s.passed}/${s.total} passed</span>`;
+        results.innerHTML = d.results.map(tr => `
+            <div class="sp-card" style="padding:12px;margin-bottom:8px;border-left:3px solid ${tr.passed?'#4CAF50':'#ef4444'};">
+                <div style="display:flex;justify-content:space-between;align-items:center;">
+                    <strong>${tr.passed?'✅':'❌'} ${tr.name}</strong>
+                </div>
+                <div style="margin-top:8px;font-size:0.78rem;">
+                    ${tr.checks.map(c => `
+                        <div style="display:flex;gap:10px;padding:3px 0;border-bottom:1px solid rgba(255,255,255,0.04);color:${c.pass?'#4CAF50':'#ef4444'};">
+                            <span style="opacity:0.6;min-width:140px;">${c.field}</span>
+                            <span>Expected: <strong>${c.expected}</strong></span>
+                            <span>Actual: <strong>${c.actual}</strong></span>
+                            ${c.deviation_pct !== undefined ? '<span>Δ ' + c.deviation_pct + '%</span>' : ''}
+                            <span>${c.pass?'✅':'❌'}</span>
+                        </div>
+                    `).join('')}
+                </div>
+            </div>
+        `).join('');
+    } catch(e) {
+        results.innerHTML = '<p style="color:#ef4444;">❌ ' + e.message + '</p>';
+    }
+}
+
+// ═══════════════ LIVE DEPENDENCY HIGHLIGHTING (Feature 4) ═══════════════
+function mbHighlightDeps(formulaIdx) {
+    // Clear all highlights
+    document.querySelectorAll('.mb-field-row').forEach(r => r.style.borderColor = 'transparent');
+    const f = mbFields[formulaIdx];
+    if (!f || !f.formula) return;
+    // Extract variable names from formula
+    const varPattern = /\b([a-zA-Z_][a-zA-Z0-9_]*)\b/g;
+    const deps = new Set();
+    let m;
+    while ((m = varPattern.exec(f.formula)) !== null) {
+        const name = m[1].toLowerCase();
+        if (!['min','max','abs','round','sqrt','ceil','floor','sum','pow','log','if','else','and','or','not','true','false'].includes(name)) {
+            deps.add(m[1]);
+        }
+    }
+    // Highlight matching field rows
+    mbFields.forEach((field, i) => {
+        const rows = document.querySelectorAll('.mb-field-row');
+        if (i < rows.length) {
+            if (deps.has(field.id)) {
+                rows[i].style.borderColor = '#4CAF50';
+                rows[i].style.background = 'rgba(76,175,80,0.06)';
+            }
+            // Check if field is unused (not referenced by any formula)
+            const isUsed = mbFields.some(ff => ff.type === 'formula' && ff.formula && ff.formula.includes(field.id));
+            if (field.type === 'input' && !isUsed && i < rows.length) {
+                rows[i].style.borderColor = 'rgba(255,193,7,0.4)';
+                rows[i].title = 'This input is not used by any formula';
+            }
+        }
+    });
+}
+
 // ═══════════════ INIT ═══════════════
 wizGoTo(0);
 mbLoadModels();
 mbLoadShares();
+// Pre-load global namespace for autocomplete
+fetch('/api/global_namespace').then(r=>r.json()).then(d=>{_gnsData=d;}).catch(()=>{});
 </script>
 """
 
@@ -9299,7 +11182,7 @@ async function scCalculate() {
             // Group formulas by section
             const sections = {};
             MODEL.fields.forEach(f => {
-                if (f.type !== 'formula' || HIDDEN.has(f.id)) return;
+                if (f.type !== 'formula' || HIDDEN.has(f.id) || f.hidden) return;
                 const s = f.formula_section || 'Results';
                 if (!sections[s]) sections[s] = [];
                 sections[s].push({...f, value: data.results[f.id]});
@@ -9335,6 +11218,8 @@ BASE_HTML = """
     <link rel="icon" type="image/x-icon" href="/static/favicon.ico">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;800&display=swap" rel="stylesheet">
     <script src="https://cdn.plot.ly/plotly-2.27.0.min.js"></script>
+    <link href="https://cdn.jsdelivr.net/npm/tom-select@2.3.1/dist/css/tom-select.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/tom-select@2.3.1/dist/js/tom-select.complete.min.js"></script>
     <style>
         :root { 
             --orange: #E8601C; 
@@ -9475,6 +11360,40 @@ BASE_HTML = """
             }
             .nav-group.mobile-expanded .nav-dropdown { display: block; }
             .nav-dropdown a { padding: 10px 20px; }
+        }
+        /* ── Project Switcher (Nav) ── */
+        .pswitch-wrap { position:relative; display:flex; align-items:center; }
+        .pswitch-trigger { display:flex; align-items:center; gap:7px; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.12); border-radius:8px; padding:5px 12px 5px 8px; color:white; font-family:'Outfit',sans-serif; font-size:0.76rem; font-weight:600; cursor:pointer; transition:all 0.2s; white-space:nowrap; max-width:180px; }
+        .pswitch-trigger:hover { background:rgba(255,255,255,0.1); border-color:rgba(255,255,255,0.2); }
+        .pswitch-dot { width:8px; height:8px; border-radius:50%; background:var(--orange); flex-shrink:0; }
+        .pswitch-label { overflow:hidden; text-overflow:ellipsis; }
+        .pswitch-dropdown { display:none; position:absolute; top:calc(100% + 6px); right:0; background:rgba(15,23,42,0.97); backdrop-filter:blur(24px); border:1px solid rgba(255,255,255,0.1); border-radius:14px; width:280px; box-shadow:0 16px 48px rgba(0,0,0,0.45); z-index:300; overflow:hidden; animation:psSlide 0.2s ease; }
+        .pswitch-dropdown.open { display:block; }
+        @keyframes psSlide { from { opacity:0; transform:translateY(-6px); } to { opacity:1; transform:translateY(0); } }
+        .pswitch-search-box { padding:10px 12px 6px; }
+        .pswitch-search { width:100%; background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:8px 12px; color:white; font-family:'Outfit',sans-serif; font-size:0.8rem; outline:none; }
+        .pswitch-search:focus { border-color:var(--orange); }
+        .pswitch-search::placeholder { color:rgba(255,255,255,0.3); }
+        .pswitch-list { max-height:240px; overflow-y:auto; padding:4px 6px; }
+        .pswitch-list::-webkit-scrollbar { width:4px; }
+        .pswitch-list::-webkit-scrollbar-thumb { background:rgba(255,255,255,0.15); border-radius:4px; }
+        .pswitch-item { display:flex; align-items:center; gap:10px; padding:9px 12px; border-radius:8px; cursor:pointer; transition:all 0.15s; }
+        .pswitch-item:hover { background:rgba(255,255,255,0.08); }
+        .pswitch-item.active { background:rgba(232,96,28,0.12); }
+        .pswitch-item-dot { width:10px; height:10px; border-radius:4px; flex-shrink:0; }
+        .pswitch-item-info { flex:1; min-width:0; }
+        .pswitch-item-name { font-size:0.82rem; font-weight:600; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .pswitch-item-sub { font-size:0.65rem; opacity:0.4; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+        .pswitch-item-check { width:16px; height:16px; border-radius:50%; border:2px solid rgba(255,255,255,0.15); display:flex; align-items:center; justify-content:center; flex-shrink:0; font-size:0.6rem; }
+        .pswitch-item.active .pswitch-item-check { border-color:var(--orange); background:var(--orange); }
+        .pswitch-footer { padding:6px 10px 8px; border-top:1px solid rgba(255,255,255,0.06); }
+        .pswitch-add { width:100%; display:flex; align-items:center; justify-content:center; gap:6px; background:none; border:1px dashed rgba(255,255,255,0.12); border-radius:8px; padding:8px; color:var(--orange); font-family:'Outfit',sans-serif; font-size:0.78rem; font-weight:600; cursor:pointer; transition:all 0.2s; }
+        .pswitch-add:hover { background:rgba(232,96,28,0.08); border-color:rgba(232,96,28,0.3); }
+        .pswitch-admin-toggle { display:flex; align-items:center; gap:6px; padding:8px 14px 10px; font-size:0.7rem; opacity:0.5; cursor:pointer; }
+        .pswitch-admin-toggle input { width:13px; height:13px; accent-color:var(--orange); }
+        @media(max-width:768px) {
+            .pswitch-dropdown { right:-20px; width:calc(100vw - 40px); max-width:300px; }
+            .pswitch-trigger { max-width:130px; }
         }
         .container { max-width: 1400px; margin: 40px auto; padding: 0 20px; }
         .card { 
@@ -9756,13 +11675,12 @@ BASE_HTML = """
         <div class="nav-links" id="mainNav">
             <a href="/" class="{{ 'active' if active == 'Dashboard' else '' }}">Dashboard</a>
             <div class="nav-group" onclick="toggleMobileDropdown(event, this)">
-                <button class="nav-group-toggle {{ 'active' if active in ['Materials','Resin','GlobalMaterials'] else '' }}">
+                <button class="nav-group-toggle {{ 'active' if active in ['Materials', 'SpendAnalytics'] else '' }}">
                     Analytics <svg viewBox="0 0 12 12" fill="none"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
                 </button>
                 <div class="nav-dropdown">
                     <a href="/materials" class="{{ 'active' if active == 'Materials' else '' }}">Material Price Tracker</a>
-                    <a href="/resin" class="{{ 'active' if active == 'Resin' else '' }}" style="font-size:0.76rem;opacity:0.7;">India Resin (Legacy)</a>
-                    <a href="/global-materials" class="{{ 'active' if active == 'GlobalMaterials' else '' }}" style="font-size:0.76rem;opacity:0.7;">Global Materials (Legacy)</a>
+                    <a href="/analytics/spend" class="{{ 'active' if active == 'SpendAnalytics' else '' }}">Spend Analytics</a>
                 </div>
             </div>
             {% if user_role in ['admin', 'analyst'] %}
@@ -9792,6 +11710,36 @@ BASE_HTML = """
             <a href="/admin/login" class="admin-link">Admin</a>
             {% endif %}
             {% if session.get('logged_in') %}
+            <a href="/projects" class="{{ 'active' if active == 'Projects' else '' }}">Projects</a>
+            <div class="pswitch-wrap" style="position:relative;">
+                <button id="pswitch-btn" onclick="psToggle()" class="pswitch-trigger">
+                    <span class="pswitch-dot" id="pswitch-dot"></span>
+                    <span class="pswitch-label" id="pswitch-label">All Projects</span>
+                    <svg width="10" height="10" viewBox="0 0 12 12" fill="none" style="opacity:0.5;"><path d="M2 4l4 4 4-4" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/></svg>
+                </button>
+                <div class="pswitch-dropdown" id="pswitch-dropdown">
+                    <div class="pswitch-search-box">
+                        <input type="text" class="pswitch-search" id="pswitch-search" placeholder="Search projects..." oninput="psFilter()">
+                    </div>
+                    <div class="pswitch-list" id="pswitch-list"></div>
+                    {% if user_role in ['admin', 'analyst'] %}
+                    <div class="pswitch-footer">
+                        <button class="pswitch-add" onclick="window.location.href='/projects'">
+                            <svg width="12" height="12" viewBox="0 0 16 16" fill="none"><path d="M8 3v10M3 8h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+                            Manage Projects
+                        </button>
+                    </div>
+                    {% endif %}
+                    {% if user_role == 'admin' %}
+                    <label class="pswitch-admin-toggle">
+                        <input type="checkbox" id="admin-all-projects" onchange="toggleAdminAllProjects(this.checked)">
+                        <span>Cross-project admin view</span>
+                    </label>
+                    {% endif %}
+                </div>
+                <!-- Hidden select for compatibility with existing fetch interceptor -->
+                <select id="project-switcher" style="display:none;"></select>
+            </div>
             <a href="/admin/logout" style="font-size:0.72rem; opacity:0.7;">Logout ({{ session.get('username','') }})</a>
             {% endif %}
         </div>
@@ -9847,6 +11795,143 @@ BASE_HTML = """
         checkFileUpdates();
         fileCheckInterval = setInterval(checkFileUpdates, """ + str(FILE_CHECK_INTERVAL_SECONDS * 1000) + """);
     }
+
+    // ═══════ PROJECT SWITCHER (Professional) ═══════
+    let _psProjects = [];
+    let _psOpen = false;
+
+    async function initProjectSwitcher() {
+        // Populate the hidden <select> for compat and build custom dropdown
+        const sel = document.getElementById('project-switcher');
+        try {
+            const r = await fetch('/api/projects');
+            const d = await r.json();
+            if (d.success && d.projects) {
+                _psProjects = d.projects;
+                if (sel) {
+                    sel.innerHTML = '<option value="">All Projects</option>';
+                    d.projects.forEach(p => {
+                        const opt = document.createElement('option');
+                        opt.value = p.project_id;
+                        opt.textContent = p.project_name;
+                        sel.appendChild(opt);
+                    });
+                }
+            }
+            const saved = sessionStorage.getItem('project_id') || '';
+            if (sel) sel.value = saved;
+            psUpdateTrigger(saved);
+            psRenderList();
+        } catch(e) { console.error('Project switcher init:', e); }
+    }
+
+    function psUpdateTrigger(pid) {
+        const label = document.getElementById('pswitch-label');
+        const dot = document.getElementById('pswitch-dot');
+        if (!label) return;
+        if (!pid) {
+            label.textContent = 'All Projects';
+            if (dot) dot.style.background = 'var(--orange)';
+            return;
+        }
+        const p = _psProjects.find(x => x.project_id === pid);
+        if (p) {
+            label.textContent = p.project_name;
+            if (dot) dot.style.background = p.color || 'var(--orange)';
+        }
+    }
+
+    function psRenderList() {
+        const list = document.getElementById('pswitch-list');
+        if (!list) return;
+        const search = (document.getElementById('pswitch-search')?.value || '').toLowerCase();
+        const activePid = sessionStorage.getItem('project_id') || '';
+        let items = _psProjects;
+        if (search) items = items.filter(p => (p.project_name + ' ' + p.project_id + ' ' + (p.client_name||'')).toLowerCase().includes(search));
+
+        let html = `<div class="pswitch-item ${!activePid ? 'active' : ''}" onclick="psSwitchTo('')">
+            <div class="pswitch-item-dot" style="background:var(--orange);"></div>
+            <div class="pswitch-item-info"><div class="pswitch-item-name">All Projects</div><div class="pswitch-item-sub">No filter applied</div></div>
+            <div class="pswitch-item-check">${!activePid ? '✓' : ''}</div>
+        </div>`;
+
+        items.forEach(p => {
+            const isActive = p.project_id === activePid;
+            const status = p.status || 'active';
+            html += `<div class="pswitch-item ${isActive ? 'active' : ''}" onclick="psSwitchTo('${p.project_id}')">
+                <div class="pswitch-item-dot" style="background:${p.color || '#E8601C'};"></div>
+                <div class="pswitch-item-info"><div class="pswitch-item-name">${p.project_name}</div><div class="pswitch-item-sub">${p.project_id}${p.client_name ? ' · ' + p.client_name : ''} · ${status}</div></div>
+                <div class="pswitch-item-check">${isActive ? '✓' : ''}</div>
+            </div>`;
+        });
+        list.innerHTML = html;
+    }
+
+    function psFilter() { psRenderList(); }
+
+    function psToggle() {
+        const dd = document.getElementById('pswitch-dropdown');
+        if (!dd) return;
+        _psOpen = !_psOpen;
+        dd.classList.toggle('open', _psOpen);
+        if (_psOpen) {
+            const si = document.getElementById('pswitch-search');
+            if (si) { si.value = ''; si.focus(); }
+            psRenderList();
+        }
+    }
+
+    function psClose() {
+        _psOpen = false;
+        const dd = document.getElementById('pswitch-dropdown');
+        if (dd) dd.classList.remove('open');
+    }
+
+    async function psSwitchTo(pid) {
+        sessionStorage.setItem('project_id', pid);
+        try {
+            await fetch('/api/projects/set_active', {
+                method: 'POST', headers: {'Content-Type':'application/json'},
+                body: JSON.stringify({project_id: pid})
+            });
+        } catch(e) {}
+        const sel = document.getElementById('project-switcher');
+        if (sel) sel.value = pid;
+        psUpdateTrigger(pid);
+        psClose();
+        location.reload();
+    }
+
+    // Alias for backward compat
+    async function switchProject(projectId) { await psSwitchTo(projectId); }
+
+    function toggleAdminAllProjects(checked) {
+        sessionStorage.setItem('admin_all_projects', checked ? '1' : '0');
+        location.reload();
+    }
+
+    // Close dropdown on outside click
+    document.addEventListener('click', e => {
+        const wrap = document.querySelector('.pswitch-wrap');
+        if (wrap && !wrap.contains(e.target)) psClose();
+    });
+
+    // Add project_id header to all fetch requests
+    const _origFetch = window.fetch;
+    window.fetch = function(url, opts) {
+        opts = opts || {};
+        opts.headers = opts.headers || {};
+        if (typeof opts.headers === 'object' && !(opts.headers instanceof Headers)) {
+            const pid = sessionStorage.getItem('project_id') || '';
+            if (pid) opts.headers['X-Project-Id'] = pid;
+            const adminAll = sessionStorage.getItem('admin_all_projects') || '0';
+            if (adminAll === '1') opts.headers['X-Admin-All-Projects'] = '1';
+        }
+        return _origFetch.call(this, url, opts);
+    };
+
+    // Initialize on page load
+    document.addEventListener('DOMContentLoaded', initProjectSwitcher);
     
     async function initPage() {
         const p = window.location.pathname;
@@ -9910,13 +11995,18 @@ BASE_HTML = """
             document.getElementById('hamburgerBtn').classList.remove('open');
         }
     });
-    // Close mobile nav on resize to desktop
-    window.addEventListener('resize', function() {
+    // Close mobile nav on resize to desktop — named so it can be cleanly removed
+    function _navResizeHandler() {
         if (window.innerWidth > 768) {
             document.getElementById('mainNav').classList.remove('mobile-open');
             document.getElementById('hamburgerBtn').classList.remove('open');
         }
-    });
+    }
+    window.addEventListener('resize', _navResizeHandler);
+    // Clean up on page unload to prevent listener accumulation
+    window.addEventListener('pagehide', function() {
+        window.removeEventListener('resize', _navResizeHandler);
+    }, { once: true });
     </script>
 </body>
 </html>
@@ -10155,7 +12245,7 @@ async function loadDashboardData() {
             // Bar chart
             const names = pd.resin.map(r => r.resin_type);
             const vals  = pd.resin.map(r => r.avg_price);
-            const cols  = pd.resin.map(r => r.trend === 'Rising' ? '#dc3545' : r.trend === 'Falling' ? '#28a745' : '#E8601C');
+            const cols  = pd.resin.map(r => r.trend === 'Rising' ? '#e63946' : r.trend === 'Falling' ? '#1f9d55' : '#E8601C');
             if (typeof Plotly !== 'undefined') {
                 Plotly.newPlot('dash-resin-chart', [{
                     x: names, y: vals, type: 'bar',
@@ -10277,12 +12367,12 @@ RESIN_UI = """
     border-color: #e8601c;
 }
 .comparison-card.best {
-    border-color: #28a745;
-    background: linear-gradient(135deg, rgba(40, 167, 69, 0.15) 0%, rgba(40, 167, 69, 0.05) 100%);
+    border-color: #1f9d55;
+    background: linear-gradient(135deg, rgba(31, 157, 85, 0.15) 0%, rgba(31, 157, 85, 0.05) 100%);
 }
 .comparison-card.worst {
-    border-color: #dc3545;
-    background: linear-gradient(135deg, rgba(220, 53, 69, 0.15) 0%, rgba(220, 53, 69, 0.05) 100%);
+    border-color: #e63946;
+    background: linear-gradient(135deg, rgba(230, 57, 70, 0.15) 0%, rgba(230, 57, 70, 0.05) 100%);
 }
 .location-badge {
     display: inline-block;
@@ -10295,11 +12385,14 @@ RESIN_UI = """
     margin-bottom: 10px;
 }
 .best .location-badge {
-    background: #28a745;
+    background: #1f9d55;
 }
 .worst .location-badge {
-    background: #dc3545;
+    background: #e63946;
 }
+.badge-positive { color: #1f9d55; font-weight: 600; }
+.badge-negative { color: #e63946; font-weight: 600; }
+.badge-warning  { color: #ff7a18; font-weight: 600; }
 .stat-row {
     display: flex;
     justify-content: space-between;
@@ -10322,11 +12415,11 @@ RESIN_UI = """
     font-weight: 700;
 }
 .trend-rising {
-    background: #dc3545;
+    background: #e63946;
     color: white;
 }
 .trend-falling {
-    background: #28a745;
+    background: #1f9d55;
     color: white;
 }
 .trend-stable {
@@ -10536,13 +12629,13 @@ async function genRes() {
             <div style="background: linear-gradient(135deg, rgba(232, 96, 28, 0.2) 0%, rgba(232, 96, 28, 0.05) 100%); border: 2px solid var(--orange); border-radius: 15px; padding: 25px; margin-bottom: 25px;">
                 <div class="resin-kpi-grid" style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 20px;">
                     <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">CURRENT PRICE</div><div style="font-size:clamp(1.3rem,4vw,2rem); font-weight:900; color:var(--orange);">${i.curr}</div></div>
-                    <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">PERIOD CHANGE</div><div style="font-size:clamp(1.3rem,4vw,2rem); font-weight:900; ${parseFloat(i.diff) > 0 ? 'color:#dc3545;' : 'color:#10b981;'}">${i.diff}</div></div>
+                    <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">PERIOD CHANGE</div><div style="font-size:clamp(1.3rem,4vw,2rem); font-weight:900; ${parseFloat(i.diff) > 0 ? 'color:#e63946;' : 'color:#10b981;'}">${i.diff}</div></div>
                     <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">MARKET STATUS</div><div><span class="badge ${i.badge}" style="font-size:0.9rem; padding:8px 15px;">${i.status}</span></div></div>
                 </div>
                 <div class="resin-kpi-grid" style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2);">
                     <div><div style="opacity:0.7; font-size:0.8rem;">Average Price</div><div style="font-weight:800; font-size:1.1rem;">${i.avg}</div></div>
                     <div><div style="opacity:0.7; font-size:0.8rem;">Min Price</div><div style="font-weight:800; font-size:1.1rem; color:#10b981;">${i.min}</div></div>
-                    <div><div style="opacity:0.7; font-size:0.8rem;">Max Price</div><div style="font-weight:800; font-size:1.1rem; color:#dc3545;">${i.max}</div></div>
+                    <div><div style="opacity:0.7; font-size:0.8rem;">Max Price</div><div style="font-weight:800; font-size:1.1rem; color:#e63946;">${i.max}</div></div>
                 </div>
             </div>
        
@@ -10705,11 +12798,11 @@ async function compareRegions() {
     } catch (error) {
         console.error('Error comparing regions:', error);
         // Display the actual error message from the server
-        resultsDiv.innerHTML = `<div class="card" style="border-color:#dc3545; background: rgba(220, 53, 69, 0.1); padding: 30px;">
+        resultsDiv.innerHTML = `<div class="card" style="border-color:#e63946; background: rgba(230, 57, 70, 0.1); padding: 30px;">
             <div style="text-align: center;">
                 <div style="font-size: 3rem; margin-bottom: 15px;">⚠️</div>
-                <h3 style="color:#dc3545; margin-bottom: 15px;">Comparison Failed</h3>
-                <p style="color:#dc3545; font-size: 1.05rem; line-height: 1.6; margin-bottom: 20px;">${error.message}</p>
+                <h3 style="color:#e63946; margin-bottom: 15px;">Comparison Failed</h3>
+                <p style="color:#e63946; font-size: 1.05rem; line-height: 1.6; margin-bottom: 20px;">${error.message}</p>
                 <p style="opacity: 0.7; font-size: 0.9rem;">Please check your selections and try again. If the problem persists, verify your data source.</p>
             </div>
         </div>`;
@@ -10724,8 +12817,8 @@ function displayComparison(data) {
     html += '<h3 style="margin-bottom: 10px;">Regional Price Comparison</h3>';
     html += `<p style="opacity: 0.8; margin-bottom: 15px;">${data.resin_type} - ${data.grade} | ${data.duration}</p>`;
     html += '<div class="resin-kpi-grid" style="display: grid; grid-template-columns: repeat(3, 1fr); gap: 15px; padding: 15px; background: rgba(255,255,255,0.1); border-radius: 8px;">';
-    html += `<div><div style="opacity: 0.7; font-size: 0.8rem;">BEST PRICE</div><div style="font-size: 1.2rem; font-weight: 800; color: #28a745;">${data.summary.best_price_location}</div></div>`;
-    html += `<div><div style="opacity: 0.7; font-size: 0.8rem;">HIGHEST PRICE</div><div style="font-size: 1.2rem; font-weight: 800; color: #dc3545;">${data.summary.worst_price_location}</div></div>`;
+    html += `<div><div style="opacity: 0.7; font-size: 0.8rem;">BEST PRICE</div><div style="font-size: 1.2rem; font-weight: 800; color: #1f9d55;">${data.summary.best_price_location}</div></div>`;
+    html += `<div><div style="opacity: 0.7; font-size: 0.8rem;">HIGHEST PRICE</div><div style="font-size: 1.2rem; font-weight: 800; color: #e63946;">${data.summary.worst_price_location}</div></div>`;
     html += `<div><div style="opacity: 0.7; font-size: 0.8rem;">PRICE SPREAD</div><div style="font-size: 1.2rem; font-weight: 800;">${data.summary.price_spread}</div></div>`;
     html += '</div></div>';
     
@@ -10785,9 +12878,8 @@ async function exportComparison() {
 """
 
 MACH_HTML = """
-<h2>Machine Database</h2>
-<div style="display:flex;gap:8px;margin-bottom:20px;background:rgba(255,255,255,0.1);padding:8px;border-radius:12px;">
-    <button class="mach-tab-btn active" onclick="switchMachTab('search')" data-mtab="search" style="flex:1;padding:12px 20px;background:var(--orange);border:none;border-radius:8px;color:white;font-family:'Outfit',sans-serif;font-size:0.9rem;font-weight:700;cursor:pointer;transition:all 0.3s;box-shadow:0 4px 12px rgba(232,96,28,0.4);">Machine Search</button>
+<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;flex-wrap:wrap;gap:10px;">
+    <h2 style="margin:0;">Machine Database</h2>
 </div>
 
 <div id="mach-tab-search" class="mach-tab-content" style="display:block;">
@@ -10795,16 +12887,15 @@ MACH_HTML = """
     <div class="mach-form-grid">
         <div>
             <label style="display:block; font-size:.75rem; margin-bottom:10px; font-weight:800; opacity:0.9">CATEGORY</label>
-            <select id="cat" onchange="loadProcs(this.value)"><option value="">Select...</option></select>
+            <select id="cat" onchange="loadProcs(this.value)" style="width:100%;padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:white;font-family:'Outfit',sans-serif;font-size:.92rem;transition:border-color .2s;"><option value="">Select Category...</option></select>
         </div>
         <div>
             <label style="display:block; font-size:.75rem; margin-bottom:10px; font-weight:800; opacity:0.9">PROCESS</label>
-            <select id="proc" onchange="enableSearch()" disabled><option>Select Category First</option></select>
+            <select id="proc" onchange="enableSearch()" disabled style="width:100%;padding:12px 14px;border-radius:10px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:white;font-family:'Outfit',sans-serif;font-size:.92rem;transition:border-color .2s;"><option>Select Category First</option></select>
         </div>
     </div>
-    <button class="btn-analyze" id="searchBtn" onclick="loadMachs()" disabled>Search Machines</button>
+    <button class="btn-analyze" id="searchBtn" onclick="loadMachs()" disabled style="margin-top:16px;">Search Machines</button>
 </div>
-<div id="ai_recommendation"></div>
 <div id="m_res"></div>
 
 <!-- ========== COMPARE PANEL ========== -->
@@ -10884,6 +12975,137 @@ function switchMachTab(tab) {
 let currentResults = [];
 let selectedForCompare = [];
 
+async function loadProcs(cat) {
+    const procSel = document.getElementById('proc');
+    if (!cat) {
+        procSel.innerHTML = '<option>Select Category First</option>';
+        procSel.disabled = true;
+        document.getElementById('searchBtn').disabled = true;
+        return;
+    }
+    procSel.innerHTML = '<option value="">Loading...</option>';
+    procSel.disabled = true;
+    try {
+        const r = await fetch('/api/procs', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cat: cat})});
+        const d = await r.json();
+        procSel.innerHTML = '<option value="">Select Process...</option>';
+        if (Array.isArray(d)) {
+            d.forEach(p => { let o = document.createElement('option'); o.value = p; o.text = p; procSel.add(o); });
+        }
+        procSel.disabled = false;
+    } catch(e) {
+        console.error('Error loading processes:', e);
+        procSel.innerHTML = '<option value="">Error loading</option>';
+    }
+}
+
+function enableSearch() {
+    const proc = document.getElementById('proc').value;
+    document.getElementById('searchBtn').disabled = !proc;
+}
+
+async function loadMachs() {
+    const cat = document.getElementById('cat').value;
+    const proc = document.getElementById('proc').value;
+    if (!cat || !proc) return;
+
+    const btn = document.getElementById('searchBtn');
+    btn.disabled = true;
+    btn.innerHTML = '<span class="loading"></span> Searching...';
+    document.getElementById('m_res').innerHTML = '<div class="card"><p style="opacity:0.6;text-align:center;"><span class="loading"></span> Loading machines...</p></div>';
+
+    try {
+        const r = await fetch('/api/mach_res', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cat, proc})});
+        const d = await r.json();
+        if (d.error) { document.getElementById('m_res').innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946">' + d.error + '</p></div>'; return; }
+
+        currentResults = d.results || [];
+        selectedForCompare = [];
+        let h = '';
+
+        // Results header
+        h += '<div class="card" style="margin-top:18px;">';
+        h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;flex-wrap:wrap;gap:10px;">';
+        h += '<h3 style="margin:0;font-size:1.1rem;">Results: <span style="color:var(--orange);">' + (d.display_count || currentResults.length) + '</span> machines found</h3>';
+        h += '<div style="display:flex;gap:8px;">';
+        h += '<button class="btn-secondary" onclick="exportMachines()" style="font-size:0.82rem;">📥 Export Excel</button>';
+        h += '<button class="btn-secondary" id="compareBtn" onclick="compareMachines()" style="font-size:0.82rem;" disabled>Compare Selected (0)</button>';
+        h += '</div></div>';
+
+        // Table
+        h += '<div class="mach-results-scroll"><table class="spec-grid" style="width:100%;border-collapse:collapse;font-size:0.85rem;">';
+        h += '<tr style="border-bottom:2px solid var(--orange);">';
+        h += '<th style="padding:10px 8px;text-align:center;width:40px;">☐</th>';
+        h += '<th style="padding:10px 8px;text-align:left;">Make</th>';
+        h += '<th style="padding:10px 8px;text-align:left;">Model</th>';
+        h += '<th style="padding:10px 8px;text-align:right;">Cost (€)</th>';
+        h += '<th style="padding:10px 8px;text-align:right;">Power (kWh)</th>';
+        h += '<th style="padding:10px 8px;text-align:right;">Footprint (sqm)</th>';
+        h += '</tr>';
+
+        currentResults.forEach((m, i) => {
+            h += '<tr style="border-bottom:1px solid rgba(255,255,255,0.08);">';
+            h += '<td style="padding:8px;text-align:center;"><input type="checkbox" class="mach-cb" data-idx="' + i + '" onchange="toggleMachCompare(' + i + ')"></td>';
+            h += '<td style="padding:8px;">' + (m.make || '-') + '</td>';
+            h += '<td style="padding:8px;font-weight:700;">' + (m.model || '-') + '</td>';
+            h += '<td style="padding:8px;text-align:right;">' + (m.cost || '-') + '</td>';
+            h += '<td style="padding:8px;text-align:right;">' + (m.power || '-') + '</td>';
+            h += '<td style="padding:8px;text-align:right;">' + (m.sqm || '-') + '</td>';
+            h += '</tr>';
+        });
+        h += '</table></div></div>';
+
+        document.getElementById('m_res').innerHTML = h;
+    } catch(e) {
+        console.error('Error loading machines:', e);
+        document.getElementById('m_res').innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946">Failed to load machines: ' + e.message + '</p></div>';
+    } finally {
+        btn.disabled = false;
+        btn.innerHTML = 'Search Machines';
+    }
+}
+
+function toggleMachCompare(idx) {
+    const pos = selectedForCompare.indexOf(idx);
+    if (pos >= 0) selectedForCompare.splice(pos, 1);
+    else if (selectedForCompare.length < 4) selectedForCompare.push(idx);
+    else { alert('Maximum 4 machines for comparison'); document.querySelector('.mach-cb[data-idx="'+idx+'"]').checked = false; return; }
+    const btn = document.getElementById('compareBtn');
+    if (btn) { btn.disabled = selectedForCompare.length < 2; btn.textContent = 'Compare Selected (' + selectedForCompare.length + ')'; }
+}
+
+async function compareMachines() {
+    if (selectedForCompare.length < 2) { alert('Select at least 2 machines'); return; }
+    const machines = selectedForCompare.map(i => currentResults[i]);
+    try {
+        const r = await fetch('/api/machine_compare', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({machines})});
+        const d = await r.json();
+        if (d.error) { alert(d.error); return; }
+        const panel = document.getElementById('comparePanel');
+        panel.style.display = 'block';
+        let h = '<div class="cmp-tbl-wrap"><table class="cmp-tbl"><tr><th>Spec</th>';
+        d.machines.forEach(m => { h += '<th>' + m.make + ' ' + m.model + '</th>'; });
+        h += '</tr>';
+        const specs = [['Cost (€)', 'cost', 'cost_raw', 'min'], ['Power (kWh)', 'power', 'power_raw', 'min'], ['Footprint (sqm)', 'sqm', 'sqm_raw', 'min'], ['Efficiency Score', null, 'efficiency_score', 'max']];
+        specs.forEach(([label, key, rawKey, bestDir]) => {
+            const vals = d.machines.map(m => m[rawKey] || 0);
+            const best = bestDir === 'min' ? Math.min(...vals.filter(v=>v>0)) : Math.max(...vals);
+            h += '<tr><td style="font-weight:700;opacity:0.7;">' + label + '</td>';
+            d.machines.forEach(m => {
+                const v = m[rawKey] || 0;
+                const display = key ? m[key] : v.toFixed(1);
+                const cls = v === best && v > 0 ? ' class="best"' : '';
+                h += '<td' + cls + '>' + display + (v === best && v > 0 ? ' ★' : '') + '</td>';
+            });
+            h += '</tr>';
+        });
+        h += '</table></div>';
+        document.getElementById('compareBody').innerHTML = h;
+        panel.scrollIntoView({behavior:'smooth'});
+    } catch(e) {
+        alert('Compare failed: ' + e.message);
+    }
+}
 
 async function exportMachines() {
     if (currentResults.length === 0) {
@@ -11096,6 +13318,7 @@ CALC_HTML = """
 
 <div class="universal-tab-navigation">
     <button class="universal-tab-btn active" onclick="switchUniversalTab('calculator')" data-tab="calculator">Cost Calculator</button>
+    <button class="universal-tab-btn" onclick="switchUniversalTab('skucompare')" data-tab="skucompare">SKU Comparison</button>
     <button class="universal-tab-btn" onclick="switchUniversalTab('compare')" data-tab="compare">Multi-Country Comparison</button>
     <button class="universal-tab-btn" onclick="switchUniversalTab('whatif')" data-tab="whatif">What-If Scenario Analysis</button>
 </div>
@@ -11178,7 +13401,7 @@ CALC_HTML = """
 
         <div id="subtab-bulk" class="sub-tab-content">
             <div style="margin-bottom:15px;">
-                <p style="opacity:0.7; font-size:0.85rem; margin-bottom:12px;">Upload an Excel file with multiple SKUs. Each row runs through the cost calculator automatically. Set <strong>model</strong> column in Excel to <code>ebm</code>, <code>carton</code>, <code>carton_advanced</code>, or <code>flexibles</code>.</p>
+                <p style="opacity:0.7; font-size:0.85rem; margin-bottom:12px;">Upload an Excel file with multiple SKUs. Each row runs through the cost calculator automatically. Set <strong>model</strong> column to <code>ebm</code>, <code>carton</code>, <code>carton_advanced</code>, <code>flexibles</code>, or <code>custom_&lt;model_id&gt;</code> for Cost Model Builder models. Download the template for examples.</p>
                 <div style="display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-bottom:15px;">
                     <label style="flex:1; min-width:250px; cursor:pointer;">
                         <div id="bulk-drop-zone" style="border:2px dashed rgba(232,96,28,0.5); border-radius:12px; padding:30px; text-align:center; transition:all 0.3s; background:rgba(232,96,28,0.05);">
@@ -11618,11 +13841,99 @@ CALC_HTML = """
     </div>
 </div>
 
+<!-- SKU COMPARISON TAB — v2 AI-POWERED DASHBOARD -->
+<div id="universal-skucompare" class="calculator-view">
+    <div class="card" style="margin-bottom:20px; border:1px solid rgba(232,96,28,0.2);">
+        <div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:10px;margin-bottom:18px;">
+            <div>
+                <div class="calc-section-title" style="margin-bottom:4px;">
+                    <span style="background:linear-gradient(135deg,#e8601c,#ff9800);-webkit-background-clip:text;-webkit-text-fill-color:transparent;font-weight:900;">AI-Powered</span> SKU Comparison Dashboard
+                </div>
+                <p style="opacity:0.5; font-size:0.82rem; margin:0;">Universal engine — works with EBM, Flexibles, Carton, and all Cost Model Builder models. Up to 5 SKUs.</p>
+            </div>
+            <div style="display:flex; gap:8px;">
+                <button class="btn-secondary" onclick="refreshSKUCompareList()" style="font-size:0.8rem; padding:8px 14px;">↻ Refresh</button>
+                <button class="btn-secondary" onclick="addCurrentToComparison()" style="font-size:0.8rem; padding:8px 14px; border-color:rgba(76,175,80,0.4); color:#4CAF50;">+ Add Current Calc</button>
+            </div>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr auto; gap:16px; align-items:end;">
+            <div>
+                <label style="display:block; font-size:0.72rem; font-weight:700; text-transform:uppercase; letter-spacing:1px; opacity:0.5; margin-bottom:8px;">Select SKUs to Compare <span style="opacity:0.6;">(hold Ctrl/Cmd for multiple, max 5)</span></label>
+                <select id="sku-compare-select" multiple style="width:100%; padding:10px; border-radius:10px; background:rgba(255,255,255,0.06); color:white; border:1px solid rgba(255,255,255,0.15); font-family:'Outfit'; font-size:0.88rem; min-height:140px; transition:border-color 0.2s;" onfocus="this.style.borderColor='var(--orange)'" onblur="this.style.borderColor='rgba(255,255,255,0.15)'">
+                </select>
+                <div style="margin-top:8px;display:flex;gap:12px;align-items:center;">
+                    <span id="sku-compare-count" style="font-size:0.78rem;opacity:0.4;">0 SKUs available</span>
+                    <span id="sku-compare-selected" style="font-size:0.78rem;color:var(--orange);font-weight:700;"></span>
+                    <label style="font-size:0.75rem;opacity:0.5;margin-left:auto;display:flex;align-items:center;gap:4px;">
+                        Base SKU: <select id="sku-base-index" style="background:rgba(255,255,255,0.08);color:white;border:1px solid rgba(255,255,255,0.15);border-radius:6px;padding:3px 8px;font-size:0.75rem;font-family:'Outfit';">
+                            <option value="0">First selected</option>
+                        </select>
+                    </label>
+                </div>
+            </div>
+            <div style="display:flex;flex-direction:column;gap:8px;">
+                <button class="btn-analyze" onclick="runSKUComparisonV2()" id="btn-run-sku-compare" style="white-space:nowrap; padding:12px 28px;">
+                    ⚡ Compare SKUs
+                </button>
+                <button class="btn-secondary" onclick="runCostAdvisor()" id="btn-cost-advisor" style="white-space:nowrap;padding:8px 16px;font-size:0.78rem;border-color:rgba(76,175,80,0.3);color:#4CAF50;" disabled>
+                    🧠 AI Advisor
+                </button>
+            </div>
+        </div>
+    </div>
+
+    <!-- DASHBOARD KPI ROW -->
+    <div id="sku-dash-kpis" style="display:none;"></div>
+
+    <!-- CHARTS GRID -->
+    <div id="sku-dash-charts" style="display:none; display:grid; grid-template-columns:1fr 1fr; gap:16px; margin-bottom:20px;">
+        <div class="card" style="border:1px solid rgba(255,255,255,0.06);"><div id="sku-radar-chart" style="height:380px;"></div></div>
+        <div class="card" style="border:1px solid rgba(255,255,255,0.06);"><div id="sku-bar-chart" style="height:380px;"></div></div>
+        <div class="card" style="border:1px solid rgba(255,255,255,0.06);"><div id="sku-waterfall-chart" style="height:380px;"></div></div>
+        <div class="card" style="border:1px solid rgba(255,255,255,0.06);"><div id="sku-index-chart" style="height:380px;"></div></div>
+    </div>
+
+    <!-- COMPARISON TABLE -->
+    <div id="sku-compare-results"></div>
+
+    <!-- AI ADVISOR PANEL -->
+    <div id="sku-advisor-panel" style="display:none; margin-top:20px;">
+        <div class="card" style="border:1px solid rgba(76,175,80,0.25); background:linear-gradient(135deg, rgba(76,175,80,0.04), rgba(76,175,80,0.01));">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;">
+                <div>
+                    <div class="calc-section-title" style="margin:0;color:#4CAF50;">🧠 AI Optimization Advisor</div>
+                    <p style="opacity:0.5;font-size:0.78rem;margin:4px 0 0;">Ranked savings opportunities across all compared SKUs</p>
+                </div>
+                <div id="advisor-total-saving" style="text-align:right;"></div>
+            </div>
+            <div id="advisor-recommendations"></div>
+        </div>
+    </div>
+
+    <!-- INPUT PARAMETERS TABLE -->
+    <div id="sku-compare-inputs" style="margin-top:20px;"></div>
+
+    <!-- EXPORT -->
+    <div id="sku-dash-export" style="display:none; margin-top:16px;">
+        <div style="display:flex;gap:10px;">
+            <button class="btn-secondary" onclick="exportSKUComparison()" style="flex:1;">📥 Export Excel</button>
+        </div>
+    </div>
+</div>
+
 <div id="universal-compare" class="calculator-view">
     <div class="card">
         <div class="calc-section-title">Multi-Country Comparison</div>
-        <p style="opacity:0.7; font-size:0.85rem; margin-bottom:15px;">Run the same SKU across multiple countries side-by-side. First calculate your cost model (any model) in the Calculator tab, then select countries below for comparison.</p>
+        <p style="opacity:0.7; font-size:0.85rem; margin-bottom:15px;">Run the same SKU across multiple countries side-by-side. Works with <strong>all models</strong> — EBM, Carton, Flexibles, and custom Cost Model Builder models. First calculate your cost model in the Calculator tab, then select countries below. You can override cost parameters per country.</p>
         <div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:15px;" id="country-checkboxes"></div>
+        <div id="mc-override-toggle" style="display:none; margin-bottom:15px;">
+            <label style="font-size:0.85rem; display:flex; align-items:center; gap:8px; cursor:pointer;">
+                <input type="checkbox" id="mc-show-overrides" onchange="toggleMCOverrides()" style="accent-color:var(--orange); width:16px; height:16px;">
+                <span style="font-weight:700;">Edit Country Parameters</span>
+                <span style="opacity:0.5; font-size:0.78rem;">(override default cost factors per country)</span>
+            </label>
+        </div>
+        <div id="mc-overrides-container" style="display:none; margin-bottom:20px;"></div>
         <button class="btn-analyze" id="compareCountriesBtn" onclick="runMultiCountry()" disabled>Compare Countries</button>
     </div>
     <div id="multi-country-results"></div>
@@ -11635,7 +13946,7 @@ CALC_HTML = """
         <p style="opacity:0.7; font-size:0.85rem; margin-bottom:15px;">Adjust sliders to see how parameter changes affect total cost. Works with all cost models — first calculate in the Calculator tab.</p>
         <div id="whatif-sliders">
             <div class="calc-section" style="margin-bottom:12px;">
-                <label style="font-size:0.85rem;">Resin Price Change: <strong id="wi_resin_label">0%</strong></label>
+                <label style="font-size:0.85rem;" id="wi_resin_text">Material Cost Change: <strong id="wi_resin_label">0%</strong></label>
                 <input type="range" min="-50" max="50" value="0" id="wi_resin" oninput="updateWhatIf()" style="width:100%; accent-color:var(--orange);">
             </div>
             <div class="calc-section" style="margin-bottom:12px;">
@@ -11653,6 +13964,18 @@ CALC_HTML = """
             <div class="calc-section" style="margin-bottom:12px;">
                 <label style="font-size:0.85rem;">Margin Change: <strong id="wi_margin_label">0%</strong></label>
                 <input type="range" min="-50" max="50" value="0" id="wi_margin" oninput="updateWhatIf()" style="width:100%; accent-color:var(--orange);">
+            </div>
+            <div class="calc-section" style="margin-bottom:12px; border-top:1px solid rgba(255,255,255,0.1); padding-top:12px;">
+                <label style="font-size:0.85rem;">Working Capital Cost Change: <strong id="wi_wc_label">0%</strong></label>
+                <input type="range" min="-50" max="50" value="0" id="wi_wc" oninput="updateWhatIf()" style="width:100%; accent-color:#9C27B0;">
+            </div>
+            <div class="calc-section" style="margin-bottom:12px;">
+                <label style="font-size:0.85rem;">Exchange Rate Change: <strong id="wi_fx_label">0%</strong></label>
+                <input type="range" min="-30" max="30" value="0" id="wi_fx" oninput="updateWhatIf()" style="width:100%; accent-color:#2196F3;">
+            </div>
+            <div class="calc-section" style="margin-bottom:12px;">
+                <label style="font-size:0.85rem;">Transportation Cost Change: <strong id="wi_transport_label">0%</strong></label>
+                <input type="range" min="-50" max="100" value="0" id="wi_transport" oninput="updateWhatIf()" style="width:100%; accent-color:#FF9800;">
             </div>
         </div>
         <button class="btn-secondary" onclick="resetWhatIf()" style="width:100%; margin-top:10px;">Reset All Sliders</button>
@@ -11705,12 +14028,20 @@ function switchUniversalTab(tab) {
             document.getElementById('universal-compare').classList.add('active');
         } else if (tab === 'whatif') {
             document.getElementById('universal-whatif').classList.add('active');
+        } else if (tab === 'skucompare') {
+            document.getElementById('universal-skucompare').classList.add('active');
+            refreshSKUCompareList();
         }
     }
 }
 
 function switchSubTab(tab) {
-    // Buttons
+    // Ensure parent calculator view is active whenever a sub-tab is selected
+    document.querySelectorAll('.calculator-view').forEach(c => c.classList.remove('active'));
+    var calcView = document.getElementById('universal-calculator');
+    if (calcView) calcView.classList.add('active');
+
+    // Update tab buttons
     document.getElementById('btn-essentials').classList.remove('active');
     document.getElementById('btn-advanced').classList.remove('active');
     document.getElementById('btn-bulk').classList.remove('active');
@@ -11830,6 +14161,7 @@ function renderCustomCalcModel(model, container) {
         html += '</div>';
     }
     html += `<button class="btn-analyze" onclick="calcCustomModel('${model.id}')" style="width:100%;margin-top:15px;">Calculate</button>`;
+    html += `<button onclick="saveSKU()" id="save-sku-btn-custom" class="btn-analyze" style="background:linear-gradient(135deg,#FF9800,#F57C00);margin-top:10px;display:none;border:none;color:white;padding:12px 24px;border-radius:8px;cursor:pointer;font-weight:600;box-shadow:0 4px 12px rgba(255,152,0,0.4);width:100%;">💾 Save as SKU</button>`;
     html += '</div></div><div>';
     // Results panel
     html += '<div class="summary-card" id="cm-summary"><h3 style="margin-bottom:20px;">' + (model.name||'Results') + '</h3>';
@@ -11842,6 +14174,12 @@ function renderCustomCalcModel(model, container) {
         });
         html += '</div>';
     }
+    html += `<div id="custom-export-btns" style="margin-top:15px;display:none;">
+        <div style="display:flex;gap:10px;">
+            <button class="btn-secondary" onclick="exportEBMExcel()" style="flex:1;">📊 Export Excel</button>
+            <button class="btn-secondary" onclick="exportEBMPDF()" style="flex:1;">📄 Export PDF</button>
+        </div>
+    </div>`;
     html += '</div></div></div>';
     container.innerHTML = html;
 }
@@ -11849,10 +14187,14 @@ function renderCustomCalcModel(model, container) {
 async function calcCustomModel(modelId) {
     // Fetch model to get field metadata for input type handling
     let modelFields = [];
+    let modelMeta = {};
     try {
         const mr = await fetch('/api/models/' + modelId);
         const md = await mr.json();
-        if (md.success) modelFields = md.model.fields || [];
+        if (md.success) {
+            modelFields = md.model.fields || [];
+            modelMeta = md.model;
+        }
     } catch(e) {}
     const inputs = {};
     modelFields.forEach(f => {
@@ -11882,8 +14224,59 @@ async function calcCustomModel(modelId) {
                 const el = document.getElementById('cm_out_' + k);
                 if (el) el.textContent = typeof v === 'number' ? v.toLocaleString(undefined, {minimumFractionDigits:2, maximumFractionDigits:4}) : v;
             }
+            // ── Universal: map results to standard cost structure ──
+            const res = data.results;
+            const mapped = _mapCustomToStandard(res, modelFields);
+            lastModelResult = {
+                ...mapped,
+                model_name: modelMeta.name || 'Custom Model',
+                model_id: modelId,
+                _custom: true,
+                _all_results: res,
+                _inputs: inputs,
+            };
+            lastModelInput = inputs;
+            lastModelType = 'custom';
+            lastModelResult._model_meta = modelMeta;
+            // Show export and save buttons
+            var expDiv = document.getElementById('custom-export-btns');
+            if (expDiv) expDiv.style.display = 'block';
+            var skuBtn = document.getElementById('save-sku-btn-custom');
+            if (skuBtn) skuBtn.style.display = 'block';
         }
     } catch(e) { alert('Calculation error: ' + e.message); }
+}
+
+function _mapCustomToStandard(results, fields) {
+    const fieldMap = {};
+    (fields || []).forEach(f => { fieldMap[f.id] = f; });
+    const mapped = {material_cost:0, conversion_cost:0, margin:0, packing_cost:0, freight_cost:0, total_cost_per_1000:0, cost_per_piece:0};
+    const kwMap = {
+        material_cost: ['material_cost','mat_cost','resin_cost','raw_material','total_material'],
+        conversion_cost: ['conversion_cost','conv_cost','processing_cost','manufacturing_cost','total_conversion'],
+        margin: ['margin','profit','markup'],
+        packing_cost: ['packing_cost','packaging_cost','pack_cost','secondary_pack'],
+        freight_cost: ['freight_cost','transport_cost','logistics_cost','shipping_cost'],
+        total_cost_per_1000: ['total_cost','total_per_1000','grand_total','final_cost','cost_per_1000'],
+        cost_per_piece: ['cost_per_piece','unit_cost','per_unit','cost_per_unit'],
+    };
+    for (const [stdKey, kws] of Object.entries(kwMap)) {
+        for (const [fid, val] of Object.entries(results)) {
+            const fidL = fid.toLowerCase();
+            const labelL = (fieldMap[fid]||{}).label ? fieldMap[fid].label.toLowerCase() : '';
+            for (const kw of kws) {
+                if (fidL.includes(kw) || labelL.includes(kw)) { mapped[stdKey] = parseFloat(val)||0; break; }
+            }
+            if (mapped[stdKey] !== 0) break;
+        }
+    }
+    if (mapped.total_cost_per_1000 === 0) {
+        mapped.total_cost_per_1000 = mapped.material_cost + mapped.conversion_cost + mapped.margin + mapped.packing_cost + mapped.freight_cost;
+    }
+    if (mapped.total_cost_per_1000 === 0 && Object.keys(results).length > 0) {
+        mapped.total_cost_per_1000 = Math.max(...Object.values(results).filter(v => typeof v === 'number'));
+    }
+    return mapped;
 }
 
 // --- CARTON LOGIC ---
@@ -12357,28 +14750,76 @@ function renderEBMPieChart(d) {
 }
 
 async function exportEBMExcel() {
-    if (!lastEBMResult && !(lastModelResult && lastModelType === 'ebm')) { alert('Calculate EBM first'); return; }
-    const data = lastEBMResult || lastModelResult;
+    if (!lastModelResult) { alert('Calculate a cost model first'); return; }
+    // Fix 1 & 6: always use lastModelResult (never stale EBMResult), route by model type
+    const data = lastModelResult;
+    const payload = {
+        model_name: data.model_name || lastModelType || 'Cost Model',
+        model_type: lastModelType,
+        country: data.country || (lastModelInput && lastModelInput.country) || 'N/A',
+        currency: data.currency || 'INR',
+        sku_description: data.sku_description || '',
+        material_cost: data.material_cost || 0,
+        conversion_cost: data.conversion_cost || 0,
+        margin: data.margin || 0,
+        packing_cost: data.packing_cost || 0,
+        freight_cost: data.freight_cost || 0,
+        total_cost_per_1000: data.total_cost_per_1000 || 0,
+        cost_per_piece: data.cost_per_piece || 0,
+        input_params: lastModelInput || {},
+        all_results: data._all_results || data,
+    };
     try {
-        const r = await fetch('/api/export_ebm_excel', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+        const exportUrlMap = {
+            'ebm': '/api/export_ebm_excel',
+            'carton': '/api/export_generic_excel',
+            'flexibles': '/api/export_generic_excel',
+            'carton-adv': '/api/export_generic_excel',
+        };
+        const url = data._custom ? '/api/export_excel' : (exportUrlMap[lastModelType] || '/api/export_generic_excel');
+        const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data._custom ? payload : data)});
         if (!r.ok) { const e = await r.json(); throw new Error(e.error || 'Export failed'); }
         const blob = await r.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url; a.download = 'EBM_Report.xlsx';
-        document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); document.body.removeChild(a);
+        const u = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = u; a.download = (payload.model_name||'Report').replace(/\s+/g,'_') + '_Report.xlsx';
+        document.body.appendChild(a); a.click(); URL.revokeObjectURL(u); document.body.removeChild(a);
     } catch(e) { alert('Export failed: ' + e.message); }
 }
 
 async function exportEBMPDF() {
-    if (!lastEBMResult && !(lastModelResult && lastModelType === 'ebm')) { alert('Calculate EBM first'); return; }
-    const data = lastEBMResult || lastModelResult;
+    if (!lastModelResult) { alert('Calculate a cost model first'); return; }
+    // Fix 1 & 6: always use lastModelResult (never stale EBMResult), route by model type
+    const data = lastModelResult;
+    const payload = {
+        model_name: data.model_name || lastModelType || 'Cost Model',
+        model_type: lastModelType,
+        country: data.country || (lastModelInput && lastModelInput.country) || 'N/A',
+        currency: data.currency || 'INR',
+        sku_description: data.sku_description || '',
+        material_cost: data.material_cost || 0,
+        conversion_cost: data.conversion_cost || 0,
+        margin: data.margin || 0,
+        packing_cost: data.packing_cost || 0,
+        freight_cost: data.freight_cost || 0,
+        total_cost_per_1000: data.total_cost_per_1000 || 0,
+        cost_per_piece: data.cost_per_piece || 0,
+        input_params: lastModelInput || {},
+        all_results: data._all_results || {},
+    };
     try {
-        const r = await fetch('/api/export_ebm_pdf', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data)});
+        const exportUrlMap = {
+            'ebm': '/api/export_ebm_pdf',
+            'carton': '/api/export_generic_pdf',
+            'flexibles': '/api/export_generic_pdf',
+            'carton-adv': '/api/export_generic_pdf',
+        };
+        const url = data._custom ? '/api/export_pdf' : (exportUrlMap[lastModelType] || '/api/export_generic_pdf');
+        const r = await fetch(url, {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data._custom ? payload : data)});
         if (!r.ok) { const e = await r.json(); throw new Error(e.error || 'Export failed'); }
         const blob = await r.blob();
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a'); a.href = url; a.download = 'EBM_Report.pdf';
-        document.body.appendChild(a); a.click(); URL.revokeObjectURL(url); document.body.removeChild(a);
+        const u = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = u; a.download = (payload.model_name||'Report').replace(/\s+/g,'_') + '_Report.pdf';
+        document.body.appendChild(a); a.click(); URL.revokeObjectURL(u); document.body.removeChild(a);
     } catch(e) { alert('Export failed: ' + e.message); }
 }
 
@@ -12396,6 +14837,124 @@ function initCountryCheckboxes() {
 function updateCompareBtn() {
     const checked = document.querySelectorAll('#country-checkboxes input:checked');
     document.getElementById('compareCountriesBtn').disabled = checked.length < 2;
+    // Show override toggle when 2+ countries selected
+    const toggleDiv = document.getElementById('mc-override-toggle');
+    if (toggleDiv) toggleDiv.style.display = checked.length >= 2 ? 'block' : 'none';
+    // Rebuild override fields if visible
+    if (document.getElementById('mc-show-overrides') && document.getElementById('mc-show-overrides').checked) {
+        buildMCOverrideFields();
+    }
+}
+
+function toggleMCOverrides() {
+    const show = document.getElementById('mc-show-overrides').checked;
+    const container = document.getElementById('mc-overrides-container');
+    container.style.display = show ? 'block' : 'none';
+    if (show) buildMCOverrideFields();
+}
+
+async function buildMCOverrideFields() {
+    const checked = Array.from(document.querySelectorAll('#country-checkboxes input:checked')).map(c => c.value);
+    if (checked.length < 2) return;
+    const container = document.getElementById('mc-overrides-container');
+    container.innerHTML = '<div style="text-align:center;padding:15px;opacity:0.5;"><span class="loading"></span> Loading defaults...</div>';
+    
+    // Determine which override fields to show based on the active model
+    const modelType = lastModelType || 'ebm';
+    let overrideFields = [];
+    if (modelType === 'ebm') {
+        overrideFields = [
+            {id:'volume', label:'Volume', placeholder:'62975559'},
+            {id:'material_price', label:'Material Price', placeholder:'95'},
+            {id:'freight_cost', label:'Freight Cost', placeholder:'8341.60'},
+            {id:'electricity_rate', label:'Electricity Rate', placeholder:''},
+            {id:'labour_rate', label:'Labour Rate', placeholder:''},
+            {id:'exchange_rate', label:'Exchange Rate (to EUR)', placeholder:''}
+        ];
+    } else if (modelType === 'carton' || modelType === 'carton-adv' || modelType === 'carton_advanced') {
+        overrideFields = [
+            {id:'volume', label:'Volume', placeholder:''},
+            {id:'material_price', label:'Board Cost Rate', placeholder:''},
+            {id:'freight_cost', label:'Freight Cost', placeholder:''},
+            {id:'electricity_rate', label:'Electricity Rate', placeholder:''},
+            {id:'labour_rate', label:'Labour Rate', placeholder:''},
+            {id:'exchange_rate', label:'Exchange Rate (to EUR)', placeholder:''}
+        ];
+    } else if (modelType === 'flexibles' || modelType === 'flexible') {
+        overrideFields = [
+            {id:'volume', label:'Volume', placeholder:''},
+            {id:'material_price', label:'Film/Resin Price', placeholder:''},
+            {id:'freight_cost', label:'Freight Cost', placeholder:''},
+            {id:'electricity_rate', label:'Electricity Rate', placeholder:''},
+            {id:'labour_rate', label:'Labour Rate', placeholder:''},
+            {id:'exchange_rate', label:'Exchange Rate (to EUR)', placeholder:''}
+        ];
+    } else {
+        // Custom or other model — show generic universal override fields plus any model-specific numeric inputs
+        overrideFields = [
+            {id:'volume', label:'Volume', placeholder:''},
+            {id:'material_price', label:'Material Price', placeholder:''},
+            {id:'freight_cost', label:'Freight Cost', placeholder:''},
+            {id:'electricity_rate', label:'Electricity Rate', placeholder:''},
+            {id:'labour_rate', label:'Labour Rate', placeholder:''},
+            {id:'exchange_rate', label:'Exchange Rate (to EUR)', placeholder:''}
+        ];
+        // Inject model-specific input fields if available from lastModelInput
+        if (lastModelInput && typeof lastModelInput === 'object') {
+            const addedIds = new Set(overrideFields.map(f => f.id));
+            Object.keys(lastModelInput).forEach(k => {
+                if (!addedIds.has(k) && typeof lastModelInput[k] === 'number') {
+                    overrideFields.push({id: k, label: k.replace(/_/g,' ').replace(/\\b\\w/g, c => c.toUpperCase()), placeholder: String(lastModelInput[k])});
+                }
+            });
+        }
+    }
+    
+    try {
+        const r = await fetch('/api/country_defaults', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({countries:checked})});
+        const d = await r.json();
+        if (!d.defaults) throw new Error('Failed to load defaults');
+        let h = '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:0.82rem;">';
+        h += '<tr style="border-bottom:2px solid var(--orange);"><th style="padding:8px;text-align:left;">Country</th>';
+        overrideFields.forEach(f => { h += '<th style="padding:8px;text-align:center;white-space:nowrap;">' + f.label + '</th>'; });
+        h += '</tr>';
+        checked.forEach(c => {
+            const df = d.defaults[c] || {};
+            h += '<tr style="border-bottom:1px solid rgba(255,255,255,0.08);">';
+            h += '<td style="padding:8px;font-weight:700;">' + c + '</td>';
+            overrideFields.forEach(f => {
+                const val = df[f.id] || f.placeholder || '';
+                const id = 'mc_ov_' + c.replace(/[^a-zA-Z0-9]/g,'_') + '_' + f.id;
+                h += '<td style="padding:4px 6px;"><input type="number" id="' + id + '" value="' + val + '" step="any" placeholder="' + (f.placeholder||'') + '" style="width:100%;padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(255,255,255,0.06);color:white;font-size:0.82rem;text-align:right;font-family:JetBrains Mono,monospace;min-width:80px;"></td>';
+            });
+            h += '</tr>';
+        });
+        h += '</table></div>';
+        h += '<p style="font-size:0.75rem;opacity:0.4;margin-top:8px;">Leave blank or keep default to use system values. Override any field to customize per-country.</p>';
+        // Store override field IDs for collection
+        window._mcOverrideFieldIds = overrideFields.map(f => f.id);
+        container.innerHTML = h;
+    } catch(e) {
+        container.innerHTML = '<div style="color:#ef4444;padding:10px;">Failed to load defaults: ' + e.message + '</div>';
+    }
+}
+
+function collectMCOverrides() {
+    const checked = Array.from(document.querySelectorAll('#country-checkboxes input:checked')).map(c => c.value);
+    const showOverrides = document.getElementById('mc-show-overrides') && document.getElementById('mc-show-overrides').checked;
+    if (!showOverrides) return {};
+    const overrides = {};
+    const fieldIds = window._mcOverrideFieldIds || ['volume','material_price','freight_cost','electricity_rate','labour_rate','exchange_rate'];
+    checked.forEach(c => {
+        const key = c.replace(/[^a-zA-Z0-9]/g,'_');
+        const ov = {};
+        fieldIds.forEach(f => {
+            const el = document.getElementById('mc_ov_' + key + '_' + f);
+            if (el && el.value !== '') ov[f] = el.value;
+        });
+        if (Object.keys(ov).length > 0) overrides[c] = ov;
+    });
+    return overrides;
 }
 
 async function runMultiCountry() {
@@ -12406,11 +14965,13 @@ async function runMultiCountry() {
     const btn = document.getElementById('compareCountriesBtn');
     btn.disabled = true; btn.innerHTML = '<span class="loading"></span> Comparing...';
     
+    const country_overrides = collectMCOverrides();
+    
     // For EBM use its dedicated endpoint; for all others use generic
     let apiUrl, payload;
     if (lastModelType === 'ebm') {
         apiUrl = '/api/multi_country_ebm';
-        payload = {countries: checked, base_params: lastEBMInput || lastModelInput};
+        payload = {countries: checked, base_params: lastEBMInput || lastModelInput, country_overrides: country_overrides};
     } else {
         apiUrl = '/api/multi_country_generic';
         payload = {
@@ -12428,7 +14989,8 @@ async function runMultiCountry() {
                 direct_labour: lastModelResult.direct_labour || 0,
                 indirect_labour: lastModelResult.indirect_labour || 0,
             },
-            base_country: lastModelResult.country || lastModelInput.country || 'India'
+            base_country: lastModelResult.country || lastModelInput.country || 'India',
+            country_overrides: country_overrides
         };
     }
     
@@ -12482,9 +15044,23 @@ async function runMultiCountry() {
 
 // --- WHAT-IF ---
 function updateWhatIf() {
-    ['resin','volume','elec','labour','margin'].forEach(p => {
-        document.getElementById('wi_'+p+'_label').textContent = document.getElementById('wi_'+p).value + '%';
+    ['resin','volume','elec','labour','margin','wc','fx','transport'].forEach(p => {
+        const el = document.getElementById('wi_'+p+'_label');
+        const sl = document.getElementById('wi_'+p);
+        if (el && sl) el.textContent = sl.value + '%';
     });
+    // Fix 5: Rename material slider label based on active model type
+    const materialLabelMap = {
+        'ebm': 'Resin Price Change',
+        'flexibles': 'Film / Resin Price Change',
+        'carton': 'Board Cost Change',
+        'carton-adv': 'Board Cost Change',
+    };
+    const resinTextEl = document.getElementById('wi_resin_text');
+    if (resinTextEl && lastModelType) {
+        const labelText = materialLabelMap[lastModelType] || 'Material Cost Change';
+        resinTextEl.childNodes[0].textContent = labelText + ': ';
+    }
     if (!lastModelResult) return;
     
     const resinChg = parseFloat(document.getElementById('wi_resin').value)/100;
@@ -12492,11 +15068,15 @@ function updateWhatIf() {
     const elecChg = parseFloat(document.getElementById('wi_elec').value)/100;
     const labourChg = parseFloat(document.getElementById('wi_labour').value)/100;
     const marginChg = parseFloat(document.getElementById('wi_margin').value)/100;
+    const wcChg = parseFloat(document.getElementById('wi_wc').value)/100;
+    const fxChg = parseFloat(document.getElementById('wi_fx').value)/100;
+    const transportChg = parseFloat(document.getElementById('wi_transport').value)/100;
     
     const base = lastModelResult;
     const mt = lastModelType;
     
     let newMaterial, newConv, newMargin, newPacking, newFreight, newTotal, baseTotal;
+    let financeCost = 0, transportCost = 0, currencyAdj = 0;
     
     if (mt === 'ebm' || mt === 'carton-adv') {
         // Full detailed breakdown
@@ -12509,6 +15089,10 @@ function updateWhatIf() {
         const newLabour = (dlCost + ilCost) * (1 + labourChg) * volFactor;
         const otherConv = base.conversion_cost - elecCost - dlCost - ilCost;
         newConv = newElec + newLabour + otherConv * volFactor;
+        // Working capital cost impact on conversion (interest component)
+        const baseInterest = base.interest_total || (base.conversion_cost * 0.08);
+        financeCost = baseInterest * wcChg;
+        newConv += financeCost;
         // Margin = margin_pct * conversion_cost (dynamic), then apply margin slider
         const mPctInput = base.margin_pct_input || (base.conversion_cost > 0 ? (base.margin / base.conversion_cost) : 0.20);
         const mCalcType = base.margin_calc_type || '% of Conversion Cost';
@@ -12518,18 +15102,28 @@ function updateWhatIf() {
             newMargin = (newMaterial + newConv) * mPctInput * (1 + marginChg);
         }
         newPacking = base.packing_cost;
-        newFreight = base.freight_cost;
+        newFreight = base.freight_cost * (1 + transportChg);
+        transportCost = base.freight_cost * transportChg;
         newTotal = newMaterial + newConv + newMargin + newPacking + newFreight;
+        // Currency adjustment — applied on total
+        currencyAdj = newTotal * fxChg;
+        newTotal += currencyAdj;
         baseTotal = base.total_cost_per_1000;
     } else {
         // Simpler models (carton standard, flexibles)
         newMaterial = (base.material_cost || 0) * (1 + resinChg);
         const volFactor = volChg !== 0 ? 1 / (1 + volChg) : 1;
         newConv = (base.conversion_cost || 0) * (1 + (elecChg + labourChg)/2) * volFactor;
+        // Working capital cost impact
+        financeCost = (base.conversion_cost || 0) * 0.08 * wcChg;
+        newConv += financeCost;
         newMargin = (base.margin || 0) * (1 + marginChg);
         newPacking = base.packing_cost || 0;
-        newFreight = base.freight_cost || 0;
+        newFreight = (base.freight_cost || 0) * (1 + transportChg);
+        transportCost = (base.freight_cost || 0) * transportChg;
         newTotal = newMaterial + newConv + newMargin + newPacking + newFreight;
+        currencyAdj = newTotal * fxChg;
+        newTotal += currencyAdj;
         baseTotal = base.total_cost_per_1000 || (newMaterial + (base.conversion_cost||0) + (base.margin||0) + (base.packing_cost||0) + (base.freight_cost||0));
     }
     
@@ -12538,7 +15132,12 @@ function updateWhatIf() {
     
     const fmt = (v) => v.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
     const clr = diff > 0 ? '#ef4444' : diff < 0 ? '#10b981' : 'white';
-    const unitLabel = mt === 'flexibles' ? '₹/kg' : '₹/1000';
+    // Fix 3: Use actual currency from result, not hard-coded ₹
+    const currencySymbol = lastModelResult?.currency_symbol || lastModelResult?.symbol || lastModelResult?.currency || '₹';
+    const unitLabel = mt === 'flexibles' ? (currencySymbol + '/kg') : (currencySymbol + '/1000');
+    
+    const costPerPart = newTotal / 1000;
+    const profitPer1000 = newMargin;
     
     let h = '<div class="card">';
     h += '<h3 style="margin-bottom:15px;">Scenario Impact</h3>';
@@ -12547,14 +15146,22 @@ function updateWhatIf() {
     h += '<div style="background:rgba(255,255,255,0.08);padding:15px;border-radius:10px;"><div style="font-size:0.75rem;opacity:0.6;">NEW COST</div><div style="font-size:1.3rem;font-weight:800;color:' + clr + ';">' + unitLabel.charAt(0) + ' ' + fmt(newTotal) + '</div></div>';
     h += '<div style="background:rgba(255,255,255,0.08);padding:15px;border-radius:10px;"><div style="font-size:0.75rem;opacity:0.6;">IMPACT</div><div style="font-size:1.3rem;font-weight:800;color:' + clr + ';">' + (diff>=0?'+':'') + fmt(diff) + ' (' + diffPct.toFixed(1) + '%)</div></div>';
     h += '</div>';
+    // Additional KPIs
+    h += '<div class="mc-grid" style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:15px;text-align:center;margin-bottom:20px;">';
+    h += '<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:8px;"><div style="font-size:0.7rem;opacity:0.5;">COST/PART</div><div style="font-size:1rem;font-weight:700;">' + unitLabel.charAt(0) + ' ' + costPerPart.toFixed(4) + '</div></div>';
+    h += '<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:8px;"><div style="font-size:0.7rem;opacity:0.5;">MARGIN/1000</div><div style="font-size:1rem;font-weight:700;color:#4CAF50;">' + unitLabel.charAt(0) + ' ' + fmt(profitPer1000) + '</div></div>';
+    h += '<div style="background:rgba(255,255,255,0.05);padding:12px;border-radius:8px;"><div style="font-size:0.7rem;opacity:0.5;">FX IMPACT</div><div style="font-size:1rem;font-weight:700;color:' + (currencyAdj > 0.01 ? '#ef4444' : currencyAdj < -0.01 ? '#10b981' : 'white') + ';">' + (currencyAdj>=0?'+':'') + fmt(currencyAdj) + '</div></div>';
+    h += '</div>';
     
     const items = [
         {label:'Material', base:base.material_cost||0, new_val:newMaterial},
         {label:'Conversion', base:base.conversion_cost||0, new_val:newConv},
         {label:'Margin', base:base.margin||0, new_val:newMargin},
         {label:'Packing', base:base.packing_cost||0, new_val:newPacking},
-        {label:'Freight', base:base.freight_cost||0, new_val:newFreight},
+        {label:'Freight / Transport', base:base.freight_cost||0, new_val:newFreight},
     ].filter(it => it.base > 0 || it.new_val > 0);
+    if (Math.abs(financeCost) > 0.01) items.push({label:'Working Capital Δ', base:0, new_val:financeCost});
+    if (Math.abs(currencyAdj) > 0.01) items.push({label:'Currency Adjustment', base:0, new_val:currencyAdj});
     h += '<div style="font-size:0.82rem;">';
     items.forEach(it => {
         const d2 = it.new_val - it.base;
@@ -12573,6 +15180,9 @@ function updateWhatIf() {
     if ((base.material_cost||0) > 0) { waterfallLabels.push('Material Δ'); waterfallValues.push(newMaterial-(base.material_cost||0)); waterfallMeasure.push('relative'); }
     if ((base.conversion_cost||0) > 0) { waterfallLabels.push('Conversion Δ'); waterfallValues.push(newConv-(base.conversion_cost||0)); waterfallMeasure.push('relative'); }
     if ((base.margin||0) > 0) { waterfallLabels.push('Margin Δ'); waterfallValues.push(newMargin-(base.margin||0)); waterfallMeasure.push('relative'); }
+    if (Math.abs(transportCost) > 0.01) { waterfallLabels.push('Transport Δ'); waterfallValues.push(transportCost); waterfallMeasure.push('relative'); }
+    if (Math.abs(financeCost) > 0.01) { waterfallLabels.push('WC Cost Δ'); waterfallValues.push(financeCost); waterfallMeasure.push('relative'); }
+    if (Math.abs(currencyAdj) > 0.01) { waterfallLabels.push('FX Δ'); waterfallValues.push(currencyAdj); waterfallMeasure.push('relative'); }
     waterfallLabels.push('New Total'); waterfallValues.push(newTotal); waterfallMeasure.push('total');
     
     var trace = {
@@ -12593,9 +15203,11 @@ function updateWhatIf() {
 }
 
 function resetWhatIf() {
-    ['resin','volume','elec','labour','margin'].forEach(p => {
-        document.getElementById('wi_'+p).value = 0;
-        document.getElementById('wi_'+p+'_label').textContent = '0%';
+    ['resin','volume','elec','labour','margin','wc','fx','transport'].forEach(p => {
+        const sl = document.getElementById('wi_'+p);
+        const lb = document.getElementById('wi_'+p+'_label');
+        if (sl) sl.value = 0;
+        if (lb) lb.textContent = '0%';
     });
     document.getElementById('whatif-results').innerHTML = '';
     document.getElementById('whatif-chart').innerHTML = '';
@@ -12894,14 +15506,12 @@ function setVal(id, value) { const el = document.getElementById(id); if (el && v
 function getActiveModel() {
     const activeCalc = document.querySelector('.sub-tab-btn.active');
     if (!activeCalc) return null;
-    const model = document.getElementById('essentialsSelect')?.value;
-    if (model) return model; // carton or flexibles
-    const advActive = document.getElementById('btn-advanced')?.classList.contains('active');
-    if (advActive) {
-        const ebmActive = document.getElementById('ebm-inputs')?.style.display !== 'none';
-        return ebmActive ? 'ebm' : 'carton_advanced';
+    // Check advanced tab first — essentialsSelect always has a value so must not short-circuit
+    const advBtn = document.getElementById('btn-advanced');
+    if (advBtn?.classList.contains('active')) {
+        return document.getElementById('advancedSelect')?.value || 'ebm';
     }
-    return null;
+    return document.getElementById('essentialsSelect')?.value || 'carton';
 }
 
 function captureCurrentModelData() {
@@ -12910,10 +15520,30 @@ function captureCurrentModelData() {
     const modelData = { model: activeModel, timestamp: new Date().toISOString(), inputs: {}, results: {} };
     switch(activeModel) {
         case 'ebm': modelData.inputs = captureEBMInputs(); modelData.results = window.lastEBMResults || {}; break;
-        case 'carton_advanced': modelData.inputs = captureCartonAdvInputs(); modelData.results = window.lastCartonAdvResults || {}; break;
+        case 'carton_advanced':
+        case 'carton-adv': modelData.inputs = captureCartonAdvInputs(); modelData.results = window.lastCartonAdvResults || {}; break;
         case 'carton': modelData.inputs = captureCartonInputs(); modelData.results = window.lastCartonResults || {}; break;
         case 'flexibles': modelData.inputs = captureFlexiblesInputs(); modelData.results = window.lastFlexiblesResults || {}; break;
-        default: alert('Unknown model type'); return null;
+        default:
+            // Handle custom_ models from Cost Model Builder
+            if (activeModel.startsWith('custom_') || lastModelType === 'custom') {
+                // Capture inputs directly from DOM (sc_ prefixed fields)
+                const domInputs = {};
+                document.querySelectorAll('[id^="sc_"]').forEach(el => {
+                    const fid = el.id.replace('sc_', '');
+                    if (el.type === 'checkbox') domInputs[fid] = el.checked ? 1 : 0;
+                    else if (el.value !== '' && el.value !== undefined) {
+                        const numVal = parseFloat(el.value);
+                        domInputs[fid] = isNaN(numVal) ? el.value : numVal;
+                    }
+                });
+                modelData.inputs = Object.keys(domInputs).length > 0 ? domInputs : (lastModelInput || {});
+                modelData.results = (lastModelResult && lastModelResult._all_results) || {};
+                modelData.model_name = (lastModelResult && lastModelResult.model_name) || activeModel;
+                modelData.model_id = (lastModelResult && lastModelResult.model_id) || activeModel.replace('custom_','');
+            } else {
+                alert('Unknown model type: ' + activeModel); return null;
+            }
     }
     return modelData;
 }
@@ -12931,17 +15561,17 @@ function loadFlexiblesInputs(inp) { if(!inp) return; Object.keys(inp).forEach(k 
 async function saveSKU() {
     const modelData = captureCurrentModelData();
     if (!modelData) return;
-    const skuName = prompt('Enter SKU name:', `SKU_${modelData.model}_${Date.now()}`);
+    const skuName = prompt('Enter SKU name:', 'SKU_' + (modelData.model_name || modelData.model) + '_' + Date.now());
     if (!skuName || skuName.trim() === '') { alert('SKU name cannot be empty'); return; }
-    const sku = { name: skuName.trim(), ...modelData };
+    const sku = { name: skuName.trim(), ...modelData, project_id: sessionStorage.getItem('project_id') || '' };
     const localSuccess = saveSKUToStorage(sku);
     try {
         const response = await fetch('/api/save_sku', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(sku) });
         const data = await response.json();
-        if (localSuccess && data.success) { alert(`✓ SKU "${skuName}" saved successfully!`); refreshSKUDropdown(); }
-        else { alert(`⚠ SKU saved locally only. Server: ${data.message || 'Error'}`); refreshSKUDropdown(); }
+        if (localSuccess && data.success) { alert('✓ SKU "' + skuName + '" saved successfully!'); refreshSKUDropdown(); refreshSKUCompareList(); }
+        else { alert('⚠ SKU saved locally only. Server: ' + (data.message || 'Error')); refreshSKUDropdown(); refreshSKUCompareList(); }
     } catch(error) {
-        if (localSuccess) { alert(`⚠ SKU saved locally only (server unavailable)`); refreshSKUDropdown(); }
+        if (localSuccess) { alert('⚠ SKU saved locally only (server unavailable)'); refreshSKUDropdown(); }
         else { alert('✗ Failed to save SKU'); }
     }
 }
@@ -12950,59 +15580,163 @@ function loadSKU() {
     const dropdown = document.getElementById('sku-selector');
     if (!dropdown || !dropdown.value) { alert('Please select a SKU to load'); return; }
     const skuName = dropdown.value;
-    const skus = getSavedSKUs();
-    const sku = skus.find(s => s.name === skuName);
-    if (!sku) { alert('SKU not found'); return; }
+
+    // Try server first, fall back to local
+    fetch('/api/load_sku/' + encodeURIComponent(skuName))
+        .then(r => r.json())
+        .then(data => {
+            if (data.success && data.sku) {
+                _applyLoadedSKU(data.sku, skuName);
+            } else {
+                // Fall back to local storage
+                const skus = getSavedSKUs();
+                const sku = skus.find(s => s.name === skuName);
+                if (!sku) { alert('SKU "' + skuName + '" not found on server or locally'); return; }
+                _applyLoadedSKU(sku, skuName);
+            }
+        })
+        .catch(() => {
+            // Server unreachable, try local
+            const skus = getSavedSKUs();
+            const sku = skus.find(s => s.name === skuName);
+            if (!sku) { alert('SKU "' + skuName + '" not found'); return; }
+            _applyLoadedSKU(sku, skuName);
+        });
+}
+
+function _applyLoadedSKU(sku, skuName) {
+    const model = sku.model || '';
     
-    // Switch to correct model
-    if (sku.model === 'carton' || sku.model === 'flexibles') {
+    // Handle custom models from Cost Model Builder
+    if (model.startsWith('custom_')) {
+        const essSelect = document.getElementById('essentialsSelect');
+        const advSelect = document.getElementById('advancedSelect');
+        let found = false;
+        if (essSelect) {
+            for (let opt of essSelect.options) {
+                if (opt.value === model) {
+                    document.getElementById('btn-essentials')?.click();
+                    setTimeout(() => { essSelect.value = model; essSelect.dispatchEvent(new Event('change')); }, 50);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found && advSelect) {
+            for (let opt of advSelect.options) {
+                if (opt.value === model) {
+                    document.getElementById('btn-advanced')?.click();
+                    setTimeout(() => {
+                        advSelect.value = model;
+                        switchCalcModel(model);
+                    }, 100);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        setTimeout(() => {
+            if (sku.inputs && typeof sku.inputs === 'object') {
+                Object.keys(sku.inputs).forEach(fid => {
+                    const el = document.getElementById('sc_' + fid);
+                    if (el) {
+                        el.value = sku.inputs[fid];
+                        el.dispatchEvent(new Event('input', {bubbles:true}));
+                    }
+                });
+            }
+            // Switch to calculator tab to show the loaded SKU
+            switchUniversalTab('calculator');
+            alert('✓ SKU "' + skuName + '" loaded successfully!');
+        }, 300);
+        return;
+    }
+    
+    // Handle standard hardcoded models
+    if (model === 'carton' || model === 'flexibles') {
+        switchUniversalTab('calculator');
         document.getElementById('btn-essentials')?.click();
         setTimeout(() => {
-            document.getElementById('essentialsSelect').value = sku.model;
+            document.getElementById('essentialsSelect').value = model;
             document.getElementById('essentialsSelect').dispatchEvent(new Event('change'));
             setTimeout(() => {
-                if (sku.model === 'carton') loadCartonInputs(sku.inputs);
+                if (model === 'carton') loadCartonInputs(sku.inputs);
                 else loadFlexiblesInputs(sku.inputs);
-                alert(`✓ SKU "${skuName}" loaded successfully!`);
+                alert('✓ SKU "' + skuName + '" loaded successfully!');
             }, 100);
         }, 100);
-    } else if (sku.model === 'ebm' || sku.model === 'carton_advanced') {
+    } else if (model === 'ebm' || model === 'carton_advanced' || model === 'carton-adv') {
+        switchUniversalTab('calculator');
         document.getElementById('btn-advanced')?.click();
         setTimeout(() => {
-            if (sku.model === 'ebm') { switchAdvModel('ebm'); loadEBMInputs(sku.inputs); }
-            else { switchAdvModel('carton_adv'); loadCartonAdvInputs(sku.inputs); }
-            alert(`✓ SKU "${skuName}" loaded successfully!`);
+            const advVal = (model === 'ebm') ? 'ebm' : 'carton-adv';
+            document.getElementById('advancedSelect').value = advVal;
+            switchCalcModel(advVal);
+            if (model === 'ebm') loadEBMInputs(sku.inputs);
+            else loadCartonAdvInputs(sku.inputs);
+            alert('✓ SKU "' + skuName + '" loaded successfully!');
         }, 100);
+    } else {
+        alert('Unknown model type: ' + model + '. This SKU may have been saved from a custom model that is no longer available.');
     }
 }
 
-function deleteSKU() {
+async function deleteSKU() {
     const dropdown = document.getElementById('sku-selector');
     if (!dropdown || !dropdown.value) { alert('Please select a SKU to delete'); return; }
     const skuName = dropdown.value;
     if (!confirm(`Delete SKU "${skuName}"?`)) return;
+    
+    // Delete from local storage
     deleteSKUFromStorage(skuName);
+    
+    // Delete from server
+    try {
+        const r = await fetch('/api/delete_sku/' + encodeURIComponent(skuName), { method: 'DELETE' });
+        const d = await r.json();
+        if (d.success) {
+            alert(`✓ SKU "${skuName}" deleted successfully`);
+        } else {
+            alert(`✓ SKU "${skuName}" deleted locally. Server: ${d.message || 'Not found on server'}`);
+        }
+    } catch(e) {
+        alert(`✓ SKU "${skuName}" deleted locally (server unavailable)`);
+    }
+    
     refreshSKUDropdown();
-    alert(`✓ SKU "${skuName}" deleted`);
+    refreshSKUCompareList();
 }
 
-function refreshSKUDropdown() {
+async function refreshSKUDropdown() {
     const dropdown = document.getElementById('sku-selector');
     if (!dropdown) return;
-    const skus = getSavedSKUs();
+    // Merge local + server SKUs (server has project filtering)
+    let allSkus = getSavedSKUs();
+    try {
+        const r = await fetch('/api/list_skus');
+        const d = await r.json();
+        if (d.success && d.skus) {
+            // Merge: server SKUs take precedence, add any local-only ones
+            const serverNames = new Set(d.skus.map(s => s.name));
+            const localOnly = allSkus.filter(s => !serverNames.has(s.name));
+            allSkus = [...d.skus, ...localOnly];
+        }
+    } catch(e) { /* fallback to local only */ }
     dropdown.innerHTML = '<option value="">-- Select SKU --</option>';
-    skus.sort((a, b) => new Date(b.timestamp) - new Date(a.timestamp));
-    skus.forEach(sku => {
+    allSkus.sort((a, b) => new Date(b.timestamp || 0) - new Date(a.timestamp || 0));
+    allSkus.forEach(sku => {
         const option = document.createElement('option');
         option.value = sku.name;
-        const date = new Date(sku.timestamp).toLocaleString();
-        option.textContent = `${sku.name} (${sku.model.toUpperCase()}) - ${date}`;
+        const modelLabel = sku.model_name || sku.model || '?';
+        const date = sku.timestamp ? new Date(sku.timestamp).toLocaleString() : '';
+        option.textContent = sku.name + ' (' + modelLabel.toUpperCase() + ')' + (date ? ' - ' + date : '');
         dropdown.appendChild(option);
     });
 }
 
 function showSaveSKUButton(model) {
-    const btnIds = {'carton': 'save-sku-btn-carton', 'flexibles': 'save-sku-btn-flexibles', 'ebm': 'save-sku-btn-ebm', 'carton_advanced': 'save-sku-btn-carton-adv'};
+    // Fix 4: include both 'carton-adv' (from advancedSelect) and 'carton_advanced' (legacy) as keys
+    const btnIds = {'carton': 'save-sku-btn-carton', 'flexibles': 'save-sku-btn-flexibles', 'ebm': 'save-sku-btn-ebm', 'carton_advanced': 'save-sku-btn-carton-adv', 'carton-adv': 'save-sku-btn-carton-adv'};
     const btnId = btnIds[model];
     if (btnId) {
         const btn = document.getElementById(btnId);
@@ -13196,9 +15930,11 @@ async function saveBulkSKU(index) {
     const sku = {
         name: r.sku_name,
         model: r.model,
+        model_name: r.model_name || r.model,
         timestamp: new Date().toISOString(),
         inputs: r.inputs || {},
-        results: r.full_result || {}
+        results: r.full_result || {},
+        project_id: sessionStorage.getItem('project_id') || ''
     };
 
     // Save locally
@@ -13232,6 +15968,430 @@ async function saveAllBulkSKUs() {
         await saveBulkSKU(i);
     }
     alert('✓ All ' + bulkResults.length + ' SKUs saved!');
+}
+
+// ═══════════════ SKU COMPARISON ENGINE v2 — AI-POWERED DASHBOARD ═══════════════
+
+const _SKU_COLORS = ['#e8601c','#3b82f6','#4CAF50','#f59e0b','#8b5cf6'];
+const _SKU_COLORS_LIGHT = ['rgba(232,96,28,0.15)','rgba(59,130,246,0.15)','rgba(76,175,80,0.15)','rgba(245,158,11,0.15)','rgba(139,92,246,0.15)'];
+
+async function refreshSKUCompareList() {
+    const sel = document.getElementById('sku-compare-select');
+    if (!sel) return;
+    try {
+        const r = await fetch('/api/list_skus?full=1');
+        const d = await r.json();
+        if (!d.success) return;
+        sel.innerHTML = '';
+        (d.skus || []).forEach(s => {
+            const opt = document.createElement('option');
+            opt.value = s.name;
+            const modelLabel = s.model_name || s.model || '?';
+            const ts = s.timestamp ? new Date(s.timestamp).toLocaleDateString() : '';
+            opt.textContent = s.name + ' (' + modelLabel.toUpperCase() + ')' + (ts ? ' — ' + ts : '');
+            opt.dataset.sku = JSON.stringify(s);
+            sel.appendChild(opt);
+        });
+        window._skuCompareData = d.skus || [];
+        const countEl = document.getElementById('sku-compare-count');
+        if (countEl) countEl.textContent = (d.skus || []).length + ' SKUs available';
+    } catch(e) { console.error('SKU compare list error:', e); }
+    sel.onchange = function() {
+        const n = sel.selectedOptions.length;
+        const selEl = document.getElementById('sku-compare-selected');
+        if (selEl) selEl.textContent = n > 0 ? n + ' selected' : '';
+        // Update base index dropdown
+        const baseSel = document.getElementById('sku-base-index');
+        if (baseSel) {
+            baseSel.innerHTML = '';
+            Array.from(sel.selectedOptions).forEach((o, i) => {
+                const bOpt = document.createElement('option');
+                bOpt.value = i;
+                bOpt.textContent = o.value;
+                baseSel.appendChild(bOpt);
+            });
+        }
+        // Enable advisor button
+        const advBtn = document.getElementById('btn-cost-advisor');
+        if (advBtn) advBtn.disabled = n < 2;
+    };
+}
+
+function addCurrentToComparison() {
+    const modelData = captureCurrentModelData();
+    if (!modelData) { alert('Calculate a cost model first, then add it to comparison.'); return; }
+    const skuName = prompt('Enter a label for this SKU in the comparison:', 'SKU_' + (modelData.model_name || modelData.model) + '_' + Date.now());
+    if (!skuName) return;
+    const sku = { name: skuName.trim(), ...modelData, project_id: sessionStorage.getItem('project_id') || '' };
+    saveSKUToStorage(sku);
+    fetch('/api/save_sku', { method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(sku) }).catch(()=>{});
+    refreshSKUCompareList();
+    refreshSKUDropdown();
+    setTimeout(() => {
+        const sel = document.getElementById('sku-compare-select');
+        if (sel) { for (let opt of sel.options) { if (opt.value === skuName.trim()) opt.selected = true; } }
+    }, 500);
+}
+
+async function runSKUComparisonV2() {
+    const sel = document.getElementById('sku-compare-select');
+    const selected = Array.from(sel.selectedOptions).map(o => o.value);
+    if (selected.length < 2) { alert('Select at least 2 SKUs to compare'); return; }
+    if (selected.length > 5) { alert('Maximum 5 SKUs allowed'); return; }
+
+    const allSkus = window._skuCompareData || [];
+    const skusToCompare = selected.map(name => allSkus.find(s => s.name === name)).filter(Boolean);
+    if (skusToCompare.length < 2) { alert('Could not find selected SKUs. Try refreshing.'); return; }
+
+    const baseIdx = parseInt(document.getElementById('sku-base-index')?.value || '0');
+    const btn = document.getElementById('btn-run-sku-compare');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Analyzing...'; }
+
+    try {
+        const resp = await fetch('/api/sku_compare_dashboard', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ skus: skusToCompare, base_index: baseIdx })
+        });
+        const result = await resp.json();
+        if (!result.success) { alert(result.error || 'Comparison failed'); return; }
+
+        window._skuDashboardData = result;
+        window._skuCompareRows = result.items;
+        renderDashboardKPIs(result);
+        renderRadarChart(result);
+        renderBarChart(result);
+        renderWaterfallChart(result);
+        renderIndexChart(result);
+        renderComparisonTable(result);
+        renderInputsTable(result);
+
+        // Show sections
+        document.getElementById('sku-dash-kpis').style.display = '';
+        document.getElementById('sku-dash-charts').style.display = 'grid';
+        document.getElementById('sku-dash-export').style.display = '';
+        document.getElementById('btn-cost-advisor').disabled = false;
+
+    } catch(e) {
+        alert('Comparison error: ' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '⚡ Compare SKUs'; }
+    }
+}
+
+// Legacy wrapper
+function runSKUComparison() { runSKUComparisonV2(); }
+
+function renderDashboardKPIs(data) {
+    const s = data.summary;
+    const items = data.items;
+    const bestSKU = items.reduce((a, b) => a.total_cost < b.total_cost && a.total_cost > 0 ? a : b);
+    const worstSKU = items.reduce((a, b) => a.total_cost > b.total_cost ? a : b);
+    let h = '<div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:12px;margin-bottom:20px;">';
+    h += _kpiCard('Best Price', s.min_cost.toLocaleString(undefined,{minimumFractionDigits:2}), bestSKU.sku_name, '#4CAF50');
+    h += _kpiCard('Highest Price', s.max_cost.toLocaleString(undefined,{minimumFractionDigits:2}), worstSKU.sku_name, '#ef4444');
+    h += _kpiCard('Average', s.avg_cost.toLocaleString(undefined,{minimumFractionDigits:2}), items.length + ' SKUs', '#3b82f6');
+    h += _kpiCard('Cost Spread', s.spread_pct + '%', 'vs base SKU', 'var(--orange)');
+    h += _kpiCard('Base SKU', '100', data.base_sku, '#8b5cf6');
+    h += '</div>';
+    document.getElementById('sku-dash-kpis').innerHTML = h;
+}
+
+function _kpiCard(label, value, sub, color) {
+    return `<div class="card" style="padding:16px;text-align:center;border:1px solid ${color}33;background:${color}08;">
+        <div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:1.2px;opacity:0.5;margin-bottom:6px;">${label}</div>
+        <div style="font-size:1.4rem;font-weight:900;color:${color};font-family:monospace;">${value}</div>
+        <div style="font-size:0.72rem;opacity:0.4;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;">${sub}</div>
+    </div>`;
+}
+
+const _plotlyDarkLayout = {
+    paper_bgcolor:'rgba(0,0,0,0)', plot_bgcolor:'rgba(0,0,0,0)',
+    font:{color:'rgba(255,255,255,0.8)', family:'Outfit', size:11},
+    margin:{t:50,b:60,l:55,r:20}, hoverlabel:{bgcolor:'#1e293b',font:{family:'Outfit',size:12}},
+};
+
+function renderRadarChart(data) {
+    const radar = data.radar;
+    const cats = [...radar.categories, radar.categories[0]]; // close the polygon
+    const traces = radar.series.map((s, i) => ({
+        type:'scatterpolar', name:s.sku_name,
+        r:[...s.values, s.values[0]], theta:cats,
+        fill:'toself', fillcolor:_SKU_COLORS_LIGHT[i],
+        line:{color:_SKU_COLORS[i], width:2},
+        marker:{size:4, color:_SKU_COLORS[i]},
+    }));
+    Plotly.newPlot('sku-radar-chart', traces, {
+        ..._plotlyDarkLayout,
+        title:{text:'Cost Breakdown Radar',font:{size:14,color:'rgba(255,255,255,0.7)'}},
+        polar:{
+            bgcolor:'rgba(0,0,0,0)',
+            radialaxis:{visible:true, range:[0,100], gridcolor:'rgba(255,255,255,0.08)',
+                        tickfont:{size:9,color:'rgba(255,255,255,0.3)'}},
+            angularaxis:{gridcolor:'rgba(255,255,255,0.08)',
+                         tickfont:{size:10,color:'rgba(255,255,255,0.5)'}},
+        },
+        legend:{orientation:'h',y:-0.15,font:{size:10}},
+        height:380,
+    }, {displayModeBar:false,responsive:true});
+}
+
+function renderBarChart(data) {
+    const items = data.items;
+    const cats = ['material','conversion','overhead','logistics','margin'];
+    const catLabels = ['Material','Conversion','Overhead','Logistics','Margin'];
+    const catColors = ['#4CAF50','#3b82f6','#f59e0b','#8b5cf6','#ef4444'];
+    const traces = cats.map((c,ci) => ({
+        x:items.map(i=>i.sku_name), y:items.map(i=>i.cost_breakdown[c]||0),
+        name:catLabels[ci], type:'bar',
+        marker:{color:catColors[ci],line:{width:0}},
+        hovertemplate:'%{x}<br>'+catLabels[ci]+': %{y:,.2f}<extra></extra>',
+    }));
+    Plotly.newPlot('sku-bar-chart', traces, {
+        ..._plotlyDarkLayout, barmode:'stack',
+        title:{text:'Stacked Cost Comparison',font:{size:14,color:'rgba(255,255,255,0.7)'}},
+        yaxis:{title:'Cost',gridcolor:'rgba(255,255,255,0.06)',tickfont:{size:10}},
+        xaxis:{tickfont:{size:10},tickangle:items.length>3?-20:0},
+        legend:{orientation:'h',y:-0.2,font:{size:10}},
+        height:380,
+    }, {displayModeBar:false,responsive:true});
+}
+
+function renderWaterfallChart(data) {
+    const items = data.items;
+    const baseIdx = data.base_index;
+    const baseName = items[baseIdx].sku_name;
+    // Build waterfall: base absolute, then deltas
+    const xLabels = [baseName + ' (Base)'];
+    const yValues = [items[baseIdx].total_cost];
+    const measures = ['absolute'];
+    const colors = ['#3b82f6'];
+    items.forEach((item, i) => {
+        if (i === baseIdx) return;
+        xLabels.push(item.sku_name);
+        yValues.push(item.delta);
+        measures.push('relative');
+        colors.push(item.delta >= 0 ? '#ef4444' : '#4CAF50');
+    });
+    xLabels.push('Spread');
+    yValues.push(0);
+    measures.push('total');
+    colors.push('var(--orange)');
+
+    Plotly.newPlot('sku-waterfall-chart', [{
+        type:'waterfall', x:xLabels, y:yValues, measure:measures,
+        connector:{line:{color:'rgba(255,255,255,0.1)', width:1}},
+        increasing:{marker:{color:'#ef4444'}},
+        decreasing:{marker:{color:'#4CAF50'}},
+        totals:{marker:{color:'#e8601c'}},
+        textposition:'outside', textfont:{size:10, color:'rgba(255,255,255,0.6)'},
+        text:yValues.map((v,i) => measures[i]==='absolute'?v.toLocaleString(undefined,{minimumFractionDigits:0}):(v>=0?'+':'')+v.toLocaleString(undefined,{minimumFractionDigits:0})),
+    }], {
+        ..._plotlyDarkLayout,
+        title:{text:'Cost Delta vs Base SKU',font:{size:14,color:'rgba(255,255,255,0.7)'}},
+        yaxis:{title:'Cost Delta',gridcolor:'rgba(255,255,255,0.06)',tickfont:{size:10}},
+        xaxis:{tickfont:{size:9},tickangle:items.length>3?-20:0},
+        showlegend:false, height:380,
+    }, {displayModeBar:false,responsive:true});
+}
+
+function renderIndexChart(data) {
+    const items = data.items;
+    const colors = items.map((item, i) => {
+        if (item.index === 100) return '#3b82f6';
+        return item.index > 100 ? '#ef4444' : '#4CAF50';
+    });
+    Plotly.newPlot('sku-index-chart', [{
+        type:'bar', x:items.map(i=>i.sku_name), y:items.map(i=>i.index),
+        marker:{color:colors, line:{width:0}},
+        text:items.map(i=>i.index.toFixed(1)),
+        textposition:'outside', textfont:{size:11,color:'rgba(255,255,255,0.7)'},
+        hovertemplate:'%{x}: Index %{y:.1f}<extra></extra>',
+    }], {
+        ..._plotlyDarkLayout,
+        title:{text:'Cost Index (Base = 100)',font:{size:14,color:'rgba(255,255,255,0.7)'}},
+        yaxis:{title:'Index',gridcolor:'rgba(255,255,255,0.06)',tickfont:{size:10},
+               range:[0, Math.max(...items.map(i=>i.index))*1.15]},
+        xaxis:{tickfont:{size:10},tickangle:items.length>3?-20:0},
+        shapes:[{type:'line',x0:-0.5,x1:items.length-0.5,y0:100,y1:100,
+                 line:{color:'rgba(255,255,255,0.3)',width:1,dash:'dash'}}],
+        showlegend:false, height:380,
+    }, {displayModeBar:false,responsive:true});
+}
+
+function renderComparisonTable(data) {
+    const items = data.items;
+    const minTotal = Math.min(...items.filter(i=>i.total_cost>0).map(i=>i.total_cost));
+    let h = '<div class="card" style="border:1px solid rgba(232,96,28,0.25);">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;flex-wrap:wrap;gap:8px;">';
+    h += '<h3 style="margin:0;font-size:1.05rem;">Detailed Breakdown <span style="color:var(--orange);font-weight:400;font-size:0.85rem;">— ' + items.length + ' SKUs</span></h3>';
+    h += '<button class="btn-secondary" onclick="exportSKUComparison()" style="font-size:0.78rem;padding:6px 14px;">📥 Export</button>';
+    h += '</div>';
+    h += '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:0.82rem;">';
+    h += '<thead><tr style="border-bottom:2px solid rgba(255,255,255,0.12);">';
+    ['SKU','Model','Material','Conversion','Overhead','Logistics','Margin','Total Cost','Index','vs Base'].forEach((col,ci) => {
+        const align = ci < 2 ? 'left' : 'right';
+        const clr = col === 'Total Cost' ? 'color:var(--orange);' : 'opacity:0.6;';
+        h += `<th style="padding:10px 8px;text-align:${align};font-size:0.7rem;text-transform:uppercase;letter-spacing:0.5px;${clr}">${col}</th>`;
+    });
+    h += '</tr></thead><tbody>';
+
+    items.forEach((item, idx) => {
+        const isBest = item.total_cost > 0 && item.total_cost === minTotal;
+        const bg = isBest ? 'background:rgba(76,175,80,0.06);' : '';
+        const badge = isBest ? ' <span style="font-size:0.62rem;padding:2px 7px;border-radius:8px;background:rgba(76,175,80,0.2);color:#4CAF50;font-weight:700;margin-left:4px;">BEST</span>' : '';
+        const bd = item.cost_breakdown;
+        const deltaStr = item.delta === 0 ? '<span style="color:#3b82f6;font-weight:700;">BASE</span>' :
+            (item.delta > 0 ? `<span style="color:#ef4444;font-weight:700;">+${item.delta.toLocaleString(undefined,{minimumFractionDigits:0})}</span>` :
+                `<span style="color:#4CAF50;font-weight:700;">${item.delta.toLocaleString(undefined,{minimumFractionDigits:0})}</span>`);
+        const idxColor = item.index > 100 ? '#ef4444' : item.index < 100 ? '#4CAF50' : '#3b82f6';
+        h += `<tr style="border-bottom:1px solid rgba(255,255,255,0.05);${bg}">`;
+        h += `<td style="padding:10px 8px;font-weight:700;">${item.sku_name}${badge}</td>`;
+        h += `<td style="padding:10px 8px;"><span style="display:inline-block;padding:2px 8px;border-radius:5px;background:rgba(255,255,255,0.06);font-size:0.72rem;text-transform:uppercase;letter-spacing:0.5px;opacity:0.7;">${item.model}</span></td>`;
+        h += `<td style="padding:10px 8px;text-align:right;font-family:monospace;font-size:0.82rem;">${bd.material.toLocaleString(undefined,{minimumFractionDigits:2})}</td>`;
+        h += `<td style="padding:10px 8px;text-align:right;font-family:monospace;font-size:0.82rem;">${bd.conversion.toLocaleString(undefined,{minimumFractionDigits:2})}</td>`;
+        h += `<td style="padding:10px 8px;text-align:right;font-family:monospace;font-size:0.82rem;">${bd.overhead.toLocaleString(undefined,{minimumFractionDigits:2})}</td>`;
+        h += `<td style="padding:10px 8px;text-align:right;font-family:monospace;font-size:0.82rem;">${bd.logistics.toLocaleString(undefined,{minimumFractionDigits:2})}</td>`;
+        h += `<td style="padding:10px 8px;text-align:right;font-family:monospace;font-size:0.82rem;">${bd.margin.toLocaleString(undefined,{minimumFractionDigits:2})}</td>`;
+        h += `<td style="padding:10px 8px;text-align:right;font-weight:800;color:var(--orange);font-family:monospace;font-size:0.88rem;">${item.total_cost.toLocaleString(undefined,{minimumFractionDigits:2})}</td>`;
+        h += `<td style="padding:10px 8px;text-align:right;font-weight:700;color:${idxColor};font-family:monospace;">${item.index.toFixed(1)}</td>`;
+        h += `<td style="padding:10px 8px;text-align:center;">${deltaStr}</td>`;
+        h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+    document.getElementById('sku-compare-results').innerHTML = h;
+}
+
+function renderInputsTable(data) {
+    const items = data.items;
+    const allKeys = new Set();
+    items.forEach(item => { if (item.inputs) Object.keys(item.inputs).forEach(k => allKeys.add(k)); });
+    if (allKeys.size === 0) { document.getElementById('sku-compare-inputs').innerHTML = ''; return; }
+
+    let h = '<div class="card" style="border:1px solid rgba(255,255,255,0.06);">';
+    h += '<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">';
+    h += '<div class="calc-section-title" style="margin:0;font-size:0.95rem;">Input Parameters</div>';
+    h += '<span style="font-size:0.72rem;opacity:0.4;">Differences highlighted</span></div>';
+    h += '<div style="overflow-x:auto;max-height:500px;overflow-y:auto;"><table style="width:100%;border-collapse:collapse;font-size:0.8rem;">';
+    h += '<thead style="position:sticky;top:0;z-index:2;"><tr style="border-bottom:2px solid rgba(255,255,255,0.1);background:rgba(15,23,42,0.95);">';
+    h += '<th style="padding:8px;text-align:left;font-size:0.68rem;text-transform:uppercase;opacity:0.5;">Parameter</th>';
+    items.forEach(item => {
+        h += `<th style="padding:8px;text-align:right;font-size:0.68rem;text-transform:uppercase;opacity:0.7;max-width:120px;overflow:hidden;text-overflow:ellipsis;">${item.sku_name}</th>`;
+    });
+    h += '</tr></thead><tbody>';
+    const sortedKeys = Array.from(allKeys).filter(k => !['timestamp','project_id','_all_results'].includes(k)).sort();
+    sortedKeys.forEach(k => {
+        const vals = items.map(item => item.inputs?.[k]);
+        const allSame = vals.every(v => JSON.stringify(v) === JSON.stringify(vals[0]));
+        const hl = !allSame ? 'background:rgba(232,96,28,0.04);' : '';
+        const dot = !allSame ? '<span style="color:var(--orange);margin-right:3px;font-size:0.65rem;">●</span>' : '';
+        h += `<tr style="border-bottom:1px solid rgba(255,255,255,0.03);${hl}">`;
+        h += `<td style="padding:6px 8px;opacity:0.6;font-size:0.78rem;">${dot}${k.replace(/_/g,' ').replace(/\b\w/g,l=>l.toUpperCase())}</td>`;
+        vals.forEach(v => {
+            const display = v !== undefined && v !== null ? v : '<span style="opacity:0.2;">-</span>';
+            h += `<td style="padding:6px 8px;text-align:right;font-family:monospace;font-size:0.78rem;">${display}</td>`;
+        });
+        h += '</tr>';
+    });
+    h += '</tbody></table></div></div>';
+    document.getElementById('sku-compare-inputs').innerHTML = h;
+}
+
+// ═══════════════ AI COST OPTIMIZATION ADVISOR ═══════════════
+
+async function runCostAdvisor() {
+    const sel = document.getElementById('sku-compare-select');
+    const selected = Array.from(sel.selectedOptions).map(o => o.value);
+    if (selected.length < 2) { alert('Select at least 2 SKUs first'); return; }
+
+    const allSkus = window._skuCompareData || [];
+    const skusToSend = selected.map(name => allSkus.find(s => s.name === name)).filter(Boolean);
+
+    const btn = document.getElementById('btn-cost-advisor');
+    if (btn) { btn.disabled = true; btn.textContent = '🧠 Analyzing...'; }
+
+    try {
+        const resp = await fetch('/api/cost_advisor', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ skus: skusToSend })
+        });
+        const result = await resp.json();
+        if (!result.success) { alert(result.error || 'Advisor failed'); return; }
+        renderAdvisorPanel(result);
+    } catch(e) {
+        alert('Advisor error: ' + e.message);
+    } finally {
+        if (btn) { btn.disabled = false; btn.textContent = '🧠 AI Advisor'; }
+    }
+}
+
+function renderAdvisorPanel(data) {
+    const panel = document.getElementById('sku-advisor-panel');
+    panel.style.display = '';
+
+    // Total saving badge
+    const totalEl = document.getElementById('advisor-total-saving');
+    totalEl.innerHTML = `<div style="font-size:0.65rem;text-transform:uppercase;letter-spacing:1px;opacity:0.5;">Total Potential</div>
+        <div style="font-size:1.3rem;font-weight:900;color:#4CAF50;">₹${data.total_potential_saving.toLocaleString(undefined,{minimumFractionDigits:2})}</div>
+        <div style="font-size:0.7rem;opacity:0.4;">${data.skus_analyzed} SKUs analyzed</div>`;
+
+    const recs = data.recommendations || [];
+    const container = document.getElementById('advisor-recommendations');
+    if (recs.length === 0) {
+        container.innerHTML = '<p style="opacity:0.5;text-align:center;padding:20px;">No optimization opportunities found. Your SKUs look well-optimized!</p>';
+        return;
+    }
+
+    const _catIcons = {material:'🧪',geography:'🌍',logistics:'🚛',conversion:'⚙️'};
+    const _confColors = {High:'#4CAF50',Medium:'#f59e0b',Low:'#ef4444'};
+
+    let h = '<div style="display:flex;flex-direction:column;gap:10px;">';
+    recs.slice(0, 7).forEach((rec, i) => {
+        const icon = _catIcons[rec.category] || '💡';
+        const confColor = _confColors[rec.confidence] || '#999';
+        h += `<div style="background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.06);border-radius:10px;padding:14px 16px;
+                    ${i === 0 ? 'border-color:rgba(76,175,80,0.25);background:rgba(76,175,80,0.04);' : ''}">`;
+        h += `<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">`;
+        h += `<div style="flex:1;">`;
+        h += `<div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">`;
+        h += `<span style="font-size:1.1rem;">${icon}</span>`;
+        h += `<span style="font-weight:700;font-size:0.9rem;">${rec.title}</span>`;
+        h += `<span style="font-size:0.65rem;padding:2px 8px;border-radius:8px;background:${confColor}22;color:${confColor};font-weight:700;text-transform:uppercase;letter-spacing:0.5px;">${rec.confidence}</span>`;
+        h += `<span style="font-size:0.68rem;opacity:0.4;margin-left:auto;">SKU: ${rec.sku}</span>`;
+        h += `</div>`;
+        h += `<div style="font-size:0.82rem;opacity:0.75;margin-bottom:4px;">${rec.action}</div>`;
+        h += `<div style="font-size:0.72rem;opacity:0.4;">${rec.details || ''}</div>`;
+        h += `</div>`;
+        h += `<div style="text-align:right;white-space:nowrap;">`;
+        h += `<div style="font-size:0.88rem;font-weight:800;color:#4CAF50;">${rec.impact}</div>`;
+        h += `</div></div></div>`;
+    });
+    h += '</div>';
+    container.innerHTML = h;
+
+    // Scroll to advisor
+    panel.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+}
+
+async function exportSKUComparison() {
+    const rows = window._skuCompareRows;
+    if (!rows || rows.length === 0) { alert('No comparison data to export'); return; }
+    const results = rows.map(r => ({
+        sku_name: r.sku_name, model: r.model, country: r.country || '-',
+        material_cost: r.cost_breakdown?.material || 0, conversion_cost: r.cost_breakdown?.conversion || 0,
+        overhead_cost: r.cost_breakdown?.overhead || 0, logistics_cost: r.cost_breakdown?.logistics || 0,
+        margin: r.cost_breakdown?.margin || 0, total_cost_per_1000: r.total_cost,
+        cost_per_piece: r.total_cost / 1000, index: r.index, delta: r.delta,
+        margin_pct: 0, cost_label_1000: '/1000', cost_label_piece: '/pc'
+    }));
+    try {
+        const resp = await fetch('/api/export_bulk_results', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({results})});
+        if (!resp.ok) { alert('Export failed'); return; }
+        const blob = await resp.blob();
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a'); a.href = url; a.download = 'sku_comparison_dashboard.xlsx'; a.click(); URL.revokeObjectURL(url);
+    } catch(e) { alert('Export error: ' + e.message); }
 }
 
 // ═══════════════ SCENARIO COMPARISON (Feature 5) ═══════════════
@@ -13432,6 +16592,9 @@ document.addEventListener('DOMContentLoaded', function() {
         var advBtn = document.getElementById('btn-advanced');
         if (advBtn) advBtn.style.display = 'none';
     }
+    // Ensure the Cost Calculator tab is always active on load
+    switchUniversalTab('calculator');
+
     // Auto-switch to view from query param (set by server)
     var requestedView = window.__calcView || 'essentials';
     if (requestedView === 'advanced' && window.__userRole !== 'viewer') {
@@ -13449,6 +16612,19 @@ document.addEventListener('DOMContentLoaded', function() {
     // Init scenario comparison
     if (typeof scRenderList === 'function') scRenderList();
     if (typeof rptUpdateTimestamp === 'function') rptUpdateTimestamp();
+
+    // Safety net: re-apply active model after all async inits settle
+    setTimeout(function() {
+        var anyModelVisible = document.querySelector('.model-view.active');
+        if (!anyModelVisible) {
+            var advBtn2 = document.getElementById('btn-advanced');
+            if (advBtn2 && advBtn2.classList.contains('active') && isAdvancedLoggedIn) {
+                switchCalcModel(document.getElementById('advancedSelect').value || 'ebm');
+            } else {
+                switchCalcModel(document.getElementById('essentialsSelect').value || 'carton');
+            }
+        }
+    }, 300);
 });
 </script>
 """
@@ -13514,7 +16690,7 @@ def api_gm_search():
         eur_to_usd = rates.get('USD', 1.08)
 
         results = []
-        for _, row in subset.iterrows():
+        for row in subset.to_dict('records'):
             loc = str(row.get('Country', '')).strip()
             comm = str(row.get('Commodity', '')).strip()
             pf = str(row.get('Portfolio', '')).strip()
@@ -13611,7 +16787,7 @@ def api_gm_compare():
         eur_to_usd = rates.get('USD', 1.08)
 
         comparison = []
-        for _, row in subset.iterrows():
+        for row in subset.to_dict('records'):
             loc = str(row.get('Country', '')).strip()
             home_code, home_sym = _country_ccy(loc)
             eur_to_home = rates.get(home_code, 1.0)
@@ -13728,6 +16904,15 @@ def api_material_init():
                 # Extract quarters for duration filter
                 qcols = _gm_quarter_cols(df)
                 result["global_quarters"] = [str(q) for q in qcols]
+                # Per-country material map for dynamic dropdown filtering
+                country_materials = {}
+                for c in result["global_countries"]:
+                    mats = sorted(df[df['Country'].astype(str).str.strip() == c]['Commodity'].dropna().astype(str).str.strip().unique().tolist())
+                    country_materials[c] = mats
+                result["country_materials"] = country_materials
+                # India non-polymer materials from global data
+                india_global = df[df['Country'].astype(str).str.strip() == 'India']['Commodity'].dropna().astype(str).str.strip().unique().tolist()
+                result["india_global_materials"] = sorted([m for m in india_global if m.upper() not in POLYMER_LIST])
         except Exception as e:
             logger.warning(f"material_init: global load failed: {e}")
 
@@ -13755,8 +16940,8 @@ def api_material_prices():
         if not material:
             return jsonify({"error": "material is required"}), 400
 
-        # ═══════════ INDIA → Resin path ═══════════
-        if country == 'India':
+        # ═══════════ INDIA → Resin path (polymers only) ═══════════
+        if country == 'India' and material.upper() in POLYMER_LIST:
             df = clean_resin_df(material)
             meta_cols = ["Supplier", "Country", "Location", "Grade", "Unit"]
 
@@ -13801,8 +16986,10 @@ def api_material_prices():
             if not values:
                 return jsonify({"error": "No price data available"}), 404
 
-            curr = values[-1]
-            diff = ((curr - values[0]) / values[0] * 100) if len(values) > 1 and values[0] != 0 else 0
+            # Current and previous always from full dataset (not trimmed by duration)
+            curr = values_all[-1] if values_all else 0
+            prev = values_all[-2] if len(values_all) > 1 else curr
+            diff = ((curr - prev) / prev * 100) if prev != 0 else 0
             avg_price = sum(values) / len(values)
             status = "BULLISH" if diff > 1.2 else "BEARISH" if diff < -1.2 else "STABLE"
 
@@ -13815,7 +17002,7 @@ def api_material_prices():
                 "series": [{"date": d, "label": l, "price": v} for d, l, v in zip(iso_dates, labels, values)],
                 "insights": {
                     "current": round(curr, 2),
-                    "previous": round(values[0], 2),
+                    "previous": round(prev, 2),
                     "change_pct": round(diff, 2),
                     "avg": round(avg_price, 2),
                     "min": round(min(values), 2),
@@ -13828,7 +17015,7 @@ def api_material_prices():
                 }
             })
 
-        # ═══════════ NON-INDIA → Global material path ═══════════
+        # ═══════════ NON-INDIA or INDIA NON-POLYMER → Global material path ═══════════
         else:
             df = _load_global_material_df()
             if df is None:
@@ -13868,6 +17055,10 @@ def api_material_prices():
             if not prices_eur:
                 return jsonify({"error": "No valid price data found"}), 404
 
+            # Save full price arrays for current/previous calculation
+            all_prices_eur = list(prices_eur)
+            all_quarter_labels = list(quarter_labels)
+
             # Apply duration trim for global (approximate: last N quarters)
             if duration != "all":
                 try:
@@ -13882,8 +17073,10 @@ def api_material_prices():
             prices_local = [round(p * eur_to_home, 2) for p in prices_eur]
             prices_usd = [round(p * eur_to_usd, 2) for p in prices_eur]
 
-            curr_eur = prices_eur[-1]
-            change_pct = round(((curr_eur - prices_eur[0]) / prices_eur[0]) * 100, 2) if len(prices_eur) > 1 and prices_eur[0] > 0 else 0
+            # Current and previous always from FULL dataset (not trimmed by duration)
+            curr_eur = all_prices_eur[-1]
+            prev_eur = all_prices_eur[-2] if len(all_prices_eur) > 1 else curr_eur
+            change_pct = round(((curr_eur - prev_eur) / prev_eur) * 100, 2) if prev_eur > 0 else 0
             trend = 'BULLISH' if change_pct > 2 else ('BEARISH' if change_pct < -2 else 'STABLE')
 
             return jsonify({
@@ -13899,7 +17092,7 @@ def api_material_prices():
                     "current": round(curr_eur * eur_to_home, 2),
                     "current_eur": round(curr_eur, 2),
                     "current_usd": round(curr_eur * eur_to_usd, 2),
-                    "previous": round(prices_eur[0] * eur_to_home, 2),
+                    "previous": round(prev_eur * eur_to_home, 2),
                     "change_pct": change_pct,
                     "avg": round(sum(prices_local) / len(prices_local), 2),
                     "min": round(min(prices_local), 2),
@@ -13920,6 +17113,194 @@ def api_material_prices():
         return jsonify({"error": str(e)}), 500
 
 
+# ── Price Forecasting Endpoint ──────────────────────────────────────────
+@app.route("/api/material_forecast", methods=["POST"])
+@login_required
+def api_material_forecast():
+    """30/60/90-day price forecast using Prophet (preferred) or Holt-Winters fallback.
+    Input JSON: {material, country, prices: [{label, price}]}
+    For India polymers: auto-loads from resin database when prices not provided or have generic labels.
+    Returns: {forecast_30, forecast_60, forecast_90, confidence_upper, confidence_lower,
+              trend_direction, pct_change_90, forecast_series}"""
+    try:
+        d = request.json or {}
+        material = d.get('material', '')
+        country = d.get('country', '')
+        prices = d.get('prices', [])
+
+        # ── India Polymer: load real dated series from resin DB if available ──
+        _india_polymer_path = False
+        if material and material.upper() in POLYMER_LIST and (
+            country == 'India' or country in COUNTRY_LOCATION_MAP.get('India', [])
+        ):
+            try:
+                df = clean_resin_df(material)
+                meta_cols = ["Supplier", "Country", "Location", "Grade", "Unit"]
+                # Find best matching row (filter by country/region if possible)
+                subset = df.copy()
+                if country and country != 'India':
+                    loc_match = subset[subset["Location"].astype(str).str.strip() == country.strip()]
+                    if not loc_match.empty:
+                        subset = loc_match
+                if subset.empty:
+                    subset = df
+
+                row = subset.iloc[0]
+                date_cols = [c for c in df.columns if c not in meta_cols and not str(c).startswith("Unnamed")]
+
+                real_dates = []
+                real_values = []
+                for col in date_cols:
+                    try:
+                        v = float(row[col])
+                        if v > 0:
+                            dt_obj = parse_date_col(str(col))
+                            if dt_obj and dt_obj != datetime.max:
+                                real_dates.append(dt_obj)
+                                real_values.append(v)
+                    except:
+                        continue
+
+                if len(real_dates) >= 3:
+                    # Sort by date
+                    paired = sorted(zip(real_dates, real_values), key=lambda x: x[0])
+                    real_dates = [p[0] for p in paired]
+                    real_values = [p[1] for p in paired]
+                    prices = [{"date": dt.strftime('%Y-%m-%d'), "price": v} for dt, v in zip(real_dates, real_values)]
+                    _india_polymer_path = True
+                    logger.info(f"India polymer forecast: loaded {len(prices)} dated points for {material}/{country}")
+            except Exception as e:
+                logger.warning(f"India polymer resin DB load for forecast failed: {e}")
+
+        if not prices or len(prices) < 3:
+            return jsonify({"error": "Need at least 3 historical price points for forecasting"}), 400
+
+        values = [float(p['price']) for p in prices]
+        labels = [p.get('label', p.get('date', '')) for p in prices]
+
+        # Build real date index from parsed dates if available (India polymer path)
+        real_date_index = None
+        if _india_polymer_path:
+            try:
+                real_date_index = pd.to_datetime([p['date'] for p in prices])
+            except Exception:
+                real_date_index = None
+
+        latest_price = values[-1]
+        forecast_30 = forecast_60 = forecast_90 = latest_price
+        conf_upper = []
+        conf_lower = []
+        forecast_labels = []
+        forecast_values = []
+        _use_hw = True
+
+        if _PROPHET_OK and len(values) >= 4:
+            # ── Prophet path ──
+            try:
+                if real_date_index is not None and len(real_date_index) == len(values):
+                    date_index = real_date_index
+                else:
+                    date_index = pd.date_range(end=pd.Timestamp.now(), periods=len(values), freq='MS')
+                pdf = pd.DataFrame({'ds': date_index, 'y': values})
+
+                model = _Prophet(
+                    yearly_seasonality=False,
+                    weekly_seasonality=False,
+                    daily_seasonality=False,
+                    changepoint_prior_scale=0.05,
+                )
+                model.fit(pdf)
+
+                future = model.make_future_dataframe(periods=3, freq='MS')
+                fc = model.predict(future)
+
+                fc_rows = fc.tail(3)
+                forecast_values_raw = fc_rows['yhat'].tolist()
+                forecast_30 = round(forecast_values_raw[0], 2) if len(forecast_values_raw) > 0 else latest_price
+                forecast_60 = round(forecast_values_raw[1], 2) if len(forecast_values_raw) > 1 else forecast_30
+                forecast_90 = round(forecast_values_raw[2], 2) if len(forecast_values_raw) > 2 else forecast_60
+
+                conf_upper = [round(v, 2) for v in fc_rows['yhat_upper'].tolist()]
+                conf_lower = [round(v, 2) for v in fc_rows['yhat_lower'].tolist()]
+                forecast_labels = ['+30d', '+60d', '+90d']
+                forecast_values = [forecast_30, forecast_60, forecast_90]
+                _use_hw = False
+                logger.info(f"Forecast (Prophet): {material}/{country} -> 30d={forecast_30}, 90d={forecast_90}")
+            except Exception as e:
+                logger.warning(f"Prophet forecast failed, falling back: {e}")
+                _use_hw = True
+
+        if _use_hw:
+            # ── Holt-Winters / Exponential Smoothing fallback ──
+            if _STATSMODELS_OK and len(values) >= 4:
+                try:
+                    series = pd.Series(values, dtype=float)
+                    hw_model = _HW(series, trend='add', seasonal=None, initialization_method='estimated')
+                    hw_fit = hw_model.fit(optimized=True)
+                    hw_forecast = hw_fit.forecast(3)
+                    forecast_values = [round(v, 2) for v in hw_forecast.tolist()]
+                    forecast_30 = forecast_values[0] if len(forecast_values) > 0 else latest_price
+                    forecast_60 = forecast_values[1] if len(forecast_values) > 1 else forecast_30
+                    forecast_90 = forecast_values[2] if len(forecast_values) > 2 else forecast_60
+                    recent_std = float(np.std(values[-min(6, len(values)):]))
+                    conf_upper = [round(v + 1.5 * recent_std, 2) for v in forecast_values]
+                    conf_lower = [round(v - 1.5 * recent_std, 2) for v in forecast_values]
+                    forecast_labels = ['+30d', '+60d', '+90d']
+                    logger.info(f"Forecast (Holt-Winters): {material}/{country} -> 30d={forecast_30}, 90d={forecast_90}")
+                except Exception as e:
+                    logger.warning(f"Holt-Winters fallback also failed: {e}")
+                    if len(values) >= 2:
+                        slope = (values[-1] - values[-max(3, len(values)//2)]) / max(3, len(values)//2)
+                        forecast_30 = round(latest_price + slope, 2)
+                        forecast_60 = round(latest_price + 2 * slope, 2)
+                        forecast_90 = round(latest_price + 3 * slope, 2)
+                    forecast_values = [forecast_30, forecast_60, forecast_90]
+                    forecast_labels = ['+30d', '+60d', '+90d']
+                    recent_std = float(np.std(values[-min(6, len(values)):]))
+                    conf_upper = [round(v + 1.5 * recent_std, 2) for v in forecast_values]
+                    conf_lower = [round(v - 1.5 * recent_std, 2) for v in forecast_values]
+            else:
+                # Simple linear extrapolation (no ML libraries)
+                if len(values) >= 2:
+                    slope = (values[-1] - values[0]) / max(len(values) - 1, 1)
+                    forecast_30 = round(latest_price + slope, 2)
+                    forecast_60 = round(latest_price + 2 * slope, 2)
+                    forecast_90 = round(latest_price + 3 * slope, 2)
+                forecast_values = [forecast_30, forecast_60, forecast_90]
+                forecast_labels = ['+30d', '+60d', '+90d']
+                recent_std = float(np.std(values[-min(6, len(values)):]) if len(values) > 1 else 0)
+                conf_upper = [round(v + 1.5 * recent_std, 2) for v in forecast_values]
+                conf_lower = [round(v - 1.5 * recent_std, 2) for v in forecast_values]
+
+        pct_change_90 = round(((forecast_90 - latest_price) / latest_price) * 100, 2) if latest_price > 0 else 0
+        if pct_change_90 > 2:
+            trend_direction = 'Up'
+        elif pct_change_90 < -2:
+            trend_direction = 'Down'
+        else:
+            trend_direction = 'Stable'
+
+        method_used = 'Prophet' if (_PROPHET_OK and not _use_hw) else ('Holt-Winters' if _STATSMODELS_OK else 'Linear')
+
+        return jsonify({
+            "forecast_30": forecast_30,
+            "forecast_60": forecast_60,
+            "forecast_90": forecast_90,
+            "confidence_upper": conf_upper,
+            "confidence_lower": conf_lower,
+            "trend_direction": trend_direction,
+            "pct_change_90": pct_change_90,
+            "latest_price": round(latest_price, 2),
+            "forecast_labels": forecast_labels,
+            "forecast_values": forecast_values,
+            "method": method_used,
+        })
+
+    except Exception as e:
+        logger.error(f"material_forecast error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 @app.route("/api/material_filters", methods=["POST"])
 @login_required
 def api_material_filters():
@@ -13930,7 +17311,7 @@ def api_material_filters():
         country = d.get('country', '').strip()
         material = d.get('material', '').strip()
 
-        if country == 'India' and material:
+        if country == 'India' and material and material.upper() in POLYMER_LIST:
             meta = load_resin_meta(material)
             # Pre-warm cache
             try:
@@ -13962,6 +17343,228 @@ def api_material_filters():
         return jsonify({"error": str(e)}), 500
 
 
+
+@app.route("/api/mt_india_region", methods=["POST"])
+@login_required
+def api_mt_india_region():
+    """India Region Comparison — returns all regions for a given resin material
+    with their latest prices for side-by-side comparison.
+    Filters: material (required), region, grade, duration."""
+    try:
+        d = request.json or {}
+        material = d.get('material', '').strip()
+        region = d.get('region', '').strip()
+        regions = [r.strip() for r in region.split(',') if r.strip()] if region else []
+        grade = d.get('grade', '').strip()
+        duration = d.get('duration', '12')
+
+        if not material:
+            return jsonify({"error": "Material is required"}), 400
+
+        df = clean_resin_df(material)
+        meta_cols = ["Supplier", "Country", "Location", "Grade", "Unit"]
+
+        subset = df.copy()
+        if regions:
+            subset = subset[subset["Location"].astype(str).str.strip().isin(regions)]
+        if grade:
+            subset = subset[subset["Grade"].astype(str).str.strip() == grade.strip()]
+
+        if subset.empty:
+            return jsonify({"error": "No data found for selected filters"}), 404
+
+        # Get all date columns
+        date_cols = [c for c in df.columns if c not in meta_cols and not str(c).startswith("Unnamed")]
+
+        results = []
+        for row in subset.to_dict('records'):
+            loc = str(row.get("Location", "")).strip()
+            grd = str(row.get("Grade", "")).strip()
+
+            prices = []
+            labels = []
+            for col in date_cols:
+                try:
+                    v = float(row[col])
+                    if v > 0:
+                        prices.append(v)
+                        labels.append(str(col))
+                except:
+                    continue
+
+            if not prices:
+                continue
+
+            # Apply duration trim
+            iso_all, labels_all, values_all = sort_date_series(labels, prices)
+            if duration != "all" and iso_all:
+                months_to_keep = int(duration)
+                keep = min(months_to_keep, len(iso_all))
+                iso_all = iso_all[-keep:]
+                labels_all = labels_all[-keep:]
+                values_all = values_all[-keep:]
+
+            if not values_all:
+                continue
+
+            curr = values_all[-1]
+            prev = values_all[-2] if len(values_all) > 1 else curr
+            chg = round(((curr - prev) / prev) * 100, 2) if prev > 0 else 0
+            trend = 'Rising' if chg > 1.2 else ('Falling' if chg < -1.2 else 'Stable')
+            last_date = labels_all[-1] if labels_all else ''
+
+            results.append({
+                "region": loc,
+                "grade": grd,
+                "price": round(curr, 2),
+                "date": last_date,
+                "prev_price": round(prev, 2),
+                "avg": round(sum(values_all) / len(values_all), 2),
+                "min": round(min(values_all), 2),
+                "max": round(max(values_all), 2),
+                "change_pct": chg,
+                "trend": trend,
+                "series_labels": labels_all,
+                "series_prices": [round(v, 2) for v in values_all],
+            })
+
+        if not results:
+            return jsonify({"error": "No valid price data found"}), 404
+
+        results.sort(key=lambda x: x['price'])
+        return jsonify({
+            "material": material,
+            "currency": "INR",
+            "symbol": "₹",
+            "results": results,
+            "count": len(results),
+            "cheapest": results[0]['region'] if results else '',
+            "most_expensive": results[-1]['region'] if results else '',
+        })
+    except Exception as e:
+        logger.error(f"mt_india_region error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/mt_cross_country", methods=["POST"])
+@login_required
+def api_mt_cross_country():
+    """Cross-Country Material Comparison — returns all countries for a given commodity
+    with EUR, USD, and local currency prices.
+    Filters: material (required), country, grade, quarter."""
+    try:
+        d = request.json or {}
+        material = d.get('material', '').strip()
+        countries = d.get('countries', [])
+        country = d.get('country', '').strip()
+        grade = d.get('grade', '').strip()
+        quarter = d.get('quarter', 'all')
+
+        if not material:
+            return jsonify({"error": "Material is required"}), 400
+
+        df = _load_global_material_df()
+        if df is None:
+            return jsonify({"error": "Global material data not loaded"}), 500
+
+        mask = df['Commodity'].astype(str).str.strip() == material
+        # Support multi-country (countries array) or single country
+        if countries and len(countries) > 0:
+            mask &= df['Country'].astype(str).str.strip().isin([c.strip() for c in countries])
+        elif country:
+            mask &= df['Country'].astype(str).str.strip() == country
+        subset = df[mask]
+
+        # Grade filter — check if a column named 'Grade' or 'Index' exists
+        if grade and subset.shape[0] > 0:
+            for gcol in ['Grade', 'Index', 'Portfolio']:
+                if gcol in subset.columns:
+                    grade_mask = subset[gcol].astype(str).str.strip() == grade
+                    if grade_mask.any():
+                        subset = subset[grade_mask]
+                        break
+
+        if subset.empty:
+            return jsonify({"error": "No data found for selected filters"}), 404
+
+        qcols = _gm_quarter_cols(df)
+        if quarter and quarter != 'all':
+            qcols = [q for q in qcols if str(q).strip() == quarter.strip()]
+        if not qcols:
+            return jsonify({"error": f"No data for quarter: {quarter}"}), 404
+
+        rates = _get_fx_rates()
+        eur_to_usd = rates.get('USD', 1.08)
+
+        results = []
+        for row in subset.to_dict('records'):
+            loc = str(row.get('Country', '')).strip()
+            row_grade = ''
+            for gcol in ['Grade', 'Index', 'Portfolio']:
+                if gcol in df.columns:
+                    v = str(row.get(gcol, '')).strip()
+                    if v and v.lower() != 'nan':
+                        row_grade = v
+                        break
+
+            home_code, home_sym = _country_ccy(loc)
+            eur_to_home = rates.get(home_code, 1.0)
+
+            prices_eur = []
+            labels = []
+            for qc in qcols:
+                try:
+                    v = float(row[qc])
+                    if v > 0:
+                        prices_eur.append(round(v, 2))
+                        labels.append(str(qc))
+                except:
+                    pass
+
+            if not prices_eur:
+                continue
+
+            curr_eur = prices_eur[-1]
+            prev_eur = prices_eur[-2] if len(prices_eur) > 1 else curr_eur
+            chg = round(((curr_eur - prev_eur) / prev_eur) * 100, 2) if prev_eur > 0 else 0
+            trend = 'Rising' if chg > 2 else ('Falling' if chg < -2 else 'Stable')
+
+            results.append({
+                "country": loc,
+                "grade": row_grade,
+                "price_eur": round(curr_eur, 2),
+                "price_usd": round(curr_eur * eur_to_usd, 2),
+                "price_local": round(curr_eur * eur_to_home, 2),
+                "currency": home_code,
+                "symbol": home_sym,
+                "change_pct": chg,
+                "trend": trend,
+                "series_labels": labels,
+                "series_eur": prices_eur,
+                "series_usd": [round(p * eur_to_usd, 2) for p in prices_eur],
+            })
+
+        if not results:
+            return jsonify({"error": "No valid price data found"}), 404
+
+        results.sort(key=lambda x: x['price_eur'])
+
+        # Collect unique grades for filter dropdown
+        all_grades = sorted(set(r['grade'] for r in results if r['grade']))
+
+        return jsonify({
+            "material": material,
+            "results": results,
+            "count": len(results),
+            "grades": all_grades,
+            "cheapest": results[0]['country'] if results else '',
+            "most_expensive": results[-1]['country'] if results else '',
+        })
+    except Exception as e:
+        logger.error(f"mt_cross_country error: {e}", exc_info=True)
+        return jsonify({"error": str(e)}), 500
+
+
 GLOBAL_MATERIAL_UI = """
 <style>
 .gm-tabs { display:flex; gap:10px; margin-bottom:20px; border-bottom:2px solid rgba(232,96,28,0.2); }
@@ -13976,24 +17579,24 @@ GLOBAL_MATERIAL_UI = """
 .gm-grid-5 { grid-template-columns:repeat(5,1fr); }
 .gm-result-card { background:linear-gradient(135deg,rgba(232,96,28,0.1) 0%,rgba(232,96,28,0.03) 100%); border:2px solid rgba(232,96,28,0.25); border-radius:12px; padding:20px; transition:transform 0.2s; }
 .gm-result-card:hover { transform:translateY(-3px); border-color:#e8601c; }
-.gm-result-card.best { border-color:#28a745; background:linear-gradient(135deg,rgba(40,167,69,0.12) 0%,rgba(40,167,69,0.03) 100%); }
-.gm-result-card.worst { border-color:#dc3545; background:linear-gradient(135deg,rgba(220,53,69,0.12) 0%,rgba(220,53,69,0.03) 100%); }
+.gm-result-card.best { border-color:#1f9d55; background:linear-gradient(135deg,rgba(40,167,69,0.12) 0%,rgba(40,167,69,0.03) 100%); }
+.gm-result-card.worst { border-color:#e63946; background:linear-gradient(135deg,rgba(220,53,69,0.12) 0%,rgba(220,53,69,0.03) 100%); }
 .gm-price-primary { font-size:1.5rem; font-weight:900; color:var(--orange); }
 .gm-price-sub { font-size:0.78rem; opacity:0.55; font-family:'JetBrains Mono',monospace; }
 .gm-stat { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.08); }
 .gm-stat-label { opacity:0.65; font-size:0.82rem; }
 .gm-stat-val { font-weight:700; font-size:0.92rem; }
 .gm-badge { display:inline-block; padding:3px 10px; border-radius:15px; font-size:0.75rem; font-weight:700; }
-.gm-rising { background:#dc3545; color:#fff; }
-.gm-falling { background:#28a745; color:#fff; }
+.gm-rising { background:#e63946; color:#fff; }
+.gm-falling { background:#1f9d55; color:#fff; }
 .gm-stable { background:#ffc107; color:#000; }
 .gm-ccy-badge { display:inline-block; padding:2px 7px; background:rgba(232,96,28,0.2); border-radius:4px; font-size:0.7rem; font-weight:700; color:var(--orange); margin-left:5px; }
 .gm-xc-table { width:100%; border-collapse:collapse; font-size:0.88rem; }
 .gm-xc-table th { background:rgba(232,96,28,0.15); padding:12px 14px; text-align:left; font-weight:800; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.5px; color:rgba(255,255,255,0.8); border-bottom:2px solid rgba(232,96,28,0.3); }
 .gm-xc-table td { padding:11px 14px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'JetBrains Mono',monospace; font-size:0.84rem; }
 .gm-xc-table tr:hover { background:rgba(232,96,28,0.06); }
-.gm-xc-best { color:#28a745; font-weight:800; }
-.gm-xc-worst { color:#dc3545; font-weight:700; }
+.gm-xc-best { color:#1f9d55; font-weight:800; }
+.gm-xc-worst { color:#e63946; font-weight:700; }
 .gm-pill-group { display:inline-flex; gap:0; background:rgba(255,255,255,0.08); border-radius:8px; overflow:hidden; border:1px solid rgba(255,255,255,0.12); }
 .gm-pill { padding:6px 14px; font-size:0.76rem; font-weight:700; cursor:pointer; border:none; background:transparent; color:rgba(255,255,255,0.5); font-family:'JetBrains Mono',monospace; transition:all 0.2s; }
 .gm-pill.active { background:var(--orange); color:#fff; box-shadow:0 2px 8px rgba(232,96,28,0.4); }
@@ -14156,7 +17759,7 @@ async function gmSearch() {
         if (!r.ok) throw new Error(d.error||'Search failed');
         _gmData = d;
         gmRenderResults(d);
-    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#dc3545"><p style="color:#dc3545;text-align:center">'+e.message+'</p></div>'; }
+    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">'+e.message+'</p></div>'; }
     finally { btn.disabled = false; btn.innerHTML = 'Search Material Prices'; }
 }
 
@@ -14251,7 +17854,7 @@ async function gmCompare() {
         const d = await r.json();
         if (!r.ok) throw new Error(d.error||'Failed');
         gmRenderXC(d, ccy);
-    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#dc3545"><p style="color:#dc3545;text-align:center">'+e.message+'</p></div>'; }
+    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">'+e.message+'</p></div>'; }
     finally { btn.disabled = false; btn.innerHTML = 'Compare Countries'; }
 }
 
@@ -14269,8 +17872,8 @@ function gmRenderXC(d, ccy) {
 
     // Summary bar
     html += '<div style="display:flex;gap:30px;flex-wrap:wrap;margin-bottom:18px;padding:14px;background:rgba(255,255,255,0.05);border-radius:10px;font-size:0.88rem;">';
-    html += '<div><span style="opacity:.55">Cheapest:</span> <strong style="color:#28a745">'+d.summary.cheapest+'</strong></div>';
-    html += '<div><span style="opacity:.55">Most Expensive:</span> <strong style="color:#dc3545">'+d.summary.most_expensive+'</strong></div>';
+    html += '<div><span style="opacity:.55">Cheapest:</span> <strong style="color:#1f9d55">'+d.summary.cheapest+'</strong></div>';
+    html += '<div><span style="opacity:.55">Most Expensive:</span> <strong style="color:#e63946">'+d.summary.most_expensive+'</strong></div>';
     html += '<div><span style="opacity:.55">Spread:</span> <strong>'+sym+(isUSD?d.summary.spread_usd:d.summary.spread_eur).toLocaleString(undefined,{minimumFractionDigits:2})+'</strong></div>';
     html += '<div><span style="opacity:.55">Countries:</span> <strong>'+d.summary.total+'</strong></div>';
     html += '</div>';
@@ -14286,13 +17889,13 @@ function gmRenderXC(d, ccy) {
         const cls = isBest?'gm-xc-best':(isWorst?'gm-xc-worst':'');
         const trendCls = loc.trend==='Rising'?'gm-rising':loc.trend==='Falling'?'gm-falling':'gm-stable';
         html += '<tr>';
-        html += '<td style="font-weight:800;'+(isBest?'color:#28a745':isWorst?'color:#dc3545':'')+'">'+String(idx+1)+'</td>';
+        html += '<td style="font-weight:800;'+(isBest?'color:#1f9d55':isWorst?'color:#e63946':'')+'">'+String(idx+1)+'</td>';
         html += '<td style="font-weight:700;">'+loc.country+'<span class="gm-ccy-badge">'+loc.home_code+'</span></td>';
         html += '<td class="'+cls+'">'+sym+price.toLocaleString(undefined,{minimumFractionDigits:2})+(isBest?' ★':'')+'</td>';
         html += '<td>'+loc.portfolio+'</td>';
         html += '<td><span class="gm-badge '+trendCls+'">'+loc.trend+' '+loc.change_pct+'%</span></td>';
         html += '<td>'+loc.home_symbol+loc.curr_home.toLocaleString(undefined,{minimumFractionDigits:2})+'</td>';
-        html += '<td style="font-weight:700;'+(pctVsBest>10?'color:#dc3545':pctVsBest>0?'color:#ffc107':'color:#28a745')+'">'+(pctVsBest>0?'+':'')+pctVsBest.toFixed(1)+'%</td>';
+        html += '<td style="font-weight:700;'+(pctVsBest>10?'color:#e63946':pctVsBest>0?'color:#ffc107':'color:#1f9d55')+'">'+(pctVsBest>0?'+':'')+pctVsBest.toFixed(1)+'%</td>';
         html += '</tr>';
     });
     html += '</tbody></table>';
@@ -14310,7 +17913,7 @@ function gmRenderXC(d, ccy) {
     // Bar chart
     const barNames = sorted.map(s=>s.country);
     const barVals = sorted.map(s=>isUSD?s.curr_usd:s.curr_eur);
-    const barColors = sorted.map((s,i)=>i===0?'#28a745':(i===sorted.length-1?'#dc3545':'#E8601C'));
+    const barColors = sorted.map((s,i)=>i===0?'#1f9d55':(i===sorted.length-1?'#e63946':'#E8601C'));
     Plotly.newPlot('gm-xc-bar', [{
         x:barNames, y:barVals, type:'bar',
         marker:{color:barColors, line:{color:'rgba(255,255,255,0.15)',width:1}},
@@ -14354,6 +17957,13 @@ MATERIAL_TRACKER_UI = """
 .mt-header h2 { font-size: 1.6rem; font-weight: 800; margin-bottom: 6px; }
 .mt-header p { opacity: 0.6; font-size: 0.88rem; }
 
+.mt-tabs { display:flex; gap:0; margin-bottom:24px; border-bottom:2px solid rgba(232,96,28,0.2); }
+.mt-tab-btn { padding:14px 24px; background:transparent; border:none; color:rgba(255,255,255,0.5); cursor:pointer; font-weight:700; font-size:0.92rem; transition:all 0.3s; border-bottom:3px solid transparent; font-family:'Outfit',sans-serif; }
+.mt-tab-btn:hover { color:var(--orange); background:rgba(232,96,28,0.05); }
+.mt-tab-btn.active { color:var(--orange); border-bottom-color:var(--orange); }
+.mt-tab-pane { display:none; }
+.mt-tab-pane.active { display:block; }
+
 .mt-form-grid { display: grid; gap: 18px; }
 .mt-grid-5 { grid-template-columns: repeat(5, 1fr); }
 .mt-grid-4 { grid-template-columns: repeat(4, 1fr); }
@@ -14393,8 +18003,8 @@ MATERIAL_TRACKER_UI = """
     display: inline-block; padding: 5px 14px; border-radius: 20px;
     font-size: 0.78rem; font-weight: 800; letter-spacing: 0.3px;
 }
-.mt-status-BULLISH { background: #dc3545; color: #fff; }
-.mt-status-BEARISH { background: #28a745; color: #fff; }
+.mt-status-BULLISH { background: #e63946; color: #fff; }
+.mt-status-BEARISH { background: #1f9d55; color: #fff; }
 .mt-status-STABLE  { background: #ffc107; color: #000; }
 
 .mt-chart-wrap { margin-top: 22px; }
@@ -14415,14 +18025,50 @@ MATERIAL_TRACKER_UI = """
 .mt-meta-item { opacity: 0.6; }
 .mt-meta-item strong { opacity: 1; color: white; margin-left: 4px; }
 
+.mt-region-card { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.1); border-radius:10px; padding:16px; transition:all 0.2s; }
+.mt-region-card:hover { border-color:var(--orange); transform:translateY(-2px); }
+.mt-region-card.best { border-color:#1f9d55; background:rgba(40,167,69,0.08); }
+.mt-region-card.worst { border-color:#e63946; background:rgba(220,53,69,0.08); }
+.mt-xc-table { width:100%; border-collapse:collapse; font-size:0.85rem; }
+.mt-xc-table th { background:rgba(232,96,28,0.12); padding:12px 14px; text-align:left; font-weight:800; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.5px; border-bottom:2px solid rgba(232,96,28,0.3); }
+.mt-xc-table td { padding:11px 14px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'JetBrains Mono',monospace; font-size:0.84rem; }
+.mt-xc-table tr:hover { background:rgba(232,96,28,0.06); }
+
 @media (max-width: 900px) {
     .mt-grid-5, .mt-grid-4 { grid-template-columns: repeat(2, 1fr); }
     .mt-kpi-strip { grid-template-columns: repeat(3, 1fr); }
+    .mt-tabs { flex-wrap:wrap; }
+    .mt-tab-btn { flex:1; text-align:center; padding:10px 8px; font-size:0.82rem; }
 }
 @media (max-width: 600px) {
     .mt-grid-5, .mt-grid-4, .mt-grid-3 { grid-template-columns: 1fr; }
     .mt-kpi-strip { grid-template-columns: repeat(2, 1fr); }
 }
+
+/* ── TomSelect dark theme overrides ── */
+.ts-wrapper.multi .ts-control { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.15); border-radius:8px; color:white; font-family:'Outfit',sans-serif; min-height:42px; padding:4px 8px; }
+.ts-wrapper.multi .ts-control input { color:white; }
+.ts-wrapper.multi .ts-control .item { background:rgba(232,96,28,0.25); border:1px solid rgba(232,96,28,0.5); color:white; border-radius:5px; padding:2px 8px; font-size:0.82rem; font-weight:600; }
+.ts-wrapper.multi .ts-control .item .remove { color:rgba(255,255,255,0.7); border-left:1px solid rgba(255,255,255,0.15); }
+.ts-wrapper.multi .ts-control .item .remove:hover { color:#e63946; }
+.ts-dropdown { background:#1e293b; border:1px solid rgba(255,255,255,0.15); border-radius:8px; color:white; }
+.ts-dropdown .option { color:white; padding:10px 14px; font-size:0.88rem; }
+.ts-dropdown .option:hover, .ts-dropdown .active { background:rgba(232,96,28,0.18); color:white; }
+.ts-dropdown .option.selected { background:rgba(232,96,28,0.3); }
+.ts-wrapper.focus .ts-control { border-color:var(--orange); box-shadow:0 0 0 2px rgba(232,96,28,0.15); }
+.ts-dropdown .ts-dropdown-content { max-height:220px; }
+.ts-wrapper .ts-control > input::placeholder { color:rgba(255,255,255,0.4); }
+.ts-wrapper.single .ts-control { background:rgba(255,255,255,0.06); border:1px solid rgba(255,255,255,0.15); color:white; border-radius:8px; font-family:'Outfit',sans-serif; }
+
+/* ── Forecast Insight Panel ── */
+.mt-forecast-panel { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.1); border-radius:12px; padding:20px; margin-top:18px; }
+.mt-forecast-panel h4 { font-size:0.95rem; font-weight:800; margin-bottom:14px; display:flex; align-items:center; gap:8px; }
+.mt-fc-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:14px; }
+.mt-fc-card { background:rgba(255,255,255,0.05); border:1px solid rgba(255,255,255,0.08); border-radius:8px; padding:14px; text-align:center; }
+.mt-fc-label { font-size:0.68rem; opacity:0.5; text-transform:uppercase; letter-spacing:0.4px; margin-bottom:5px; }
+.mt-fc-value { font-size:1.1rem; font-weight:800; font-family:'JetBrains Mono',monospace; }
+.mt-fc-sub { font-size:0.72rem; opacity:0.4; margin-top:3px; }
+@media (max-width:700px) { .mt-fc-grid { grid-template-columns:repeat(2,1fr); } }
 </style>
 
 <div class="mt-header">
@@ -14430,38 +18076,41 @@ MATERIAL_TRACKER_UI = """
     <p>Unified commodity intelligence — India resin prices &amp; global material costs in one view.</p>
 </div>
 
+<!-- ═══════ TAB NAVIGATION ═══════ -->
+<div class="mt-tabs">
+    <button class="mt-tab-btn active" onclick="mtSwitchTab('global',this)">Global Material Price Tracker</button>
+    <button class="mt-tab-btn" onclick="mtSwitchTab('india',this)">India Region Comparison</button>
+    <button class="mt-tab-btn" onclick="mtSwitchTab('crosscountry',this)">Cross Country Comparison</button>
+</div>
+
+<!-- ═══════ TAB 1: GLOBAL MATERIAL PRICE TRACKER ═══════ -->
+<div id="mt-pane-global" class="mt-tab-pane active">
 <div class="card" id="mt-filters-card">
     <div class="mt-form-grid mt-grid-5" id="mt-filter-row">
-        <!-- Country -->
         <div class="mt-field">
             <label>Country</label>
             <select id="mt-country" onchange="mtCountryChanged()">
                 <option value="India">India</option>
             </select>
         </div>
-        <!-- Material (dynamic) -->
         <div class="mt-field">
             <label>Material</label>
             <select id="mt-material" onchange="mtMaterialChanged()">
                 <option value="">Select Country First</option>
             </select>
         </div>
-        <!-- Supplier (India only) -->
         <div class="mt-field" id="mt-supplier-wrap">
             <label>Supplier / Location</label>
             <select id="mt-supplier"><option value="">Loading...</option></select>
         </div>
-        <!-- Grade (India only) -->
         <div class="mt-field" id="mt-grade-wrap">
             <label>Grade</label>
             <select id="mt-grade"><option value="">Loading...</option></select>
         </div>
-        <!-- Region (global only) -->
         <div class="mt-field mt-hidden" id="mt-region-wrap">
             <label>Region / Portfolio</label>
             <select id="mt-region"><option value="">All Regions</option></select>
         </div>
-        <!-- Duration -->
         <div class="mt-field">
             <label>Duration</label>
             <select id="mt-duration">
@@ -14477,12 +18126,81 @@ MATERIAL_TRACKER_UI = """
         Generate Analysis
     </button>
 </div>
-
 <div id="mt-results"></div>
+</div>
+
+<!-- ═══════ TAB 2: INDIA REGION COMPARISON ═══════ -->
+<div id="mt-pane-india" class="mt-tab-pane">
+<div class="card">
+    <div class="mt-form-grid mt-grid-4">
+        <div class="mt-field">
+            <label>Material</label>
+            <select id="mt-ir-material"><option value="">Loading...</option></select>
+        </div>
+        <div class="mt-field">
+            <label>Region / Location</label>
+            <select id="mt-ir-region" multiple placeholder="Search & select regions..."><option value="">All Regions</option></select>
+        </div>
+        <div class="mt-field">
+            <label>Grade</label>
+            <select id="mt-ir-grade"><option value="">All Grades</option></select>
+        </div>
+        <div class="mt-field">
+            <label>Duration</label>
+            <select id="mt-ir-duration">
+                <option value="3">Last 3 Months</option>
+                <option value="6">Last 6 Months</option>
+                <option value="12" selected>Last 1 Year</option>
+                <option value="24">Last 2 Years</option>
+                <option value="all">All Time</option>
+            </select>
+        </div>
+    </div>
+    <button class="btn-analyze" id="mt-ir-btn" onclick="mtIndiaRegion()">Compare Regions</button>
+</div>
+<div id="mt-ir-results"></div>
+<div id="mt-ir-chart" style="margin-top:20px;"></div>
+</div>
+
+<!-- ═══════ TAB 3: CROSS COUNTRY COMPARISON ═══════ -->
+<div id="mt-pane-crosscountry" class="mt-tab-pane">
+<div class="card">
+    <div class="mt-form-grid mt-grid-4">
+        <div class="mt-field">
+            <label>Material / Commodity</label>
+            <select id="mt-xc-material" onchange="mtXCMaterialChanged()"><option value="">Loading...</option></select>
+        </div>
+        <div class="mt-field">
+            <label>Countries (multi-select)</label>
+            <select id="mt-xc-country" multiple placeholder="Search & select countries..."><option value="">All Countries</option></select>
+        </div>
+        <div class="mt-field">
+            <label>Grade / Portfolio</label>
+            <select id="mt-xc-grade"><option value="">All Grades</option></select>
+        </div>
+        <div class="mt-field">
+            <label>Duration / Quarter</label>
+            <select id="mt-xc-quarter"><option value="all">All Time</option></select>
+        </div>
+    </div>
+    <button class="btn-analyze" id="mt-xc-btn" onclick="mtCrossCountry()">Compare Countries</button>
+</div>
+<div id="mt-xc-results"></div>
+<div id="mt-xc-chart" style="margin-top:20px;"></div>
+</div>
 
 <script>
 // ═══════════ Unified Material Tracker JS ═══════════
 let _mtInitData = null;
+let _tsXCCountry = null;  // TomSelect instance for cross-country countries
+let _tsIRRegion = null;   // TomSelect instance for India region
+
+function mtSwitchTab(id, btn) {
+    document.querySelectorAll('.mt-tab-btn').forEach(t=>t.classList.remove('active'));
+    document.querySelectorAll('.mt-tab-pane').forEach(p=>p.classList.remove('active'));
+    btn.classList.add('active');
+    document.getElementById('mt-pane-'+id).classList.add('active');
+}
 
 // ── Init: load all dropdown data ──
 (async function mtInit() {
@@ -14492,20 +18210,261 @@ let _mtInitData = null;
         if (!r.ok) throw new Error(d.error || 'Init failed');
         _mtInitData = d;
 
-        // Populate country dropdown: India + all global countries
+        // Tab 1: Populate country dropdown
         const cSel = document.getElementById('mt-country');
         let opts = '<option value="India">India</option>';
         (d.global_countries || []).forEach(c => {
             if (c !== 'India') opts += '<option value="' + c + '">' + c + '</option>';
         });
         cSel.innerHTML = opts;
-
-        // Trigger initial material load for India
         mtCountryChanged();
+
+        // Tab 2: India Region — populate material dropdown with resin materials
+        const irMatSel = document.getElementById('mt-ir-material');
+        const resinMats = d.resin_materials || [];
+        irMatSel.innerHTML = '<option value="">Select Material...</option>' + resinMats.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+        irMatSel.onchange = function() { mtLoadIRFilters(); };
+
+        // Tab 2: Initialize TomSelect on India Region multi-select
+        _tsIRRegion = new TomSelect('#mt-ir-region', {
+            plugins: ['remove_button'],
+            maxItems: null,
+            placeholder: 'Search & select regions...',
+            persist: false,
+            create: false
+        });
+
+        // Tab 3: Cross Country — populate material dropdown with global materials
+        const xcMatSel = document.getElementById('mt-xc-material');
+        const globalMats = d.global_materials || [];
+        xcMatSel.innerHTML = '<option value="">Select Material...</option>' + globalMats.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+
+        // Tab 3: Initialize TomSelect on cross-country country multi-select
+        const xcCountrySel = document.getElementById('mt-xc-country');
+        const globalCountries = d.global_countries || [];
+        xcCountrySel.innerHTML = globalCountries.map(c => '<option value="' + c + '">' + c + '</option>').join('');
+        _tsXCCountry = new TomSelect('#mt-xc-country', {
+            plugins: ['remove_button'],
+            maxItems: null,
+            placeholder: 'Search & select countries...',
+            persist: false,
+            create: false,
+            onChange: function() { mtXCCountriesChanged(); }
+        });
+
+        // Tab 3: Populate quarter dropdown
+        if (d.global_quarters && d.global_quarters.length) {
+            const qOpts = '<option value="all">All Time</option>' + d.global_quarters.map(q => '<option value="' + q + '">' + q + '</option>').join('');
+            document.getElementById('mt-xc-quarter').innerHTML = qOpts;
+        }
     } catch (e) {
         console.error('mtInit error:', e);
     }
 })();
+
+// ═══════ TAB 2: India Region Comparison ═══════
+async function mtLoadIRFilters() {
+    const material = document.getElementById('mt-ir-material').value;
+    if (!material) return;
+    try {
+        const r = await fetch('/api/material_filters', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({country:'India', material:material})});
+        const d = await r.json();
+        // Update TomSelect for regions
+        if (_tsIRRegion) {
+            _tsIRRegion.clear(true);
+            _tsIRRegion.clearOptions();
+            (d.suppliers || []).forEach(s => { _tsIRRegion.addOption({value:s, text:s}); });
+            _tsIRRegion.refreshOptions(false);
+        }
+        const grdSel = document.getElementById('mt-ir-grade');
+        grdSel.innerHTML = '<option value="">All Grades</option>' + (d.grades || []).map(g => '<option value="' + g + '">' + g + '</option>').join('');
+    } catch(e) { console.error('IR filter load error:', e); }
+}
+
+async function mtIndiaRegion() {
+    const material = document.getElementById('mt-ir-material').value;
+    if (!material) { alert('Select a material'); return; }
+    const regions = _tsIRRegion ? _tsIRRegion.getValue() : [];
+    const region = Array.isArray(regions) ? regions.join(',') : (regions || '');
+    const grade = document.getElementById('mt-ir-grade').value;
+    const duration = document.getElementById('mt-ir-duration').value;
+    const btn = document.getElementById('mt-ir-btn');
+    btn.disabled = true; btn.innerHTML = '<span class="loading"></span> Comparing...';
+    const res = document.getElementById('mt-ir-results');
+    res.innerHTML = '<div class="card"><p style="opacity:0.5;text-align:center"><span class="loading"></span> Loading...</p></div>';
+    try {
+        const r = await fetch('/api/mt_india_region', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({material, region, grade, duration})});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Failed');
+        mtRenderIndiaRegion(d);
+    } catch(e) {
+        res.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">' + e.message + '</p></div>';
+        document.getElementById('mt-ir-chart').innerHTML = '';
+    } finally {
+        btn.disabled = false; btn.innerHTML = 'Compare Regions';
+    }
+}
+
+function mtRenderIndiaRegion(d) {
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin:20px 0 12px;">';
+    html += '<span style="font-weight:700;font-size:1.05rem;">' + d.material + ' — India Region Comparison</span>';
+    html += '<span style="opacity:0.5;font-size:0.85rem;">' + d.count + ' result' + (d.count>1?'s':'') + '</span></div>';
+    // Table — columns: Region, Grade, Price, Date
+    html += '<div class="card" style="overflow-x:auto;"><table class="mt-xc-table">';
+    html += '<tr><th>Region</th><th>Grade</th><th style="text-align:right;">Price (₹)</th><th>Date</th><th style="text-align:right;">Avg</th><th style="text-align:right;">Min</th><th style="text-align:right;">Max</th><th style="text-align:right;">Change</th></tr>';
+    d.results.forEach((r, i) => {
+        const cls = i === 0 ? ' style="color:#1f9d55;font-weight:800;"' : (i === d.results.length-1 ? ' style="color:#e63946;font-weight:700;"' : '');
+        const tag = i === 0 ? ' <span style="color:#1f9d55;font-size:0.7rem;">CHEAPEST</span>' : (i === d.results.length-1 ? ' <span style="color:#e63946;font-size:0.7rem;">HIGHEST</span>' : '');
+        const chgClr = r.change_pct > 0 ? '#e63946' : r.change_pct < 0 ? '#1f9d55' : '#ffc107';
+        html += '<tr>';
+        html += '<td' + cls + '>' + r.region + tag + '</td>';
+        html += '<td>' + r.grade + '</td>';
+        html += '<td style="text-align:right;font-weight:700;">₹' + r.price.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+        html += '<td style="opacity:0.7;font-size:0.82rem;">' + (r.date || '') + '</td>';
+        html += '<td style="text-align:right;">₹' + r.avg.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+        html += '<td style="text-align:right;color:#1f9d55;">₹' + r.min.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+        html += '<td style="text-align:right;color:#e63946;">₹' + r.max.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+        html += '<td style="text-align:right;color:' + chgClr + ';font-weight:700;">' + (r.change_pct > 0?'+':'') + r.change_pct + '%</td>';
+        html += '</tr>';
+    });
+    html += '</table></div>';
+    document.getElementById('mt-ir-results').innerHTML = html;
+    // Chart — regional price comparison
+    const traces = d.results.map(r => ({
+        x: r.series_labels, y: r.series_prices, type:'scatter', mode:'lines+markers',
+        name: r.region + (r.grade ? ' ('+r.grade+')' : ''),
+        hovertemplate:'%{x}<br>₹%{y:,.2f}<extra>'+r.region+'</extra>'
+    }));
+    Plotly.newPlot('mt-ir-chart', traces, {
+        title:{text:d.material+' — Regional Price Comparison',font:{color:'white',size:14,family:'Outfit'}},
+        xaxis:{color:'white',tickfont:{size:9},gridcolor:'rgba(255,255,255,0.04)',tickangle:-30},
+        yaxis:{title:'₹/unit',color:'white',tickfont:{size:10},gridcolor:'rgba(255,255,255,0.06)'},
+        plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
+        font:{color:'white',family:'Outfit'}, margin:{l:60,r:20,t:50,b:80},
+        legend:{orientation:'h',y:-0.25,font:{size:10}}, height:380
+    }, {responsive:true, displayModeBar:false});
+    // Forecast for first (cheapest) region
+    if (d.results.length > 0) {
+        const first = d.results[0];
+        const fcPanel = document.createElement('div'); fcPanel.id = 'mt-ir-fc-panel';
+        document.getElementById('mt-ir-results').appendChild(fcPanel);
+        mtFetchForecast(d.material, first.region, first.series_prices, '₹', 'mt-ir-chart', 'mt-ir-fc-panel');
+    }
+}
+
+// ═══════ TAB 3: Cross Country Comparison ═══════
+async function mtXCMaterialChanged() {
+    const material = document.getElementById('mt-xc-material').value;
+    if (!material || !_mtInitData) return;
+    // Fetch countries and portfolios/grades for this commodity via material_filters
+    try {
+        const r = await fetch('/api/material_filters', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({country:'', material:material})});
+        const d = await r.json();
+        if (d.type === 'global') {
+            // Update TomSelect for countries
+            if (_tsXCCountry) {
+                _tsXCCountry.clear(true);
+                _tsXCCountry.clearOptions();
+                (d.countries || []).forEach(c => { _tsXCCountry.addOption({value:c, text:c}); });
+                _tsXCCountry.refreshOptions(false);
+            }
+            const gradeSel = document.getElementById('mt-xc-grade');
+            gradeSel.innerHTML = '<option value="">All Grades</option>' + (d.portfolios || []).map(g => '<option value="' + g + '">' + g + '</option>').join('');
+        }
+    } catch(e) { console.error('XC filter load error:', e); }
+}
+
+// Dynamic material filter: update material dropdown when countries change
+function mtXCCountriesChanged() {
+    if (!_mtInitData || !_tsXCCountry) return;
+    const selected = _tsXCCountry.getValue();
+    if (!selected || !selected.length) {
+        // No countries selected — show all materials
+        const xcMatSel = document.getElementById('mt-xc-material');
+        const allMats = _mtInitData.global_materials || [];
+        const curVal = xcMatSel.value;
+        xcMatSel.innerHTML = '<option value="">Select Material...</option>' + allMats.map(m => '<option value="' + m + '"' + (m===curVal?' selected':'') + '>' + m + '</option>').join('');
+        return;
+    }
+    // Intersect materials available across selected countries
+    const countryMats = _mtInitData.country_materials || {};
+    let matSets = selected.map(c => new Set(countryMats[c] || []));
+    let commonMats = [...matSets[0]].filter(m => matSets.every(s => s.has(m))).sort();
+    const xcMatSel = document.getElementById('mt-xc-material');
+    const curVal = xcMatSel.value;
+    xcMatSel.innerHTML = '<option value="">Select Material...</option>' + commonMats.map(m => '<option value="' + m + '"' + (m===curVal?' selected':'') + '>' + m + '</option>').join('');
+}
+
+async function mtCrossCountry() {
+    const material = document.getElementById('mt-xc-material').value;
+    if (!material) { alert('Select a material'); return; }
+    const countries = _tsXCCountry ? _tsXCCountry.getValue() : [];
+    const grade = document.getElementById('mt-xc-grade').value;
+    const quarter = document.getElementById('mt-xc-quarter').value;
+    const btn = document.getElementById('mt-xc-btn');
+    btn.disabled = true; btn.innerHTML = '<span class="loading"></span> Comparing...';
+    const res = document.getElementById('mt-xc-results');
+    res.innerHTML = '<div class="card"><p style="opacity:0.5;text-align:center"><span class="loading"></span> Loading...</p></div>';
+    try {
+        const r = await fetch('/api/mt_cross_country', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({material, countries, grade, quarter})});
+        const d = await r.json();
+        if (!r.ok) throw new Error(d.error || 'Failed');
+        mtRenderCrossCountry(d);
+    } catch(e) {
+        res.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">' + e.message + '</p></div>';
+        document.getElementById('mt-xc-chart').innerHTML = '';
+    } finally {
+        btn.disabled = false; btn.innerHTML = 'Compare Countries';
+    }
+}
+
+function mtRenderCrossCountry(d) {
+    let html = '<div style="display:flex;justify-content:space-between;align-items:center;margin:20px 0 12px;">';
+    html += '<span style="font-weight:700;font-size:1.05rem;">' + d.material + ' — Cross Country Comparison</span>';
+    html += '<span style="opacity:0.5;font-size:0.85rem;">' + d.count + ' countries</span></div>';
+    // Table — columns: Country, Grade, Price (€), Price ($), Local Currency, Change
+    html += '<div class="card" style="overflow-x:auto;"><table class="mt-xc-table">';
+    html += '<tr><th>Country</th><th>Grade</th><th style="text-align:right;">Price (€)</th><th style="text-align:right;">Price ($)</th><th style="text-align:right;">Local Currency</th><th style="text-align:right;">Change</th></tr>';
+    d.results.forEach((r, i) => {
+        const cls = i === 0 ? ' style="color:#1f9d55;font-weight:800;"' : (i === d.results.length-1 ? ' style="color:#e63946;font-weight:700;"' : '');
+        const tag = i === 0 ? ' <span style="color:#1f9d55;font-size:0.7rem;">CHEAPEST</span>' : (i === d.results.length-1 ? ' <span style="color:#e63946;font-size:0.7rem;">MOST EXPENSIVE</span>' : '');
+        const chgClr = r.change_pct > 0 ? '#e63946' : r.change_pct < 0 ? '#1f9d55' : '#ffc107';
+        html += '<tr>';
+        html += '<td' + cls + '>' + r.country + tag + '</td>';
+        html += '<td>' + (r.grade || '') + '</td>';
+        html += '<td style="text-align:right;font-weight:700;">€' + r.price_eur.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+        html += '<td style="text-align:right;">$' + r.price_usd.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+        html += '<td style="text-align:right;">' + r.symbol + r.price_local.toLocaleString(undefined,{minimumFractionDigits:2}) + ' <span style="opacity:0.4;font-size:0.75rem;">' + r.currency + '</span></td>';
+        html += '<td style="text-align:right;color:' + chgClr + ';font-weight:700;">' + (r.change_pct > 0?'+':'') + r.change_pct + '%</td>';
+        html += '</tr>';
+    });
+    html += '</table></div>';
+    document.getElementById('mt-xc-results').innerHTML = html;
+    // Bar Chart — cross country price comparison
+    const countries = d.results.map(r => r.country);
+    const pricesEur = d.results.map(r => r.price_eur);
+    const colors = d.results.map((r,i) => i===0 ? '#1f9d55' : (i===d.results.length-1 ? '#e63946' : '#E8601C'));
+    Plotly.newPlot('mt-xc-chart', [{
+        x: countries, y: pricesEur, type:'bar',
+        marker:{color:colors},
+        text: pricesEur.map(p => '€'+p.toFixed(2)),
+        textposition:'outside', textfont:{color:'white',size:10},
+        hovertemplate:'%{x}<br>€%{y:,.2f}<extra></extra>'
+    }], {
+        title:{text:d.material+' — Country Price Comparison (EUR)',font:{color:'white',size:14,family:'Outfit'}},
+        xaxis:{color:'white',tickfont:{size:9},gridcolor:'rgba(255,255,255,0.04)'},
+        yaxis:{title:'€/unit',color:'white',tickfont:{size:10},gridcolor:'rgba(255,255,255,0.06)'},
+        plot_bgcolor:'rgba(0,0,0,0)', paper_bgcolor:'rgba(0,0,0,0)',
+        font:{color:'white',family:'Outfit'}, margin:{l:60,r:20,t:50,b:80}, height:400
+    }, {responsive:true, displayModeBar:false});
+    // Forecast for cheapest country
+    if (d.results.length > 0) {
+        const first = d.results[0];
+        const fcPanel = document.createElement('div'); fcPanel.id = 'mt-xc-fc-panel';
+        document.getElementById('mt-xc-results').appendChild(fcPanel);
+        mtFetchForecast(d.material, first.country, first.series_eur || [], '€', 'mt-xc-chart', 'mt-xc-fc-panel');
+    }
+}
 
 function mtCountryChanged() {
     if (!_mtInitData) return;
@@ -14514,25 +18473,46 @@ function mtCountryChanged() {
     const supWrap = document.getElementById('mt-supplier-wrap');
     const grdWrap = document.getElementById('mt-grade-wrap');
     const regWrap = document.getElementById('mt-region-wrap');
+    const durSel = document.getElementById('mt-duration');
 
     if (country === 'India') {
-        // Show India resin materials
-        const mats = _mtInitData.resin_materials || [];
-        matSel.innerHTML = '<option value="">Select Material...</option>' + mats.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+        // Show India resin materials + India non-polymer global materials
+        const resinMats = _mtInitData.resin_materials || [];
+        const indiaGlobalMats = _mtInitData.india_global_materials || [];
+        let opts = '<option value="">Select Material...</option>';
+        if (resinMats.length) {
+            opts += '<optgroup label="Polymers (Plastemart)">';
+            resinMats.forEach(m => { opts += '<option value="' + m + '">' + m + '</option>'; });
+            opts += '</optgroup>';
+        }
+        if (indiaGlobalMats.length) {
+            opts += '<optgroup label="Other Materials (Global)">';
+            indiaGlobalMats.forEach(m => { opts += '<option value="' + m + '">' + m + '</option>'; });
+            opts += '</optgroup>';
+        }
+        matSel.innerHTML = opts;
+        // Default: show supplier/grade for polymers (will toggle on material change)
         supWrap.classList.remove('mt-hidden');
         grdWrap.classList.remove('mt-hidden');
         regWrap.classList.add('mt-hidden');
-        // Reset sub-filters
         document.getElementById('mt-supplier').innerHTML = '<option value="">Select Material First</option>';
         document.getElementById('mt-grade').innerHTML = '<option value="">Select Material First</option>';
+        // India duration = month-based
+        durSel.innerHTML = '<option value="1">Last 1 Month</option><option value="3">Last 3 Months</option><option value="12" selected>Last 1 Year</option><option value="all">All Time</option>';
     } else {
-        // Show global commodity materials
-        const mats = _mtInitData.global_materials || [];
-        matSel.innerHTML = '<option value="">Select Material...</option>' + mats.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+        // Non-India: filter materials available in that country from global data
+        const countryMats = (_mtInitData.country_materials || {})[country] || _mtInitData.global_materials || [];
+        matSel.innerHTML = '<option value="">Select Material...</option>' + countryMats.map(m => '<option value="' + m + '">' + m + '</option>').join('');
+        // Hide supplier/grade, hide region/portfolio for non-India
         supWrap.classList.add('mt-hidden');
         grdWrap.classList.add('mt-hidden');
-        regWrap.classList.remove('mt-hidden');
+        regWrap.classList.add('mt-hidden');
         document.getElementById('mt-region').innerHTML = '<option value="">All Regions</option>';
+        // Non-India duration = quarter-based
+        const quarters = _mtInitData.global_quarters || [];
+        let qOpts = '<option value="all">All Quarters</option>';
+        quarters.forEach(q => { qOpts += '<option value="' + q + '">' + q + '</option>'; });
+        durSel.innerHTML = qOpts;
     }
     document.getElementById('mt-analyze-btn').disabled = true;
     document.getElementById('mt-results').innerHTML = '';
@@ -14548,6 +18528,10 @@ async function mtMaterialChanged() {
 
     document.getElementById('mt-analyze-btn').disabled = false;
 
+    const supWrap = document.getElementById('mt-supplier-wrap');
+    const grdWrap = document.getElementById('mt-grade-wrap');
+    const regWrap = document.getElementById('mt-region-wrap');
+
     // Fetch sub-filters
     try {
         const r = await fetch('/api/material_filters', {
@@ -14558,15 +18542,27 @@ async function mtMaterialChanged() {
         const d = await r.json();
 
         if (d.type === 'resin') {
+            // India polymer — show supplier/grade, hide region
+            supWrap.classList.remove('mt-hidden');
+            grdWrap.classList.remove('mt-hidden');
+            regWrap.classList.add('mt-hidden');
             const supSel = document.getElementById('mt-supplier');
             supSel.innerHTML = (d.suppliers || []).map(s => '<option value="' + s + '">' + s + '</option>').join('');
             const grdSel = document.getElementById('mt-grade');
             grdSel.innerHTML = (d.grades || []).map(g => '<option value="' + g + '">' + g + '</option>').join('');
         } else if (d.type === 'global') {
-            const regSel = document.getElementById('mt-region');
-            let opts = '<option value="">All Regions</option>';
-            (d.portfolios || []).forEach(p => { opts += '<option value="' + p + '">' + p + '</option>'; });
-            regSel.innerHTML = opts;
+            // India non-polymer or non-India — hide supplier/grade, hide region for non-India
+            supWrap.classList.add('mt-hidden');
+            grdWrap.classList.add('mt-hidden');
+            if (country === 'India' && (d.portfolios || []).length > 0) {
+                regWrap.classList.remove('mt-hidden');
+                const regSel = document.getElementById('mt-region');
+                let opts = '<option value="">All Regions</option>';
+                (d.portfolios || []).forEach(p => { opts += '<option value="' + p + '">' + p + '</option>'; });
+                regSel.innerHTML = opts;
+            } else {
+                regWrap.classList.add('mt-hidden');
+            }
         }
     } catch (e) {
         console.error('Filter load error:', e);
@@ -14606,7 +18602,7 @@ async function mtAnalyze() {
         if (!r.ok) throw new Error(d.error || 'Analysis failed');
         mtRenderResults(d);
     } catch (e) {
-        resCont.innerHTML = '<div class="card" style="border-color:#dc3545"><p style="color:#dc3545;text-align:center">' + e.message + '</p></div>';
+        resCont.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">' + e.message + '</p></div>';
     } finally {
         btn.disabled = false;
         btn.innerHTML = 'Generate Analysis';
@@ -14636,10 +18632,10 @@ function mtRenderResults(d) {
     html += '<div class="mt-kpi-strip">';
     html += '<div class="mt-kpi"><div class="mt-kpi-label">Current</div><div class="mt-kpi-value">' + sym + ins.current.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
     html += '<div class="mt-kpi"><div class="mt-kpi-label">Previous</div><div class="mt-kpi-value">' + sym + ins.previous.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
-    html += '<div class="mt-kpi"><div class="mt-kpi-label">Change</div><div class="mt-kpi-value" style="color:' + (ins.change_pct > 0 ? '#dc3545' : ins.change_pct < 0 ? '#28a745' : '#ffc107') + '">' + (ins.change_pct > 0 ? '+' : '') + ins.change_pct + '%</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Change</div><div class="mt-kpi-value" style="color:' + (ins.change_pct > 0 ? '#e63946' : ins.change_pct < 0 ? '#1f9d55' : '#ffc107') + '">' + (ins.change_pct > 0 ? '+' : '') + ins.change_pct + '%</div></div>';
     html += '<div class="mt-kpi"><div class="mt-kpi-label">Average</div><div class="mt-kpi-value">' + sym + ins.avg.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
-    html += '<div class="mt-kpi"><div class="mt-kpi-label">Min</div><div class="mt-kpi-value" style="color:#28a745">' + sym + ins.min.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
-    html += '<div class="mt-kpi"><div class="mt-kpi-label">Max</div><div class="mt-kpi-value" style="color:#dc3545">' + sym + ins.max.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Min</div><div class="mt-kpi-value" style="color:#1f9d55">' + sym + ins.min.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Max</div><div class="mt-kpi-value" style="color:#e63946">' + sym + ins.max.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
     html += '</div>';
 
     // ── Multi-currency info (global only) ──
@@ -14664,7 +18660,9 @@ function mtRenderResults(d) {
     }
 
     // ── Chart placeholder ──
-    html += '<div class="mt-chart-wrap"><div id="mt-price-chart" style="height:350px;"></div></div>';
+    html += '<div class="mt-chart-wrap"><div id="mt-price-chart" style="height:380px;"></div></div>';
+    // ── Forecast insight panel placeholder ──
+    html += '<div id="mt-forecast-panel"></div>';
     html += '</div>';
 
     document.getElementById('mt-results').innerHTML = html;
@@ -14672,24 +18670,3531 @@ function mtRenderResults(d) {
     // ── Render Plotly chart ──
     const dates = d.series.map(p => p.label || p.date);
     const prices = d.series.map(p => p.price);
-    const lineColor = ins.change_pct > 0 ? '#dc3545' : ins.change_pct < 0 ? '#28a745' : '#ffc107';
 
     Plotly.newPlot('mt-price-chart', [{
         x: dates, y: prices, type: 'scatter', mode: 'lines+markers',
-        line: {color: '#E8601C', width: 2.5, shape: 'spline'},
-        marker: {color: '#E8601C', size: 7, line: {color: 'white', width: 1}},
-        fill: 'tozeroy', fillcolor: 'rgba(232,96,28,0.08)',
-        hovertemplate: '%{x}<br>' + sym + '%{y:,.2f}<extra></extra>'
+        name: 'Historical',
+        line: {color: '#3b82f6', width: 2.5, shape: 'spline'},
+        marker: {color: '#3b82f6', size: 7, line: {color: 'white', width: 1}},
+        fill: 'tozeroy', fillcolor: 'rgba(59,130,246,0.08)',
+        hovertemplate: '%{x}<br>' + sym + '%{y:,.2f}<extra>Historical</extra>'
     }], {
         title: {text: d.material + ' Price Trend — ' + d.country + ' (' + d.currency + ')', font: {color: 'white', size: 15, family: 'Outfit'}},
         xaxis: {color: 'white', tickfont: {size: 10}, gridcolor: 'rgba(255,255,255,0.04)', tickangle: -30},
         yaxis: {title: sym + ' / unit', color: 'white', tickfont: {size: 10}, gridcolor: 'rgba(255,255,255,0.06)'},
         plot_bgcolor: 'rgba(0,0,0,0)', paper_bgcolor: 'rgba(0,0,0,0)',
         font: {color: 'white', family: 'Outfit'}, margin: {l: 60, r: 20, t: 50, b: 80},
+        legend: {orientation:'h', y:-0.2, font:{size:10}}
     }, {responsive: true, displayModeBar: false});
+
+    // ── Fetch forecast and overlay ──
+    mtFetchForecast(d.material, d.country, prices, sym, 'mt-price-chart', 'mt-forecast-panel');
+}
+
+// ═══════ FORECASTING MODULE ═══════
+async function mtFetchForecast(material, country, histPrices, sym, chartElId, panelElId) {
+    if (!histPrices || histPrices.length < 3) return;
+    const panel = document.getElementById(panelElId);
+    if (panel) panel.innerHTML = '<div style="text-align:center;padding:16px;opacity:0.5;font-size:0.85rem;"><span class="loading"></span> Generating 30/60/90-day forecast...</div>';
+    try {
+        const pricesPayload = histPrices.map((p, i) => ({label: 'P' + i, price: p}));
+        const r = await fetch('/api/material_forecast', {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({material, country, prices: pricesPayload})
+        });
+        if (!r.ok) { if (panel) panel.innerHTML = ''; return; }
+        const fc = await r.json();
+        if (!fc || fc.error) { if (panel) panel.innerHTML = '<div style="text-align:center;padding:14px;opacity:0.4;font-size:0.82rem;">Forecast unavailable: ' + (fc.error||'') + '</div>'; return; }
+
+        // ── Overlay forecast on Plotly chart ──
+        const chartEl = document.getElementById(chartElId);
+        if (chartEl) {
+            // Get last x value from existing chart to connect lines
+            const plotData = chartEl.data;
+            const lastX = plotData && plotData[0] ? plotData[0].x[plotData[0].x.length - 1] : '';
+            const lastY = histPrices[histPrices.length - 1];
+
+            const fcLabels = [lastX].concat(fc.forecast_labels || ['+30d', '+60d', '+90d']);
+            const fcValues = [lastY].concat(fc.forecast_values || []);
+            const upper = [lastY].concat(fc.confidence_upper || fcValues.slice(1).map(v => v * 1.1));
+            const lower = [lastY].concat(fc.confidence_lower || fcValues.slice(1).map(v => v * 0.9));
+
+            Plotly.addTraces(chartElId, [
+                // Confidence band upper bound (invisible line)
+                {
+                    x: fcLabels, y: upper, type:'scatter', mode:'lines',
+                    name:'Conf. Upper', line:{color:'rgba(249,115,22,0)', width:0},
+                    showlegend:false, hoverinfo:'skip'
+                },
+                // Confidence band lower bound — fill to upper
+                {
+                    x: fcLabels, y: lower, type:'scatter', mode:'lines',
+                    name:'Confidence Band', fill:'tonexty', fillcolor:'rgba(249,115,22,0.10)',
+                    line:{color:'rgba(249,115,22,0)', width:0}, showlegend:true,
+                    hoverinfo:'skip'
+                },
+                // Dashed forecast line
+                {
+                    x: fcLabels, y: fcValues, type:'scatter', mode:'lines+markers',
+                    name:'Forecast', line:{color:'#f97316', width:2.5, dash:'dash', shape:'spline'},
+                    marker:{color:'#f97316', size:8, symbol:'diamond', line:{color:'white', width:1}},
+                    hovertemplate:'%{x}<br>' + sym + '%{y:,.2f}<extra>Forecast</extra>'
+                }
+            ]);
+        }
+
+        // ── Render forecast insight panel ──
+        if (panel) {
+            const latest = histPrices[histPrices.length - 1];
+            const f30 = fc.forecast_30 || latest;
+            const f60 = fc.forecast_60 || latest;
+            const f90 = fc.forecast_90 || latest;
+            const pct90 = fc.pct_change_90 || 0;
+            const trend = fc.trend_direction || 'Stable';
+            const trendClr = trend === 'Up' ? '#e63946' : (trend === 'Down' ? '#1f9d55' : '#ffc107');
+            const trendIcon = trend === 'Up' ? '↑' : (trend === 'Down' ? '↓' : '→');
+
+            let h = '<div class="mt-forecast-panel">';
+            h += '<h4><span style="color:var(--orange);">📈</span> Price Forecast (30 / 60 / 90 days) <span style="font-size:0.72rem;opacity:0.4;font-weight:400;margin-left:auto;">' + (fc.method || 'Auto') + '</span></h4>';
+            h += '<div class="mt-fc-grid">';
+            h += '<div class="mt-fc-card"><div class="mt-fc-label">30-Day Forecast</div><div class="mt-fc-value">' + sym + f30.toLocaleString(undefined,{minimumFractionDigits:2}) + '</div></div>';
+            h += '<div class="mt-fc-card"><div class="mt-fc-label">60-Day Forecast</div><div class="mt-fc-value">' + sym + f60.toLocaleString(undefined,{minimumFractionDigits:2}) + '</div></div>';
+            h += '<div class="mt-fc-card"><div class="mt-fc-label">90-Day Forecast</div><div class="mt-fc-value">' + sym + f90.toLocaleString(undefined,{minimumFractionDigits:2}) + '</div></div>';
+            h += '<div class="mt-fc-card" style="border-color:' + trendClr + '44;"><div class="mt-fc-label">Price Trend</div><div class="mt-fc-value" style="color:' + trendClr + ';">' + trendIcon + ' ' + trend + '</div><div class="mt-fc-sub">' + (pct90 > 0 ? '+' : '') + pct90 + '% in 90 days</div></div>';
+            h += '</div></div>';
+            panel.innerHTML = h;
+        }
+    } catch(e) {
+        console.error('Forecast error:', e);
+        if (panel) panel.innerHTML = '<div style="text-align:center;padding:14px;opacity:0.4;font-size:0.82rem;">Forecast unavailable</div>';
+    }
 }
 </script>
 """
+
+# =============================================================================
+# ██████████████████████  SPEND ANALYTICS INTEGRATION  ████████████████████████
+# =============================================================================
+# All logic ported from spend_analytics_app.py (Streamlit → Flask).
+# Database:  packaging_analytics.db (unchanged schema).
+# Routes:    /analytics/spend   (main page)
+#            /api/spend/upload  (POST – parse + classify uploaded file)
+#            /api/spend/store   (POST – clean & persist to DB)
+#            /api/spend/datasets (GET – list stored datasets)
+#            /api/spend/data    (GET – load + aggregate all data as JSON)
+#            /api/spend/insights (GET – automated insights JSON)
+#            /api/spend/chart/<kind> (GET – Plotly JSON for each chart)
+#            /api/spend/dataset/<id> (DELETE – remove a dataset)
+# =============================================================================
+
+# ── Spend DB path ──────────────────────────────────────────────────────────
+SPEND_DB_PATH = str(BASE_DIR / "packaging_analytics.db")
+
+# ── Constants ──────────────────────────────────────────────────────────────
+SPEND_CATEGORY_OPTIONS = [
+    "Tube", "Bottle", "Carton", "Corrugate", "Pouch", "Sachet",
+    "Cap/Closure", "Label", "Blister", "Jar", "Can", "Wrapper",
+    "Shrink Sleeve", "Tray", "Clamshell", "Drum", "Bag", "Other",
+]
+
+SPEND_ROLE_LABELS = {
+    "volume_metric": "📊 Volume / Quantity",
+    "price_metric":  "💲 Price / Unit Cost",
+    "value_metric":  "💰 Total Value / Spend",
+    "sku_id":        "🔖 SKU / Item Code",
+    "sku_desc":      "📝 SKU Description",
+    "supplier":      "🏭 Supplier / Vendor",
+    "plant":         "🏢 Plant / Site",
+    "dimension":     "📂 Grouping Dimension",
+    "spec":          "🔧 Technical Spec",
+    "skip":          "⏭️ Skip",
+}
+
+SPEND_ROLE_KEYWORDS = {
+    "sku_id":        ["pam code","sku","item code","item_code","material code","product id",
+                      "part number","part no","article number","article no","item number",
+                      "stock code","component code","product code","sap code","erp code"],
+    "sku_desc":      ["pam description","description","item description","product description",
+                      "sku description","material description","item name","product name",
+                      "short text","long text","item desc","prod desc","name"],
+    "supplier":      ["supplier","vendor","manufacturer","supplier name","vendor name",
+                      "mfg","convertor","converter","printer","co-packer","copacker",
+                      "sourcing unit"],
+    "plant":         ["plant","factory","site","facility","plant name","site name",
+                      "warehouse","plant code","site code","ship to","destination",
+                      "receiving plant","manufacturing site","production site","location"],
+    "volume_metric": ["annual volume","volume forecast","quantity","qty","volume",
+                      "annual qty","forecast qty","demand","consumption","usage",
+                      "annual usage","total qty","order qty","pieces","pcs","units"],
+    "price_metric":  ["price","unit price","unit cost","cost","rate","price per unit",
+                      "cost per unit","standard cost","std cost","landed cost","net price",
+                      "invoice price","purchase price","buying price","contract price"],
+    "value_metric":  ["total spend","total cost","spend","amount","total amount",
+                      "extended cost","line total","net amount","net value","invoice amount",
+                      "po amount","order value","total value"],
+}
+
+SPEND_SPEC_KEYWORDS = [
+    "diameter","dia","length","cutting length","height","width","thickness",
+    "wall thickness","gauge","micron","mil","caliper","weight","net weight",
+    "gross weight","grammage","gsm","capacity","fill volume","volume ml","volume oz",
+    "laminate","laminate structure","laminate specification","web thickness","barrier",
+    "shoulder","cap","cap color","cap type","closure","closure type","neck",
+    "neck diameter","orifice","thread","resin","polymer","material type","material grade",
+    "substrate","board grade","flute","paper type","plastic type","composition","film type",
+    "print","printing","print method","decoration","offset","flexo","gravure",
+    "color","colour","finish","surface finish","seal","seal type","shape","layer","layers",
+    "coating","varnish",
+]
+
+SPEND_DIM_KEYWORDS = [
+    "currency","curr","ccy","uom","unit of measure","unit","measure","pack unit",
+    "region","zone","area","territory","market","business unit","bu","division",
+    "brand","sub-brand","segment","channel","format","pack size","incoterm",
+    "country of origin","origin","country","status","order status","moq",
+    "minimum order","lead time","po","po number","purchase order","order number",
+    "contract","date","order date","period","year","month","quarter",
+    "category","product category","packaging type","pack type","supplier code","vendor code",
+]
+
+SPEND_CHART_COLORS = [
+    "#E8601C","#1e40af","#27AE60","#8E44AD","#F39C12",
+    "#3498DB","#CB4335","#148F77","#2E86C1","#E74C3C",
+    "#1ABC9C","#9B59B6","#D35400","#16A085","#C0392B",
+    "#7D3C98","#2874A6","#239B56","#B9770E","#1B4F72",
+]
+
+
+# ── Database helpers ───────────────────────────────────────────────────────
+def _spend_conn():
+    c = sqlite3.connect(SPEND_DB_PATH)
+    c.execute("PRAGMA journal_mode=WAL")
+    return c
+
+def spend_init_db():
+    c = _spend_conn()
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS datasets (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_file  TEXT,
+            country      TEXT,
+            year         INTEGER,
+            category     TEXT,
+            role_map     TEXT,
+            columns_list TEXT,
+            row_count    INTEGER,
+            project_id   TEXT DEFAULT '',
+            uploaded_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+    c.execute("""
+        CREATE TABLE IF NOT EXISTS records (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            dataset_id  INTEGER,
+            data_json   TEXT,
+            FOREIGN KEY (dataset_id) REFERENCES datasets(id)
+        )
+    """)
+    # Ensure project_id column exists on existing databases
+    try:
+        c.execute("ALTER TABLE datasets ADD COLUMN project_id TEXT DEFAULT ''")
+    except sqlite3.OperationalError:
+        pass
+    c.commit(); c.close()
+
+def spend_insert_dataset(source_file, country, year, category, role_map, df, project_id=None):
+    if project_id is None:
+        project_id = session.get('active_project_id', '')
+    c = _spend_conn()
+    cur = c.execute(
+        "INSERT INTO datasets (source_file,country,year,category,role_map,columns_list,row_count,project_id) VALUES (?,?,?,?,?,?,?,?)",
+        (source_file, country, int(year), category,
+         json.dumps(role_map), json.dumps(list(df.columns)), len(df), project_id or '')
+    )
+    ds_id = cur.lastrowid
+    rows = []
+    for row in df.to_dict('records'):
+        d = {col: (float(v) if isinstance(v, (np.integer, np.floating)) else v)
+             for col, v in row.items() if pd.notna(v)}
+        rows.append((ds_id, json.dumps(d)))
+    c.executemany("INSERT INTO records (dataset_id,data_json) VALUES (?,?)", rows)
+    c.commit(); c.close()
+    return ds_id
+
+def spend_load_all_data():
+    try:
+        c = _spend_conn()
+        # Project-scoped query (admin mode sees all)
+        active_pid = session.get('active_project_id', '') if not _is_admin_mode() else None
+        if active_pid:
+            datasets = pd.read_sql("SELECT * FROM datasets WHERE project_id=? OR project_id='' OR project_id IS NULL", c, params=(active_pid,))
+        else:
+            datasets = pd.read_sql("SELECT * FROM datasets", c)
+        if datasets.empty:
+            c.close(); return pd.DataFrame(), {}, []
+        combined_roles = {}
+        all_cols = set()
+        for ds in datasets.to_dict('records'):
+            rm = json.loads(ds["role_map"])
+            for col, role in rm.items():
+                if role != "skip":
+                    combined_roles[col] = role
+                    all_cols.add(col)
+        records = pd.read_sql(
+            "SELECT r.*, d.country, d.year, d.category, d.source_file "
+            "FROM records r JOIN datasets d ON r.dataset_id = d.id", c)
+        c.close()
+        if records.empty:
+            return pd.DataFrame(), combined_roles, list(all_cols)
+        parsed = records["data_json"].apply(json.loads)
+        df = pd.json_normalize(parsed)
+        df["country"]     = records["country"].values
+        df["year"]        = records["year"].values
+        df["category"]    = records["category"].values
+        df["source_file"] = records["source_file"].values
+        for col, role in combined_roles.items():
+            if role in ("volume_metric","price_metric","value_metric") and col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
+        return df, combined_roles, list(all_cols)
+    except Exception:
+        return pd.DataFrame(), {}, []
+
+def _spend_apply_filters(df):
+    """Apply global filters from request query params to the spend DataFrame."""
+    if df.empty:
+        return df
+    from flask import request as _req
+    f_country  = _req.args.get('country', '').strip()
+    f_year     = _req.args.get('year', '').strip()
+    f_category = _req.args.get('category', '').strip()
+    f_supplier = _req.args.get('supplier', '').strip()
+    if f_country and f_country.lower() != 'all' and 'country' in df.columns:
+        df = df[df['country'].astype(str).str.lower() == f_country.lower()]
+    if f_year and f_year.lower() != 'all' and 'year' in df.columns:
+        try:
+            df = df[df['year'].astype(int) == int(f_year)]
+        except (ValueError, TypeError):
+            pass
+    if f_category and f_category.lower() != 'all' and 'category' in df.columns:
+        df = df[df['category'].astype(str).str.lower() == f_category.lower()]
+    if f_supplier and f_supplier.lower() != 'all':
+        # Find the supplier column dynamically
+        sup_cols = [c for c in df.columns if 'supplier' in c.lower() or 'vendor' in c.lower()]
+        if sup_cols:
+            sc = sup_cols[0]
+            df = df[df[sc].astype(str).str.lower().str.contains(f_supplier.lower(), na=False)]
+    return df
+
+
+def spend_get_datasets():
+    try:
+        c = _spend_conn()
+        ds = pd.read_sql("SELECT * FROM datasets ORDER BY uploaded_at DESC", c)
+        c.close()
+        return ds
+    except Exception:
+        return pd.DataFrame()
+
+def spend_delete_dataset(ds_id):
+    c = _spend_conn()
+    c.execute("DELETE FROM records WHERE dataset_id = ?", (ds_id,))
+    c.execute("DELETE FROM datasets WHERE id = ?", (ds_id,))
+    c.commit(); c.close()
+
+def spend_clear_db():
+    c = _spend_conn()
+    c.execute("DELETE FROM records")
+    c.execute("DELETE FROM datasets")
+    c.commit(); c.close()
+
+
+# ── File reading helpers ───────────────────────────────────────────────────
+def _spend_find_header_row(df_raw, max_scan=20):
+    best_row, best_score = 0, 0
+    for i in range(min(max_scan, len(df_raw))):
+        row = df_raw.iloc[i]
+        cells = row.dropna().astype(str)
+        non_num = cells[~cells.str.match(r"^\s*[\d.,\-]+\s*$")]
+        if len(non_num) == 0:
+            continue
+        ratio = len(non_num.unique()) / max(len(non_num), 1)
+        score = len(non_num) * ratio
+        if score > best_score:
+            best_score, best_row = score, i
+    return best_row
+
+def spend_read_flask_file(file_storage):
+    """Read a Werkzeug FileStorage object into a cleaned DataFrame."""
+    name = file_storage.filename.lower()
+    buf = io.BytesIO(file_storage.read())
+    if name.endswith(".csv"):
+        raw = pd.read_csv(buf, header=None, dtype=str, on_bad_lines="skip")
+    elif name.endswith((".xlsx", ".xls")):
+        raw = pd.read_excel(buf, header=None, dtype=str, engine="openpyxl")
+    else:
+        raise ValueError("Unsupported file type — use .xlsx, .xls or .csv")
+    if raw.empty:
+        raise ValueError("Uploaded file appears to be empty")
+    hdr = _spend_find_header_row(raw)
+    headers = raw.iloc[hdr].fillna("").astype(str).str.strip()
+    seen = {}; clean = []
+    for h in headers:
+        h = h if h else "unnamed"
+        if h in seen:
+            seen[h] += 1; clean.append(f"{h}_{seen[h]}")
+        else:
+            seen[h] = 0; clean.append(h)
+    data = raw.iloc[hdr + 1:].reset_index(drop=True)
+    data.columns = clean
+    data = data.dropna(axis=1, how="all").dropna(axis=0, how="all").reset_index(drop=True)
+    return data
+
+
+# ── Column classification ──────────────────────────────────────────────────
+def _spend_norm(s):
+    return re.sub(r"[^a-z0-9 ]", " ", str(s).lower()).strip()
+
+def _spend_norm_clean(s):
+    s = re.sub(r"\[.*?\]", "", s)
+    s = re.sub(r"\(.*?\)", "", s)
+    return re.sub(r"[^a-z0-9 ]", " ", s.lower()).strip()
+
+def _spend_fuzzy(a, b):
+    return SequenceMatcher(None, a, b).ratio()
+
+def _spend_is_numeric_col(series, threshold=0.6):
+    non_null = series.dropna().astype(str).str.strip()
+    non_null = non_null[non_null != ""]
+    if len(non_null) == 0:
+        return False
+    cleaned = non_null.str.replace(r"[,$€£¥₹\s]", "", regex=True)
+    numeric = pd.to_numeric(cleaned, errors="coerce")
+    return numeric.notna().sum() / len(non_null) >= threshold
+
+def _spend_kw_score(header_norm, keywords):
+    best = 0
+    for kw in keywords:
+        if kw == header_norm:              best = max(best, 100)
+        elif header_norm.startswith(kw):   best = max(best, 80 + len(kw))
+        elif header_norm.endswith(kw):     best = max(best, 75 + len(kw))
+        elif kw in header_norm:            best = max(best, 50 + len(kw))
+        elif header_norm in kw:            best = max(best, 40 + len(kw))
+        else:
+            f = _spend_fuzzy(header_norm, kw)
+            if f > 0.75:
+                best = max(best, int(f * 60))
+    return best
+
+def spend_classify_columns(df):
+    roles = {}
+    role_scores = {}
+    for col in df.columns:
+        hn = _spend_norm(col)
+        hc = _spend_norm_clean(col)
+        scores = {}
+        for role, kws in SPEND_ROLE_KEYWORDS.items():
+            s = max(_spend_kw_score(hn, kws), _spend_kw_score(hc, kws))
+            if s > 0:
+                scores[role] = s
+        s_spec = max(_spend_kw_score(hn, SPEND_SPEC_KEYWORDS), _spend_kw_score(hc, SPEND_SPEC_KEYWORDS))
+        if s_spec > 0:
+            scores["spec"] = s_spec
+        s_dim = max(_spend_kw_score(hn, SPEND_DIM_KEYWORDS), _spend_kw_score(hc, SPEND_DIM_KEYWORDS))
+        if s_dim > 0:
+            scores["dimension"] = s_dim
+        role_scores[col] = scores
+
+    used_unique_roles = set()
+    unique_roles = {"sku_id","sku_desc","supplier","plant","volume_metric","price_metric","value_metric"}
+    assignments = sorted(
+        [(score, col, role) for col, scores in role_scores.items() for role, score in scores.items()],
+        key=lambda x: -x[0]
+    )
+    assigned_cols = set()
+    for score, col, role in assignments:
+        if col in assigned_cols: continue
+        if role in unique_roles and role in used_unique_roles: continue
+        if score >= 30:
+            roles[col] = role
+            assigned_cols.add(col)
+            if role in unique_roles:
+                used_unique_roles.add(role)
+
+    for col in df.columns:
+        if col in assigned_cols: continue
+        series = df[col]
+        is_num = _spend_is_numeric_col(series)
+        n_unique = series.dropna().nunique()
+        cardinality = n_unique / max(len(series.dropna()), 1)
+        if is_num:
+            roles[col] = "spec"
+        else:
+            roles[col] = "skip" if n_unique <= 1 else "dimension"
+        assigned_cols.add(col)
+
+    for col in df.columns:
+        if col not in roles:
+            roles[col] = "dimension"
+    return roles
+
+
+# ── Data cleaning ──────────────────────────────────────────────────────────
+def _spend_clean_numeric(s):
+    cl = s.astype(str).str.replace(r"[^\d.\-]", "", regex=True)
+    cl = cl.replace({"": np.nan, "nan": np.nan, "None": np.nan})
+    return pd.to_numeric(cl, errors="coerce")
+
+def _spend_clean_text(s):
+    return (s.astype(str).str.strip()
+              .replace({"nan": np.nan,"None": np.nan,"": np.nan,"NaT": np.nan,"Nan": np.nan}))
+
+def spend_clean_dataframe(raw, role_map):
+    df = raw.copy()
+    numeric_roles = {"volume_metric","price_metric","value_metric"}
+    keep_cols = [c for c, r in role_map.items() if r != "skip" and c in df.columns]
+    df = df[keep_cols].copy()
+    for col in keep_cols:
+        role = role_map.get(col, "dimension")
+        if role in numeric_roles or role == "spec":
+            if _spend_is_numeric_col(df[col], 0.3):
+                df[col] = _spend_clean_numeric(df[col])
+            else:
+                df[col] = _spend_clean_text(df[col])
+        else:
+            df[col] = _spend_clean_text(df[col])
+    return df.dropna(how="all").drop_duplicates().reset_index(drop=True)
+
+
+# ── Analytics helpers ──────────────────────────────────────────────────────
+def _spend_get_metric_col(role_map, metric_type="volume_metric"):
+    for col, role in role_map.items():
+        if role == metric_type:
+            return col
+    return None
+
+def _spend_fmt_vol(v):
+    v = float(v)
+    if abs(v) >= 1e9: return f"{v/1e9:.2f}B"
+    if abs(v) >= 1e6: return f"{v/1e6:.2f}M"
+    if abs(v) >= 1e3: return f"{v/1e3:.1f}K"
+    return f"{v:,.0f}"
+
+def _spend_grp(df, col, val_col, agg="sum", n=20):
+    tmp = df.dropna(subset=[col])
+    if tmp.empty or val_col not in tmp.columns:
+        return pd.DataFrame(columns=[col, val_col])
+    g = tmp.groupby(col, as_index=False)[val_col].agg(agg)
+    return g.sort_values(val_col, ascending=False).head(n)
+
+
+# ── Insights engine ────────────────────────────────────────────────────────
+def spend_generate_insights(df, role_map):
+    insights = []
+    vol_col   = _spend_get_metric_col(role_map, "volume_metric")
+    sku_col   = _spend_get_metric_col(role_map, "sku_id")   or ""
+    sup_col   = _spend_get_metric_col(role_map, "supplier") or ""
+    plant_col = _spend_get_metric_col(role_map, "plant")    or ""
+    price_col = _spend_get_metric_col(role_map, "price_metric")
+
+    if vol_col is None or vol_col not in df.columns:
+        return [{"icon":"⚠️","title":"No Volume Data","detail":"No volume/quantity column found.","sev":"warning"}]
+    total_vol = df[vol_col].sum()
+    if total_vol == 0:
+        return [{"icon":"⚠️","title":"Zero Volume","detail":"Total volume is zero.","sev":"warning"}]
+
+    # Supplier concentration
+    if sup_col and sup_col in df.columns:
+        sup = df.groupby(sup_col)[vol_col].sum().sort_values(ascending=False).dropna()
+        if not sup.empty:
+            tn, tv = sup.index[0], sup.iloc[0]
+            tp = tv / total_vol * 100
+            insights.append({"icon":"🏭","title":"Top Supplier",
+                "detail": f"{tn} supplies {tp:.1f}% of total volume ({_spend_fmt_vol(tv)} units).",
+                "sev": "critical" if tp > 50 else "warning" if tp > 35 else "info"})
+            t3 = sup.head(3).sum() / total_vol * 100
+            insights.append({"icon":"📊","title":"Supplier Concentration",
+                "detail": f"Top 3 suppliers account for {t3:.1f}% of volume.",
+                "sev": "critical" if t3 > 80 else "warning" if t3 > 60 else "info"})
+            if len(sup) >= 5:
+                hhi = ((sup / total_vol * 100) ** 2).sum()
+                lbl = "Highly concentrated" if hhi > 2500 else "Moderate" if hhi > 1500 else "Competitive"
+                insights.append({"icon":"📈","title":"HHI Index",
+                    "detail": f"HHI = {hhi:.0f} ({lbl}).",
+                    "sev": "critical" if hhi > 2500 else "warning" if hhi > 1500 else "info"})
+
+    # SKU analysis
+    if sku_col and sku_col in df.columns:
+        sku_vol = df.groupby(sku_col)[vol_col].sum().sort_values(ascending=False)
+        n_sku = len(sku_vol)
+        insights.append({"icon":"📦","title":"SKU Universe",
+            "detail": f"{n_sku} unique SKUs in the dataset.", "sev":"info"})
+        if n_sku >= 10:
+            top10p = max(1, int(n_sku * 0.1))
+            top_v = sku_vol.head(top10p).sum() / total_vol * 100
+            if top_v > 60:
+                insights.append({"icon":"⚖️","title":"SKU Concentration",
+                    "detail": f"Top {top10p} SKUs cover {top_v:.1f}% of volume.",
+                    "sev":"warning"})
+        if sku_col and sup_col and sup_col in df.columns:
+            ss = df.groupby(sku_col)[sup_col].nunique()
+            single = ss[ss == 1]
+            if len(single):
+                p = len(single) / len(ss) * 100
+                insights.append({"icon":"⚡","title":"Single-Source Risk",
+                    "detail": f"{len(single)} SKUs ({p:.0f}%) sourced from a single supplier.",
+                    "sev": "critical" if p > 70 else "warning" if p > 40 else "info"})
+
+    # YoY
+    if "year" in df.columns and df["year"].nunique() > 1:
+        yr = df.groupby("year")[vol_col].sum().sort_index()
+        if len(yr) >= 2:
+            l2 = yr.index[-2:]
+            if yr[l2[0]] != 0:
+                chg = (yr[l2[1]] - yr[l2[0]]) / yr[l2[0]] * 100
+                d = "increased" if chg > 0 else "decreased"
+                insights.append({"icon":"📅","title":"YoY Volume",
+                    "detail": f"Volume {d} {abs(chg):.1f}% from {l2[0]} to {l2[1]}.",
+                    "sev":"warning" if abs(chg) > 20 else "info"})
+
+    # Price variance
+    if price_col and price_col in df.columns and df[price_col].notna().any() and sku_col:
+        ps = df.groupby(sku_col)[price_col].agg(["mean","std","count"])
+        ps["cv"] = (ps["std"] / ps["mean"] * 100).fillna(0)
+        hv = ps[(ps["cv"] > 25) & (ps["count"] >= 2)]
+        for sk in list(hv.head(3).index):
+            cv = hv.loc[sk, "cv"]
+            insights.append({"icon":"💲","title":f"Price Variance — {sk}",
+                "detail": f"Coefficient of variation = {cv:.0f}%.",
+                "sev": "critical" if cv > 50 else "warning"})
+
+    return insights or [{"icon":"✅","title":"All Clear","detail":"No significant anomalies detected.","sev":"info"}]
+
+
+# ── Chart data builders (return Plotly-compatible dicts) ───────────────────
+def _spend_chart_bar(df, grp, val, title="", n=15, horiz=False):
+    g = _spend_grp(df, grp, val, n=n)
+    if g.empty: return None
+    if horiz:
+        g = g.sort_values(val, ascending=True)
+        trace = dict(type="bar", x=g[val].tolist(), y=g[grp].tolist(),
+                     orientation="h", marker=dict(color=SPEND_CHART_COLORS[:len(g)]),
+                     text=[_spend_fmt_vol(v) for v in g[val]], textposition="outside")
+        layout = dict(title=title, xaxis=dict(title=val), yaxis=dict(automargin=True))
+    else:
+        trace = dict(type="bar", x=g[grp].tolist(), y=g[val].tolist(),
+                     marker=dict(color=SPEND_CHART_COLORS[:len(g)]),
+                     text=[_spend_fmt_vol(v) for v in g[val]], textposition="outside")
+        layout = dict(title=title, xaxis=dict(tickangle=-30, automargin=True), yaxis=dict(title=val))
+    layout.update(dict(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                       font=dict(color="white", family="Outfit"), showlegend=False,
+                       margin=dict(t=50, b=60, l=50, r=20), height=380))
+    return dict(data=[trace], layout=layout)
+
+def _spend_chart_donut(df, grp, val, title="", n=10):
+    g = _spend_grp(df, grp, val, n=n)
+    if g.empty: return None
+    trace = dict(type="pie", labels=g[grp].tolist(), values=g[val].tolist(),
+                 hole=0.5, marker=dict(colors=SPEND_CHART_COLORS[:len(g)]))
+    layout = dict(title=title, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                  font=dict(color="white", family="Outfit"),
+                  margin=dict(t=50, b=30, l=20, r=20), height=380)
+    return dict(data=[trace], layout=layout)
+
+def _spend_chart_trend(df, tc, gc, val, title="", n=8):
+    tmp = df.dropna(subset=[tc, gc])
+    if tmp.empty: return None
+    top = tmp.groupby(gc)[val].sum().nlargest(n).index
+    tmp = tmp[tmp[gc].isin(top)]
+    a = tmp.groupby([tc, gc], as_index=False)[val].agg("sum")
+    traces = []
+    for i, grp in enumerate(top):
+        sub = a[a[gc] == grp]
+        traces.append(dict(type="scatter", mode="lines+markers",
+                           x=sub[tc].tolist(), y=sub[val].tolist(), name=str(grp),
+                           line=dict(color=SPEND_CHART_COLORS[i % len(SPEND_CHART_COLORS)], width=2.5),
+                           marker=dict(size=6)))
+    layout = dict(title=title, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                  font=dict(color="white", family="Outfit"),
+                  margin=dict(t=50, b=60, l=50, r=20), height=380,
+                  xaxis=dict(color="white", gridcolor="rgba(255,255,255,0.1)"),
+                  yaxis=dict(color="white", gridcolor="rgba(255,255,255,0.1)"))
+    return dict(data=traces, layout=layout)
+
+def _spend_chart_price_variance(df, sku_col, price_col, n=20):
+    if not sku_col or not price_col: return None
+    tmp = df.dropna(subset=[sku_col, price_col])
+    if tmp.empty: return None
+    top_skus = tmp.groupby(sku_col)[price_col].count().nlargest(n).index
+    tmp = tmp[tmp[sku_col].isin(top_skus)]
+    traces = []
+    for i, sku in enumerate(top_skus):
+        sub = tmp[tmp[sku_col] == sku][price_col].dropna()
+        if len(sub) < 2: continue
+        traces.append(dict(type="box", y=sub.tolist(), name=str(sku)[:25],
+                           marker=dict(color=SPEND_CHART_COLORS[i % len(SPEND_CHART_COLORS)])))
+    if not traces: return None
+    layout = dict(title="Price Distribution by SKU",
+                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                  font=dict(color="white", family="Outfit"), showlegend=False,
+                  margin=dict(t=50, b=100, l=50, r=20), height=400,
+                  xaxis=dict(color="white", tickangle=-45, gridcolor="rgba(255,255,255,0.1)"),
+                  yaxis=dict(color="white", gridcolor="rgba(255,255,255,0.1)"))
+    return dict(data=traces, layout=layout)
+
+def _spend_chart_heatmap(df, rc, cc, vc, title="", n=15):
+    tmp = df.dropna(subset=[rc, cc])
+    if tmp.empty: return None
+    piv = tmp.pivot_table(index=rc, columns=cc, values=vc, aggfunc="sum").fillna(0)
+    top_r = piv.sum(axis=1).nlargest(n).index
+    piv = piv.loc[piv.index.isin(top_r)]
+    trace = dict(type="heatmap",
+                 z=piv.values.tolist(), x=[str(c) for c in piv.columns],
+                 y=[str(r) for r in piv.index], colorscale="Blues")
+    layout = dict(title=title, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                  font=dict(color="white", family="Outfit"),
+                  margin=dict(t=50, b=120, l=120, r=20), height=max(380, len(piv)*30+100),
+                  xaxis=dict(color="white", tickangle=-45),
+                  yaxis=dict(color="white", automargin=True))
+    return dict(data=[trace], layout=layout)
+
+
+# ── KPI summary helper ─────────────────────────────────────────────────────
+def _spend_build_kpis(df, role_map):
+    vol_col   = _spend_get_metric_col(role_map, "volume_metric")
+    price_col = _spend_get_metric_col(role_map, "price_metric")
+    sku_col   = _spend_get_metric_col(role_map, "sku_id")
+    sup_col   = _spend_get_metric_col(role_map, "supplier")
+    plant_col = _spend_get_metric_col(role_map, "plant")
+    kpis = {}
+    if vol_col and vol_col in df.columns:
+        kpis["total_volume"] = {"label":"Total Volume", "value": _spend_fmt_vol(df[vol_col].sum())}
+    if sku_col and sku_col in df.columns:
+        kpis["unique_skus"] = {"label":"Unique SKUs", "value": f"{df[sku_col].nunique():,}"}
+    if sup_col and sup_col in df.columns:
+        kpis["suppliers"] = {"label":"Suppliers", "value": f"{df[sup_col].nunique():,}"}
+    if plant_col and plant_col in df.columns:
+        kpis["plants"] = {"label":"Plants", "value": f"{df[plant_col].nunique():,}"}
+    if "category" in df.columns:
+        kpis["categories"] = {"label":"Categories", "value": f"{df['category'].nunique():,}"}
+    if price_col and price_col in df.columns and df[price_col].notna().any():
+        kpis["avg_price"] = {"label":"Avg Price", "value": f"${df[price_col].mean():,.2f}"}
+    kpis["total_rows"] = {"label":"Records", "value": f"{len(df):,}"}
+    return kpis
+
+
+# =============================================================================
+# ██████████  SPEND ANALYTICS — AI UPGRADE BLOCK (Features 1–9)  ████████████
+# =============================================================================
+
+# ── Vendor normalisation dictionary (extend as needed) ────────────────────
+_VENDOR_DICT = {
+    # Petrochemicals / Resins
+    'Reliance':        [r'\bRELIANCE\b', r'\bRIL\b', r'\bRPL\b', r'\bRELIANCE\s*IND\b', r'\bRELIANCE\s*INDUSTRIES\b'],
+    'IOCL':            [r'\bIOCL\b', r'\bINDIAN\s*OIL\b', r'\bIOC\b'],
+    'HPCL':            [r'\bHPCL\b', r'\bHINDUSTAN\s*PETRO\b'],
+    'BPCL':            [r'\bBPCL\b', r'\bBHARAT\s*PETRO\b'],
+    'GAIL':            [r'\bGAIL\b'],
+    'OPAL':            [r'\bOPAL\b'],
+    'ONGC':            [r'\bONGC\b'],
+    'Sabic':           [r'\bSABIC\b'],
+    'LyondellBasell':  [r'\bLYONDELL\b', r'\bBASELL\b', r'\bLYB\b'],
+    'HALDIA':          [r'\bHALDIA\b', r'\bHPL\b'],
+    # Packaging converters (common)
+    'Amcor':           [r'\bAMCOR\b'],
+    'Berry':           [r'\bBERRY\s*GLOBAL\b', r'\bBERRY\s*PLASTICS\b', r'\bBERRY\b'],
+    'Sealed Air':      [r'\bSEALED\s*AIR\b', r'\bSEALED-AIR\b'],
+    'Huhtamaki':       [r'\bHUHTAMAKI\b'],
+    'DS Smith':        [r'\bDS\s*SMITH\b', r'\bDSS\b'],
+    'Smurfit':         [r'\bSMURFIT\b', r'\bSKG\b'],
+    'Sonoco':          [r'\bSONOCO\b'],
+    'Silgan':          [r'\bSILGAN\b'],
+    'Crown':           [r'\bCROWN\s*HOLD\b', r'\bCROWN\s*CORK\b', r'\bCROWN\b'],
+    'Ball':            [r'\bBALL\s*CORP\b', r'\bBALL\b'],
+}
+
+# ── 1. AI Vendor Normalisation ─────────────────────────────────────────────
+def _vn_fuzzy_ratio(a: str, b: str) -> float:
+    """Return fuzzy similarity 0-1 between two strings."""
+    if _RAPIDFUZZ_OK:
+        return _rfuzz.token_sort_ratio(a, b) / 100.0
+    return SequenceMatcher(None, a, b).ratio()
+
+def normalize_supplier_names(df: pd.DataFrame, col: str = None) -> pd.DataFrame:
+    """
+    Hybrid TF-IDF + fuzzy vendor normalisation.
+    Adds column 'canonical_supplier' mapped to cleaned canonical name.
+    col  – the supplier column to use; auto-detected if None.
+    """
+    df = df.copy()
+
+    # Find supplier column
+    if col is None:
+        for c in df.columns:
+            if c.lower() in ("supplier","vendor","manufacturer","convertor","converter","sourcing unit"):
+                col = c
+                break
+    if col is None or col not in df.columns:
+        df["canonical_supplier"] = np.nan
+        return df
+
+    raw_vals = df[col].fillna("UNKNOWN").astype(str).str.strip()
+
+    # Step 1 — dictionary mapping (regex rules, fast)
+    def _dict_lookup(name: str) -> str:
+        upper = name.upper()
+        for canonical, patterns in _VENDOR_DICT.items():
+            for pat in patterns:
+                if re.search(pat, upper):
+                    return canonical
+        return None
+
+    canonical = raw_vals.apply(_dict_lookup)
+
+    # Step 2 — collect un-matched unique values for ML pass
+    unmatched_mask = canonical.isna()
+    unique_unmatched = raw_vals[unmatched_mask].unique().tolist()
+
+    if len(unique_unmatched) > 1 and _SKLEARN_OK:
+        # TF-IDF similarity clustering
+        clean_vals = [re.sub(r"[^a-z0-9 ]", " ", v.lower()) for v in unique_unmatched]
+        try:
+            tfidf = TfidfVectorizer(analyzer="char_wb", ngram_range=(2, 4), min_df=1)
+            mat = tfidf.fit_transform(clean_vals)
+            sim = cosine_similarity(mat)
+
+            # Build cluster: union-find
+            parent = list(range(len(unique_unmatched)))
+
+            def find(i):
+                while parent[i] != i:
+                    parent[i] = parent[parent[i]]
+                    i = parent[i]
+                return i
+
+            THRESHOLD = 0.85
+            for i in range(len(unique_unmatched)):
+                for j in range(i + 1, len(unique_unmatched)):
+                    if sim[i, j] >= THRESHOLD:
+                        ri, rj = find(i), find(j)
+                        if ri != rj:
+                            # Keep longer name as canonical
+                            if len(unique_unmatched[ri]) >= len(unique_unmatched[rj]):
+                                parent[rj] = ri
+                            else:
+                                parent[ri] = rj
+
+            # Build name → canonical map
+            cluster_map = {}
+            for i, name in enumerate(unique_unmatched):
+                root = find(i)
+                cluster_map[name] = unique_unmatched[root].title()
+
+            def _ml_lookup(name):
+                return cluster_map.get(name, name.title())
+
+            canonical[unmatched_mask] = raw_vals[unmatched_mask].apply(_ml_lookup)
+        except Exception:
+            canonical[unmatched_mask] = raw_vals[unmatched_mask].str.title()
+    else:
+        # Fallback: simple title-case
+        canonical[unmatched_mask] = raw_vals[unmatched_mask].str.title()
+
+    df["canonical_supplier"] = canonical.values
+    return df
+
+
+# ── 2. AI Spend Categorisation ────────────────────────────────────────────
+_SPEND_CAT_KEYWORDS = {
+    "Raw Material": [
+        "resin","polymer","hdpe","ldpe","lldpe","pp","pet","pvc","eva","abs","nylon","pa6","pa66",
+        "polypropylene","polyethylene","polystyrene","acrylonitrile","plastic pellet","masterbatch",
+        "pigment","additive","compound","film","laminate","substrate","aluminum foil","tinplate",
+        "steel","glass","paper pulp","fibre","cardboard","paperboard","kraft","corrugated medium",
+        "raw","base material","commodity"
+    ],
+    "Packaging": [
+        "tube","bottle","jar","can","carton","box","pouch","sachet","blister","tray","clamshell",
+        "drum","pail","bag","wrapper","shrink sleeve","label","cap","closure","lid","stopper",
+        "fitment","spout","doypack","stand-up","flexible pack","rigid pack","container",
+        "packaging","pack","wrapping","corrugated","corrugate","display"
+    ],
+    "Logistics": [
+        "freight","transport","shipping","logistics","courier","trucking","carrier","3pl",
+        "warehouse","storage","handling","delivery","forwarding","customs","duty","demurrage",
+        "distribution","fleet","last mile","inbound","outbound","supply chain","import","export"
+    ],
+    "Capex": [
+        "machine","equipment","tooling","mould","mold","die","fixture","press","extruder",
+        "blow mold","injection","capex","capital","asset","plant","installation","engineering",
+        "fabrication","construction","modification","upgrade","project","infrastructure"
+    ],
+    "MRO": [
+        "spare","spares","maintenance","repair","overhaul","lubricant","oil","grease","cleaning",
+        "safety","ppe","glove","helmet","workwear","consumable","tool","drill","bearing",
+        "gasket","seal","filter","belt","maintenance supply","facility supply","mro"
+    ],
+    "Utilities": [
+        "electricity","power","gas","water","steam","compressed air","fuel","energy","utility",
+        "natural gas","lpg","lng","diesel","coal","solar","wind","renewable"
+    ],
+    "Services": [
+        "service","consulting","testing","inspection","audit","certification","iso","quality",
+        "training","software","it","subscription","license","professional","design","agency",
+        "marketing","printing","recruitment","hr","legal","insurance","finance","contract"
+    ],
+}
+
+def categorize_spend(description: str) -> str:
+    """
+    Keyword classifier → return spend category string.
+    Returns one of: Raw Material | Packaging | Logistics | Capex | MRO | Utilities | Services | Other
+    """
+    if not description or not isinstance(description, str):
+        return "Other"
+    d = description.lower()
+    scores = {cat: 0 for cat in _SPEND_CAT_KEYWORDS}
+    for cat, kws in _SPEND_CAT_KEYWORDS.items():
+        for kw in kws:
+            if kw in d:
+                scores[cat] += 1 + len(kw) // 4   # longer keyword = higher weight
+    best_cat = max(scores, key=scores.get)
+    if scores[best_cat] == 0:
+        return "Other"
+    return best_cat
+
+def _spend_add_ai_categories(df: pd.DataFrame, role_map: dict) -> pd.DataFrame:
+    """Vectorised apply of categorize_spend over the SKU-description column."""
+    desc_col = _spend_get_metric_col(role_map, "sku_desc")
+    if desc_col and desc_col in df.columns:
+        df["category_ai"] = df[desc_col].apply(categorize_spend)
+    else:
+        df["category_ai"] = "Other"
+    return df
+
+
+# ── 3. Price Purchase Variance (PPV) ─────────────────────────────────────
+def compute_ppv(df: pd.DataFrame, role_map: dict,
+                market_price_col: str = "market_price") -> pd.DataFrame:
+    """
+    Join spend data with market reference prices and compute PPV.
+    If market_price_col is missing, attempt to load from global material DB.
+    Adds: ppv, ppv_pct, overpaid, savings_potential
+    """
+    df = df.copy()
+    price_col = _spend_get_metric_col(role_map, "price_metric")
+    vol_col   = _spend_get_metric_col(role_map, "volume_metric")
+
+    if not price_col or price_col not in df.columns:
+        return df
+
+    # Attempt to load market price from global material DB
+    if market_price_col not in df.columns:
+        try:
+            gm = _load_global_material_df()
+            if gm is not None and "Commodity" in gm.columns:
+                qcols = _gm_quarter_cols(gm)
+                if qcols:
+                    gm["market_price"] = gm[qcols].apply(pd.to_numeric, errors="coerce").mean(axis=1)
+                    sku_col = _spend_get_metric_col(role_map, "sku_id")
+                    if sku_col and sku_col in df.columns:
+                        mp_map = gm.set_index("Commodity")["market_price"].to_dict()
+                        df["market_price"] = df[sku_col].map(mp_map)
+        except Exception:
+            pass
+
+    if market_price_col not in df.columns or df[market_price_col].isna().all():
+        # Fallback: use rolling median per SKU as proxy market price
+        sku_col = _spend_get_metric_col(role_map, "sku_id")
+        if sku_col and sku_col in df.columns:
+            df["market_price"] = df.groupby(sku_col)[price_col].transform("median")
+        else:
+            df["market_price"] = df[price_col].median()
+
+    df["ppv"]               = pd.to_numeric(df[price_col], errors="coerce") - pd.to_numeric(df["market_price"], errors="coerce")
+    df["ppv_pct"]           = (df["ppv"] / df["market_price"].replace(0, np.nan) * 100).round(2)
+    df["overpaid"]          = df["ppv"] > 0
+
+    if vol_col and vol_col in df.columns:
+        df["savings_potential"] = (df["ppv"] * pd.to_numeric(df[vol_col], errors="coerce")).clip(lower=0)
+    else:
+        df["savings_potential"] = 0.0
+
+    return df
+
+def _spend_chart_supplier_ppv(df: pd.DataFrame, role_map: dict):
+    """Horizontal bar: total PPV savings per supplier."""
+    sup_col = _spend_get_metric_col(role_map, "supplier")
+    if not sup_col or sup_col not in df.columns or "ppv" not in df.columns:
+        return None
+    g = df.groupby(sup_col)["savings_potential"].sum().sort_values(ascending=True).tail(15)
+    if g.empty:
+        return None
+    colors = ["#e63946" if v > 0 else "#1f9d55" for v in g.values]
+    trace = dict(type="bar", orientation="h",
+                 x=g.values.tolist(), y=g.index.tolist(),
+                 marker=dict(color=colors),
+                 text=[f"${v:,.0f}" for v in g.values], textposition="outside")
+    layout = dict(title="Savings Potential by Supplier (PPV)",
+                  xaxis=dict(title="Savings Potential ($)"),
+                  yaxis=dict(automargin=True),
+                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                  font=dict(color="white", family="Outfit"),
+                  margin=dict(t=50, b=60, l=160, r=40), height=400, showlegend=False)
+    return dict(data=[trace], layout=layout)
+
+def _spend_chart_category_ppv(df: pd.DataFrame):
+    """Bar: average PPV% per category_ai."""
+    cat_col = "category_ai" if "category_ai" in df.columns else "category"
+    if cat_col not in df.columns or "ppv_pct" not in df.columns:
+        return None
+    g = df.groupby(cat_col)["ppv_pct"].mean().sort_values(ascending=False)
+    if g.empty:
+        return None
+    colors = [SPEND_CHART_COLORS[i % len(SPEND_CHART_COLORS)] for i in range(len(g))]
+    trace = dict(type="bar", x=g.index.tolist(), y=g.values.round(2).tolist(),
+                 marker=dict(color=colors),
+                 text=[f"{v:.1f}%" for v in g.values], textposition="outside")
+    layout = dict(title="Avg PPV% by Category",
+                  yaxis=dict(title="PPV %"),
+                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                  font=dict(color="white", family="Outfit"),
+                  margin=dict(t=50, b=80, l=50, r=20), height=380, showlegend=False)
+    return dict(data=[trace], layout=layout)
+
+
+# ── 4. Spend Forecasting ─────────────────────────────────────────────────
+def forecast_spend_by_category(df: pd.DataFrame, role_map: dict,
+                                periods: int = 3) -> dict:
+    """
+    Quarterly spend forecast per category.
+    Uses Prophet if available, else Holt-Winters, else linear extrapolation.
+    Returns dict of { category: { dates, forecast, lower, upper } }
+    """
+    vol_col = _spend_get_metric_col(role_map, "volume_metric")
+    cat_col = "category_ai" if "category_ai" in df.columns else "category"
+    results = {}
+
+    if not vol_col or vol_col not in df.columns:
+        return results
+    if cat_col not in df.columns:
+        return results
+    if "year" not in df.columns:
+        return results
+
+    for cat, grp in df.groupby(cat_col):
+        try:
+            ts = grp.groupby("year")[vol_col].sum().reset_index()
+            ts.columns = ["year", "volume"]
+            ts = ts.sort_values("year").dropna()
+            if len(ts) < 2:
+                continue
+
+            if _PROPHET_OK and len(ts) >= 4:
+                # Prophet path
+                ts_p = ts.rename(columns={"year": "ds", "volume": "y"})
+                ts_p["ds"] = pd.to_datetime(ts_p["ds"].astype(str) + "-01-01")
+                m = _Prophet(yearly_seasonality=False, weekly_seasonality=False,
+                             daily_seasonality=False, interval_width=0.80)
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore")
+                    m.fit(ts_p)
+                future = m.make_future_dataframe(periods=periods, freq="YE")
+                fc = m.predict(future).tail(periods)
+                results[str(cat)] = {
+                    "dates":    fc["ds"].dt.year.tolist(),
+                    "forecast": fc["yhat"].clip(lower=0).round(0).tolist(),
+                    "lower":    fc["yhat_lower"].clip(lower=0).round(0).tolist(),
+                    "upper":    fc["yhat_upper"].clip(lower=0).round(0).tolist(),
+                    "method":   "Prophet",
+                }
+            elif _STATSMODELS_OK and len(ts) >= 4:
+                # Holt-Winters path
+                model = _HW(ts["volume"].values, trend="add", initialization_method="estimated")
+                fit = model.fit(optimized=True)
+                fc_vals = fit.forecast(periods).clip(min=0)
+                last_yr = int(ts["year"].max())
+                dates = [last_yr + i + 1 for i in range(periods)]
+                results[str(cat)] = {
+                    "dates":    dates,
+                    "forecast": [round(v, 0) for v in fc_vals],
+                    "lower":    [round(v * 0.85, 0) for v in fc_vals],
+                    "upper":    [round(v * 1.15, 0) for v in fc_vals],
+                    "method":   "Holt-Winters",
+                }
+            else:
+                # Simple linear trend
+                x = np.arange(len(ts))
+                y = ts["volume"].values.astype(float)
+                if len(x) >= 2:
+                    m_val, b_val = np.polyfit(x, y, 1)
+                else:
+                    m_val, b_val = 0, y[0]
+                last_yr = int(ts["year"].max())
+                dates, forecast = [], []
+                for i in range(1, periods + 1):
+                    pred = max(0.0, m_val * (len(x) + i - 1) + b_val)
+                    dates.append(last_yr + i)
+                    forecast.append(round(pred, 0))
+                results[str(cat)] = {
+                    "dates":    dates,
+                    "forecast": forecast,
+                    "lower":    [round(v * 0.80, 0) for v in forecast],
+                    "upper":    [round(v * 1.20, 0) for v in forecast],
+                    "method":   "Linear",
+                }
+        except Exception:
+            continue
+
+    return results
+
+def _spend_chart_forecast(forecast_results: dict) -> dict:
+    """Multi-line Plotly figure for spend forecast with confidence bands."""
+    if not forecast_results:
+        return None
+    traces = []
+    colors = SPEND_CHART_COLORS
+    for i, (cat, fc) in enumerate(forecast_results.items()):
+        col = colors[i % len(colors)]
+        traces.append(dict(
+            type="scatter", mode="lines+markers",
+            x=fc["dates"], y=fc["forecast"],
+            name=cat, line=dict(color=col, width=2.5, dash="dot"),
+            marker=dict(size=7)
+        ))
+        traces.append(dict(
+            type="scatter", mode="lines", x=fc["dates"] + fc["dates"][::-1],
+            y=fc["upper"] + fc["lower"][::-1],
+            fill="toself", fillcolor=col.replace(")", ",0.12)").replace("rgb", "rgba") if col.startswith("rgb") else col + "20",
+            line=dict(width=0), showlegend=False, name=f"{cat} band"
+        ))
+    layout = dict(
+        title="Spend Forecast by Category (Next 3 Periods)",
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="white", family="Outfit"),
+        xaxis=dict(title="Year", color="white", gridcolor="rgba(255,255,255,0.08)"),
+        yaxis=dict(title="Volume", color="white", gridcolor="rgba(255,255,255,0.08)"),
+        margin=dict(t=55, b=60, l=60, r=20), height=420
+    )
+    return dict(data=traces, layout=layout)
+
+
+# ── 5. Chat-to-Spend NL Query ─────────────────────────────────────────────
+_NL_QUERY_PATTERNS = [
+    # supplier queries
+    (r"spend\s+by\s+supplier", "supplier_bar"),
+    (r"supplier\s+volume",     "supplier_bar"),
+    (r"top\s+supplier",        "supplier_bar"),
+    # category
+    (r"spend\s+by\s+categor",  "category_bar"),
+    (r"categor.*volume",       "category_bar"),
+    # price
+    (r"price\s+by\s+supplier", "price_sup"),
+    (r"price\s+by\s+categor",  "price_cat"),
+    (r"price\s+trend",         "price_trend"),
+    # SKU
+    (r"top\s+sku",             "sku_bar"),
+    (r"sku\s+volume",          "sku_bar"),
+    # PPV
+    (r"ppv",                   "supplier_ppv"),
+    (r"savings",               "supplier_ppv"),
+    (r"overpaid",              "supplier_ppv"),
+    # forecast
+    (r"forecast",              "forecast"),
+    (r"next\s+quarter",        "forecast"),
+    (r"next\s+year",           "forecast"),
+    # anomaly
+    (r"anomal",                "anomaly_table"),
+    # risk
+    (r"risk",                  "supplier_risk"),
+    (r"concentrat",            "supplier_risk"),
+    # should-cost
+    (r"should.?cost",          "should_cost"),
+    (r"gap",                   "should_cost"),
+]
+
+def _nl_extract_year(question: str):
+    """Extract 4-digit year from question string."""
+    m = re.search(r"\b(20\d{2})\b", question)
+    return int(m.group(1)) if m else None
+
+def nl_spend_query(question: str, df: pd.DataFrame, role_map: dict) -> dict:
+    """
+    Convert natural-language question into a pandas result or chart dict.
+    Returns { "chart": <plotly dict|None>, "table": <list-of-dicts|None>,
+              "summary": <str>, "chart_type": <str> }
+    """
+    q = question.lower()
+    year_filter = _nl_extract_year(q)
+
+    # Apply year filter if requested
+    working_df = df.copy()
+    if year_filter and "year" in working_df.columns:
+        working_df = working_df[working_df["year"] == year_filter]
+
+    matched_type = None
+    for pat, ctype in _NL_QUERY_PATTERNS:
+        if re.search(pat, q):
+            matched_type = ctype
+            break
+
+    # Default
+    if matched_type is None:
+        matched_type = "category_bar"
+
+    chart = None
+    table = None
+    summary = f"Showing '{matched_type}' for query: \"{question}\""
+
+    vol_col   = _spend_get_metric_col(role_map, "volume_metric")
+    price_col = _spend_get_metric_col(role_map, "price_metric")
+    sup_col   = _spend_get_metric_col(role_map, "supplier")
+    sku_col   = _spend_get_metric_col(role_map, "sku_id")
+
+    try:
+        if matched_type in ("supplier_bar", "supplier_horiz") and sup_col and vol_col:
+            chart = _spend_chart_bar(working_df, sup_col, vol_col, "Supplier Volume", horiz=True)
+        elif matched_type == "category_bar" and vol_col:
+            cat_col = "category_ai" if "category_ai" in working_df.columns else "category"
+            chart = _spend_chart_bar(working_df, cat_col, vol_col, "Volume by Category")
+        elif matched_type == "price_sup" and price_col and sup_col:
+            chart = _spend_chart_bar(working_df, sup_col, price_col, "Price by Supplier", horiz=True)
+        elif matched_type == "price_cat" and price_col:
+            cat_col = "category_ai" if "category_ai" in working_df.columns else "category"
+            chart = _spend_chart_bar(working_df, cat_col, price_col, "Price by Category")
+        elif matched_type == "price_trend" and price_col and "year" in working_df.columns:
+            chart = _spend_chart_trend(working_df, "year", sup_col or sku_col, price_col, "Price Trend")
+        elif matched_type == "sku_bar" and sku_col and vol_col:
+            chart = _spend_chart_bar(working_df, sku_col, vol_col, "Top SKUs", horiz=True)
+        elif matched_type == "supplier_ppv" and "ppv" in working_df.columns:
+            chart = _spend_chart_supplier_ppv(working_df, role_map)
+        elif matched_type == "forecast":
+            fc = forecast_spend_by_category(working_df, role_map)
+            chart = _spend_chart_forecast(fc)
+        elif matched_type == "anomaly_table" and "anomaly_flag" in working_df.columns:
+            anom = working_df[working_df["anomaly_flag"] == True]
+            table = anom.head(50).where(pd.notna(anom), None).to_dict(orient="records")
+            summary = f"Found {len(anom)} anomalous rows."
+        elif matched_type == "supplier_risk":
+            risk = compute_supplier_risk(working_df, role_map)
+            table = risk.head(20).where(pd.notna(risk), None).to_dict(orient="records")
+            summary = "Supplier concentration risk analysis."
+        elif matched_type == "should_cost" and "should_cost_gap" in working_df.columns:
+            top_gap = working_df.nlargest(20, "should_cost_gap")
+            table = top_gap.where(pd.notna(top_gap), None).to_dict(orient="records")
+            summary = "Top SKUs with highest should-cost gap."
+        else:
+            # Fallback: show category bar
+            cat_col = "category_ai" if "category_ai" in working_df.columns else "category"
+            if cat_col in working_df.columns and vol_col:
+                chart = _spend_chart_bar(working_df, cat_col, vol_col, "Volume by Category")
+    except Exception as e:
+        summary = f"Query error: {e}"
+
+    return {"chart": chart, "table": table, "summary": summary, "chart_type": matched_type}
+
+
+# ── 6. Should-Cost Gap Analysis ──────────────────────────────────────────
+def compute_should_cost_gap(df: pd.DataFrame, role_map: dict,
+                             should_cost_map: dict = None) -> pd.DataFrame:
+    """
+    Compute should_cost_gap = actual_price − calculated_should_cost per SKU.
+    should_cost_map: { sku_id → should_cost_price } (optional external dict).
+    When not provided, derives should_cost from median price per SKU (proxy).
+    Adds: should_cost, should_cost_gap, gap_pct, margin_var, material_var, conversion_var
+    """
+    df = df.copy()
+    price_col = _spend_get_metric_col(role_map, "price_metric")
+    sku_col   = _spend_get_metric_col(role_map, "sku_id")
+
+    if not price_col or price_col not in df.columns:
+        return df
+
+    actual = pd.to_numeric(df[price_col], errors="coerce")
+
+    if should_cost_map and sku_col and sku_col in df.columns:
+        df["should_cost"] = df[sku_col].map(should_cost_map)
+    elif sku_col and sku_col in df.columns:
+        # Proxy: 25th-percentile price per SKU = "efficient market" price
+        df["should_cost"] = df.groupby(sku_col)[price_col].transform(
+            lambda x: pd.to_numeric(x, errors="coerce").quantile(0.25)
+        )
+    else:
+        df["should_cost"] = actual.quantile(0.25)
+
+    sc = pd.to_numeric(df["should_cost"], errors="coerce")
+    df["should_cost_gap"] = (actual - sc).round(4)
+    df["gap_pct"]         = ((actual - sc) / sc.replace(0, np.nan) * 100).round(2)
+
+    # Decompose variance (simplified 3-bucket split)
+    gap = df["should_cost_gap"].fillna(0)
+    df["material_var"]    = (gap * 0.55).round(4)   # ~55% driven by material cost
+    df["conversion_var"]  = (gap * 0.30).round(4)   # ~30% conversion / labour
+    df["margin_var"]      = (gap * 0.15).round(4)   # ~15% margin / overhead
+
+    return df
+
+
+# ── 7. Supplier Risk Analytics ───────────────────────────────────────────
+# Country-to-geo coordinates for scatter_geo
+_COUNTRY_COORDS = {
+    "India":         (20.6, 78.9), "China":        (35.9, 104.2),
+    "USA":           (37.1, -95.7), "Germany":     (51.2, 10.5),
+    "France":        (46.2, 2.2),  "UK":           (55.4, -3.4),
+    "Japan":         (36.2, 138.3),"South Korea":  (35.9, 127.8),
+    "Indonesia":     (-0.8, 113.9),"Thailand":     (15.9, 100.9),
+    "Vietnam":       (14.1, 108.3),"Malaysia":     (4.2, 101.9),
+    "Philippines":   (13.0, 121.8),"Singapore":    (1.4, 103.8),
+    "Brazil":        (-14.2, -51.9),"Mexico":      (23.6, -102.6),
+    "Canada":        (56.1, -106.3),"Australia":   (-25.3, 133.8),
+    "Saudi Arabia":  (24.2, 45.1), "UAE":          (23.4, 53.8),
+    "Poland":        (51.9, 19.1), "Italy":        (41.9, 12.6),
+    "Spain":         (40.5, -3.7), "Turkey":       (39.0, 35.2),
+    "Russia":        (61.5, 105.3),"South Africa": (-30.6, 22.9),
+    "Egypt":         (26.8, 30.8), "Pakistan":     (30.4, 69.3),
+    "Bangladesh":    (23.7, 90.4), "Netherlands":  (52.1, 5.3),
+    "Belgium":       (50.5, 4.5),  "Sweden":       (60.1, 18.6),
+}
+
+def compute_supplier_risk(df: pd.DataFrame, role_map: dict) -> pd.DataFrame:
+    """
+    Compute supplier concentration risk.
+    Returns a DataFrame with: supplier, total_volume, supplier_share, risk_flag, country
+    """
+    sup_col   = _spend_get_metric_col(role_map, "supplier")
+    vol_col   = _spend_get_metric_col(role_map, "volume_metric")
+    plant_col = _spend_get_metric_col(role_map, "plant")
+
+    if not sup_col or not vol_col or sup_col not in df.columns or vol_col not in df.columns:
+        return pd.DataFrame()
+
+    g = df.groupby(sup_col).agg(
+        total_volume=(vol_col, "sum"),
+    ).reset_index()
+    total = g["total_volume"].sum()
+    if total == 0:
+        return g
+
+    g["supplier_share"] = (g["total_volume"] / total * 100).round(2)
+    g["risk_flag"]      = g["supplier_share"] > 80
+
+    # Try to attach country from plant/location column
+    if "country" in df.columns:
+        country_map = df.groupby(sup_col)["country"].agg(lambda x: x.mode().iloc[0] if len(x) else "Unknown")
+        g["country"] = g[sup_col].map(country_map).fillna("Unknown")
+    elif plant_col and plant_col in df.columns:
+        g["country"] = "Unknown"
+    else:
+        g["country"] = "Unknown"
+
+    return g.sort_values("supplier_share", ascending=False)
+
+def _spend_chart_geo_risk(risk_df: pd.DataFrame) -> dict:
+    """Plotly scatter_geo showing supplier spend by country."""
+    if risk_df.empty or "country" not in risk_df.columns:
+        return None
+    cg = risk_df.groupby("country").agg(
+        total_vol=("total_volume", "sum"),
+        risk_count=("risk_flag", "sum")
+    ).reset_index()
+
+    lats, lons, texts, sizes, colors_list = [], [], [], [], []
+    _max_vol = max(cg["total_vol"]) if not cg.empty else 1
+    for row in cg.to_dict('records'):
+        coords = _COUNTRY_COORDS.get(str(row["country"]))
+        if coords:
+            lats.append(coords[0]); lons.append(coords[1])
+            texts.append(f"{row['country']}<br>Volume: {_spend_fmt_vol(row['total_vol'])}")
+            sizes.append(max(8, min(40, row["total_vol"] / _max_vol * 40)))
+            colors_list.append("#e63946" if row["risk_count"] > 0 else "#E8601C")
+
+    if not lats:
+        return None
+
+    trace = dict(
+        type="scattergeo", lat=lats, lon=lons, text=texts, mode="markers",
+        marker=dict(size=sizes, color=colors_list, opacity=0.75,
+                    line=dict(width=1, color="white"))
+    )
+    layout = dict(
+        title="Supplier Geographic Risk Exposure",
+        geo=dict(showframe=False, showcoastlines=True, showcountries=True,
+                 bgcolor="rgba(0,0,0,0)", landcolor="rgba(50,50,80,0.5)",
+                 coastlinecolor="rgba(255,255,255,0.2)", countrycolor="rgba(255,255,255,0.1)"),
+        paper_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="white", family="Outfit"),
+        margin=dict(t=50, b=20, l=0, r=0), height=420
+    )
+    return dict(data=[trace], layout=layout)
+
+
+# ── 8. Anomaly Detection ──────────────────────────────────────────────────
+def detect_price_anomalies(df: pd.DataFrame, role_map: dict,
+                            threshold: float = 1.3) -> pd.DataFrame:
+    """
+    Compute rolling average price per SKU and flag anomalies.
+    price > threshold × historical_avg → anomaly_flag = True
+    """
+    df = df.copy()
+    price_col = _spend_get_metric_col(role_map, "price_metric")
+    sku_col   = _spend_get_metric_col(role_map, "sku_id")
+
+    if not price_col or price_col not in df.columns:
+        df["anomaly_flag"] = False
+        return df
+
+    prices = pd.to_numeric(df[price_col], errors="coerce")
+
+    if sku_col and sku_col in df.columns:
+        # Rolling mean per SKU (use expanding window as fallback for small groups)
+        def _rolling_mean(grp):
+            p = pd.to_numeric(grp, errors="coerce")
+            rm = p.expanding(min_periods=1).mean().shift(1)   # exclude current row
+            return rm
+
+        hist_avg = df.groupby(sku_col)[price_col].transform(_rolling_mean)
+        hist_avg = pd.to_numeric(hist_avg, errors="coerce")
+
+        # Where history is unavailable (first row), use global median
+        global_med = prices.median()
+        hist_avg = hist_avg.fillna(global_med)
+    else:
+        hist_avg = prices.expanding(min_periods=1).mean().shift(1).fillna(prices.median())
+
+    df["price_hist_avg"] = hist_avg.round(4)
+    df["anomaly_flag"]   = (prices > threshold * hist_avg) & hist_avg.notna() & prices.notna()
+    df["anomaly_score"]  = (prices / hist_avg.replace(0, np.nan)).round(3)
+
+    return df
+
+
+# ── Combined pipeline helper ──────────────────────────────────────────────
+def spend_run_ai_pipeline(df: pd.DataFrame, role_map: dict) -> pd.DataFrame:
+    """
+    Run all AI enrichment steps in sequence and return the enriched DataFrame.
+    Steps: normalise suppliers → categorise → PPV → should-cost → anomaly detection
+    """
+    sup_col = _spend_get_metric_col(role_map, "supplier")
+    df = normalize_supplier_names(df, col=sup_col)
+    df = _spend_add_ai_categories(df, role_map)
+    df = compute_ppv(df, role_map)
+    df = compute_should_cost_gap(df, role_map)
+    df = detect_price_anomalies(df, role_map)
+    return df
+
+
+# ── Spend Analytics UI HTML ────────────────────────────────────────────────
+SPEND_UI_HTML = """
+<style>
+/* ── Spend Analytics page styles ── */
+.spend-page { max-width: 1280px; margin: 0 auto; padding: 28px 24px 60px; }
+.spend-header { margin-bottom: 28px; }
+.spend-header h1 { font-size: 1.75rem; font-weight: 800; color: white; margin: 0 0 4px; }
+.spend-header p  { font-size: 0.9rem; color: rgba(255,255,255,0.6); margin: 0; }
+
+/* Tabs */
+.spend-tabs { display: flex; gap: 6px; margin-bottom: 24px; border-bottom: 1px solid rgba(255,255,255,0.12); padding-bottom: 0; }
+.spend-tab  { padding: 9px 20px; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 0.85rem;
+              font-weight: 600; color: rgba(255,255,255,0.55); background: transparent; border: none;
+              border-bottom: 2px solid transparent; transition: all .2s; }
+.spend-tab:hover   { color: white; background: rgba(255,255,255,0.05); }
+.sp-filter-bar { background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.08); border-radius: 10px; padding: 12px 18px; margin-bottom: 14px; }
+.sp-filter-sel { width: auto; min-width: 140px; padding: 6px 10px; font-size: 0.8rem; }
+.spend-tab.active  { color: var(--orange); border-bottom-color: var(--orange); background: rgba(232,96,28,0.08); }
+.spend-panel       { display: none; }
+.spend-panel.active{ display: block; }
+
+/* Cards */
+.sp-card { background: rgba(255,255,255,0.06); backdrop-filter: blur(8px);
+           border: 1px solid rgba(255,255,255,0.12); border-radius: 14px; padding: 22px 24px; margin-bottom: 20px; }
+.sp-card h3 { font-size: 1rem; font-weight: 700; color: white; margin: 0 0 16px; }
+
+/* KPI strip */
+.sp-kpi-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 14px; margin-bottom: 24px; }
+.sp-kpi      { background: rgba(255,255,255,0.07); border: 1px solid rgba(255,255,255,0.12);
+               border-radius: 10px; padding: 16px 18px; }
+.sp-kpi-lbl  { font-size: 0.7rem; color: rgba(255,255,255,0.5); text-transform: uppercase; letter-spacing: .06em; margin-bottom: 4px; }
+.sp-kpi-val  { font-size: 1.35rem; font-weight: 800; color: var(--orange); }
+
+/* Chart grid */
+.sp-chart-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; margin-bottom: 18px; }
+@media(max-width:860px){ .sp-chart-grid-2 { grid-template-columns: 1fr; } }
+
+/* Upload form */
+.sp-form-row { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; margin-bottom: 18px; }
+@media(max-width:700px){ .sp-form-row { grid-template-columns: 1fr; } }
+.sp-label    { font-size: 0.78rem; color: rgba(255,255,255,0.6); margin-bottom: 5px; display: block; }
+.sp-input, .sp-select { width: 100%; padding: 9px 12px; border-radius: 8px; border: 1px solid rgba(255,255,255,0.18);
+                         background: rgba(255,255,255,0.07); color: white; font-size: 0.88rem; font-family: Outfit,sans-serif; }
+.sp-input:focus, .sp-select:focus { outline: none; border-color: var(--orange); }
+.sp-select option { background: #1e3a8a; color: white; }
+.sp-drop-zone { border: 2px dashed rgba(255,255,255,0.25); border-radius: 12px;
+                padding: 36px 20px; text-align: center; color: rgba(255,255,255,0.55);
+                cursor: pointer; transition: all .2s; }
+.sp-drop-zone:hover, .sp-drop-zone.drag-over { border-color: var(--orange); background: rgba(232,96,28,0.06); }
+.sp-drop-zone svg { width: 36px; height: 36px; opacity: .4; margin-bottom: 10px; }
+.sp-btn { padding: 10px 22px; border-radius: 9px; border: none; cursor: pointer;
+          font-weight: 700; font-size: 0.88rem; font-family: Outfit,sans-serif; transition: all .2s; }
+.sp-btn-primary   { background: var(--orange); color: white; }
+.sp-btn-primary:hover { background: #d4541a; }
+.sp-btn-secondary { background: rgba(255,255,255,0.1); color: white; border: 1px solid rgba(255,255,255,0.2); }
+.sp-btn-secondary:hover { background: rgba(255,255,255,0.16); }
+.sp-btn-danger    { background: rgba(220,53,69,0.8); color: white; }
+.sp-btn-danger:hover { background: rgba(220,53,69,1); }
+.sp-btn:disabled  { opacity: 0.45; cursor: not-allowed; }
+
+/* Role mapping table */
+.sp-role-table { width: 100%; border-collapse: collapse; font-size: 0.84rem; }
+.sp-role-table th { color: rgba(255,255,255,0.5); font-weight: 600; text-align: left;
+                     padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.1); font-size: 0.75rem; text-transform: uppercase; }
+.sp-role-table td { padding: 8px 10px; border-bottom: 1px solid rgba(255,255,255,0.06); color: rgba(255,255,255,0.85); vertical-align: middle; }
+.sp-role-tag  { display: inline-block; padding: 2px 9px; border-radius: 5px; font-size: 0.72rem; font-weight: 600; }
+.rt-vol   { background: rgba(39,174,96,0.25);  color: #58d68d; }
+.rt-price { background: rgba(241,196,15,0.25); color: #f9e79f; }
+.rt-id    { background: rgba(52,152,219,0.25); color: #85c1e9; }
+.rt-sup   { background: rgba(142,68,173,0.25); color: #c39bd3; }
+.rt-dim   { background: rgba(255,255,255,0.1); color: rgba(255,255,255,0.55); }
+.rt-spec  { background: rgba(232,96,28,0.25);  color: #f0b27a; }
+.rt-skip  { background: rgba(255,255,255,0.05); color: rgba(255,255,255,0.3); }
+
+/* Insight cards */
+.sp-insight { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1);
+              border-radius: 10px; padding: 14px 18px; margin-bottom: 10px; }
+.sp-insight.critical { border-left: 4px solid #e63946; }
+.sp-insight.warning  { border-left: 4px solid #ffc107; }
+.sp-insight.info     { border-left: 4px solid #3b82f6; }
+.sp-insight-title  { font-weight: 700; font-size: 0.9rem; margin-bottom: 4px; }
+.sp-insight-detail { font-size: 0.83rem; color: rgba(255,255,255,0.6); }
+
+/* Dataset list */
+.sp-ds-row { display: flex; align-items: center; justify-content: space-between;
+             padding: 12px 16px; border-radius: 9px; background: rgba(255,255,255,0.05);
+             border: 1px solid rgba(255,255,255,0.08); margin-bottom: 8px; }
+.sp-ds-info  { font-size: 0.85rem; color: rgba(255,255,255,0.8); }
+.sp-ds-meta  { font-size: 0.75rem; color: rgba(255,255,255,0.4); margin-top: 2px; }
+
+/* Loading spinner */
+.sp-spinner { display: inline-block; width: 18px; height: 18px; border: 2px solid rgba(255,255,255,0.2);
+              border-top-color: var(--orange); border-radius: 50%; animation: sp-spin 0.7s linear infinite; vertical-align: middle; margin-right: 6px; }
+@keyframes sp-spin { to { transform: rotate(360deg); } }
+
+/* Empty state */
+.sp-empty { text-align: center; padding: 48px 24px; color: rgba(255,255,255,0.35); }
+.sp-empty svg { width: 52px; height: 52px; opacity: .25; margin-bottom: 14px; }
+.sp-empty p { font-size: 0.95rem; }
+
+/* AI data table */
+.sp-ai-table { width:100%; border-collapse:collapse; font-size:0.82rem; }
+.sp-ai-table th { background:rgba(232,96,28,0.15); padding:9px 12px; text-align:left;
+                   font-size:0.72rem; font-weight:800; text-transform:uppercase;
+                   letter-spacing:.5px; color:rgba(255,255,255,.7);
+                   border-bottom:2px solid rgba(232,96,28,.3); white-space:nowrap; }
+.sp-ai-table td { padding:8px 12px; border-bottom:1px solid rgba(255,255,255,.05);
+                   font-family:'JetBrains Mono',monospace; font-size:0.8rem; }
+.sp-ai-table tr:hover { background:rgba(232,96,28,.05); }
+.sp-risk-high { color:#e63946; font-weight:800; }
+.sp-risk-ok   { color:#1f9d55; }
+.sp-anom-flag { background:rgba(220,53,69,.25); border-radius:4px; padding:2px 7px;
+                color:#f1948a; font-size:.72rem; font-weight:700; }
+
+/* Chat chips */
+.sp-chip { padding:6px 14px; border-radius:20px; border:1px solid rgba(232,96,28,.4);
+           background:rgba(232,96,28,.1); color:rgba(255,255,255,.75); font-size:.78rem;
+           cursor:pointer; font-family:Outfit,sans-serif; transition:all .2s; }
+.sp-chip:hover { background:rgba(232,96,28,.25); color:white; border-color:var(--orange); }
+
+/* Chat bubble */
+.sp-chat-q { background:rgba(232,96,28,.15); border:1px solid rgba(232,96,28,.3);
+              border-radius:10px; padding:12px 16px; margin-bottom:12px; font-size:.88rem; }
+.sp-chat-a { background:rgba(255,255,255,.05); border:1px solid rgba(255,255,255,.1);
+              border-radius:10px; padding:16px; margin-bottom:16px; }
+.sp-chat-summary { font-size:.82rem; color:rgba(255,255,255,.55); margin-bottom:12px; }
+</style>
+
+<div class="spend-page">
+  <div class="spend-header">
+    <h1>Spend Analytics</h1>
+    <p>Packaging procurement intelligence — dynamic field engine, any product category</p>
+  </div>
+
+  <!-- Tabs -->
+  <!-- ── GLOBAL FILTER BAR ── -->
+  <div class="sp-filter-bar" id="sp-filter-bar" style="display:none;">
+    <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap;">
+      <span style="font-size:0.78rem;font-weight:700;text-transform:uppercase;opacity:0.5;">🔍 Filters</span>
+      <select id="sp-f-country" class="sp-select sp-filter-sel" onchange="spApplyFilters()">
+        <option value="all">All Countries</option>
+      </select>
+      <select id="sp-f-year" class="sp-select sp-filter-sel" onchange="spApplyFilters()">
+        <option value="all">All Years</option>
+      </select>
+      <select id="sp-f-category" class="sp-select sp-filter-sel" onchange="spApplyFilters()">
+        <option value="all">All Categories</option>
+      </select>
+      <select id="sp-f-supplier" class="sp-select sp-filter-sel" onchange="spApplyFilters()">
+        <option value="all">All Suppliers</option>
+      </select>
+      <button class="sp-btn sp-btn-secondary" style="padding:5px 14px;font-size:0.76rem;" onclick="spResetFilters()">✖ Clear</button>
+      <span id="sp-filter-badge" style="font-size:0.72rem;color:rgba(255,255,255,0.4);margin-left:auto;"></span>
+    </div>
+  </div>
+
+  <div class="spend-tabs" style="flex-wrap:wrap">
+    <button class="spend-tab active" onclick="spTab('upload')"> Upload Data</button>
+    <button class="spend-tab" onclick="spTab('dashboard')" id="tab-dashboard"> Dashboard</button>
+    <button class="spend-tab" onclick="spTab('supplier')"> Supplier Analysis</button>
+    <button class="spend-tab" onclick="spTab('sku')"> SKU Analysis</button>
+    <button class="spend-tab" onclick="spTab('price')"> Price Analytics</button>
+    <button class="spend-tab" onclick="spTab('ppv')"> PPV &amp; Savings</button>
+    <button class="spend-tab" onclick="spTab('forecast')"> Forecast</button>
+    <button class="spend-tab" onclick="spTab('risk')"> Supplier Risk</button>
+    <button class="spend-tab" onclick="spTab('anomaly')"> Anomalies</button>
+    <button class="spend-tab" onclick="spTab('shouldcost')"> Should-Cost Gap</button>
+    <button class="spend-tab" onclick="spTab('chat')"> Ask AI</button>
+    <button class="spend-tab" onclick="spTab('insights')"> Insights</button>
+    <button class="spend-tab" onclick="spTab('datasets')"> Data Management</button>
+  </div>
+
+  <!-- ── UPLOAD PANEL ── -->
+  <div class="spend-panel active" id="sp-panel-upload">
+    <div class="sp-card">
+      <h3>Upload Procurement Data</h3>
+      <p style="font-size:.85rem;color:rgba(255,255,255,.55);margin-bottom:18px">
+        Upload any Excel or CSV — every column is auto-classified (volume, price, SKU, supplier, specs, dimensions…).
+        No fixed schema required.
+      </p>
+      <div class="sp-form-row">
+        <div>
+          <label class="sp-label"> Country</label>
+          <input id="sp-country" class="sp-input" type="text" value="Global" placeholder="e.g. India, Global">
+        </div>
+        <div>
+          <label class="sp-label">Year</label>
+          <input id="sp-year" class="sp-input" type="number" value="2024" min="2000" max="2099">
+        </div>
+        <div>
+          <label class="sp-label"> Category</label>
+          <select id="sp-category" class="sp-select">
+            <option>Tube</option><option>Bottle</option><option>Carton</option>
+            <option>Corrugate</option><option>Pouch</option><option>Sachet</option>
+            <option>Cap/Closure</option><option>Label</option><option>Blister</option>
+            <option>Jar</option><option>Can</option><option>Wrapper</option>
+            <option>Shrink Sleeve</option><option>Tray</option><option>Clamshell</option>
+            <option>Drum</option><option>Bag</option><option>Other</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="sp-drop-zone" id="sp-drop-zone"
+           onclick="document.getElementById('sp-file-input').click()"
+           ondragover="event.preventDefault();this.classList.add('drag-over')"
+           ondragleave="this.classList.remove('drag-over')"
+           ondrop="spHandleDrop(event)">
+        <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+        <p style="margin:0;font-size:.9rem">Drop your file here or <strong style="color:var(--orange)">browse</strong></p>
+        <p style="margin:4px 0 0;font-size:.78rem">.xlsx · .xls · .csv</p>
+      </div>
+      <input type="file" id="sp-file-input" accept=".xlsx,.xls,.csv" style="display:none" onchange="spFileSelected(this)">
+    </div>
+
+    <!-- Preview + Role Mapping (shown after parse) -->
+    <div id="sp-preview-section" style="display:none">
+      <div class="sp-card">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+          <h3 style="margin:0" id="sp-preview-title">Preview</h3>
+          <span id="sp-preview-badge" style="font-size:.78rem;color:rgba(255,255,255,.5)"></span>
+        </div>
+        <div id="sp-preview-table" style="overflow-x:auto;max-height:260px;overflow-y:auto"></div>
+      </div>
+
+      <div class="sp-card">
+        <h3>Column Classification</h3>
+        <p style="font-size:.82rem;color:rgba(255,255,255,.5);margin-bottom:14px">
+          Auto-detected roles. Adjust if needed before importing.
+        </p>
+        <div id="sp-role-table-wrap" style="overflow-x:auto"></div>
+        <div style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap">
+          <button class="sp-btn sp-btn-primary" id="sp-store-btn" onclick="spStoreData()">
+            ✅ Clean &amp; Store Data
+          </button>
+          <button class="sp-btn sp-btn-secondary" onclick="spResetUpload()">✖ Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── DASHBOARD PANEL ── -->
+  <div class="spend-panel" id="sp-panel-dashboard">
+    <div id="sp-kpi-strip" class="sp-kpi-grid"></div>
+    <div class="sp-chart-grid-2">
+      <div class="sp-card"><h3>Volume by Category</h3><div id="sp-ch-cat-bar" style="height:330px"></div></div>
+      <div class="sp-card"><h3>Category Mix</h3><div id="sp-ch-cat-donut" style="height:330px"></div></div>
+    </div>
+    <div class="sp-chart-grid-2">
+      <div class="sp-card"><h3>Top Suppliers</h3><div id="sp-ch-sup-bar" style="height:330px"></div></div>
+      <div class="sp-card"><h3>Volume by Plant</h3><div id="sp-ch-plant-bar" style="height:330px"></div></div>
+    </div>
+  </div>
+
+  <!-- ── SUPPLIER ANALYSIS ── -->
+  <div class="spend-panel" id="sp-panel-supplier">
+    <div class="sp-chart-grid-2">
+      <div class="sp-card"><h3>Supplier Volume (Bar)</h3><div id="sp-ch-sup-h" style="height:360px"></div></div>
+      <div class="sp-card"><h3>Supplier Share (Donut)</h3><div id="sp-ch-sup-donut" style="height:360px"></div></div>
+    </div>
+    <div class="sp-card"><h3>Supplier × Category Heatmap</h3><div id="sp-ch-sup-heat" style="height:420px"></div></div>
+    <div class="sp-card"><h3>YoY Volume per Supplier</h3><div id="sp-ch-sup-trend" style="height:380px"></div></div>
+  </div>
+
+  <!-- ── SKU ANALYSIS ── -->
+  <div class="spend-panel" id="sp-panel-sku">
+    <div class="sp-chart-grid-2">
+      <div class="sp-card"><h3>Top SKUs by Volume</h3><div id="sp-ch-sku-bar" style="height:360px"></div></div>
+      <div class="sp-card"><h3>SKU Mix</h3><div id="sp-ch-sku-donut" style="height:360px"></div></div>
+    </div>
+    <div class="sp-card"><h3>SKU × Supplier Heatmap</h3><div id="sp-ch-sku-heat" style="height:420px"></div></div>
+  </div>
+
+  <!-- ── PRICE ANALYTICS ── -->
+  <div class="spend-panel" id="sp-panel-price">
+    <div class="sp-card"><h3>Price Distribution by SKU (Box Plot)</h3><div id="sp-ch-price-box" style="height:400px"></div></div>
+    <div class="sp-chart-grid-2">
+      <div class="sp-card"><h3>Avg Price by Supplier</h3><div id="sp-ch-price-sup" style="height:360px"></div></div>
+      <div class="sp-card"><h3>Avg Price by Category</h3><div id="sp-ch-price-cat" style="height:360px"></div></div>
+    </div>
+    <div class="sp-card"><h3>YoY Price Trend</h3><div id="sp-ch-price-trend" style="height:380px"></div></div>
+  </div>
+
+  <!-- ── INSIGHTS ── -->
+  <div class="spend-panel" id="sp-panel-insights">
+    <div id="sp-insights-kpis" class="sp-kpi-grid" style="margin-bottom:18px"></div>
+    <div id="sp-insights-list"></div>
+  </div>
+
+  <!-- ── DATA MANAGEMENT ── -->
+  <div class="spend-panel" id="sp-panel-datasets">
+    <div id="sp-datasets-kpis" class="sp-kpi-grid" style="margin-bottom:18px"></div>
+    <div class="sp-card" id="sp-datasets-list">
+      <h3>Stored Datasets</h3>
+      <div id="sp-ds-rows"></div>
+    </div>
+    <div style="margin-top:16px;display:flex;gap:10px">
+      <button class="sp-btn sp-btn-danger" onclick="spClearDB()">⚠️ Clear All Data</button>
+    </div>
+  </div>
+
+  <!-- ══════════════════════════════════════════════════════════════
+       NEW AI PANELS
+  ══════════════════════════════════════════════════════════════ -->
+
+  <!-- ── PPV & SAVINGS ── -->
+  <div class="spend-panel" id="sp-panel-ppv">
+    <div id="sp-ppv-kpis" class="sp-kpi-grid"></div>
+    <div class="sp-chart-grid-2">
+      <div class="sp-card"><h3> Savings Potential by Supplier</h3><div id="sp-ch-ppv-sup" style="height:380px"></div></div>
+      <div class="sp-card"><h3> Avg PPV% by Category</h3><div id="sp-ch-ppv-cat" style="height:380px"></div></div>
+    </div>
+    <div class="sp-card">
+      <h3> Top Overpaid Rows</h3>
+      <div id="sp-ppv-table" style="overflow-x:auto;max-height:340px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- ── FORECAST ── -->
+  <div class="spend-panel" id="sp-panel-forecast">
+    <div class="sp-card" style="margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <label class="sp-label" style="margin:0">Forecast periods:</label>
+        <select id="sp-fc-periods" class="sp-select" style="width:120px">
+          <option value="3" selected>3 years</option>
+          <option value="5">5 years</option>
+          <option value="2">2 years</option>
+        </select>
+        <button class="sp-btn sp-btn-primary" onclick="spLoadForecast(true)"> Run Forecast</button>
+        <span id="sp-fc-method" style="font-size:.78rem;color:rgba(255,255,255,.45)"></span>
+      </div>
+    </div>
+    <div class="sp-card"><h3>Spend Forecast by Category</h3><div id="sp-ch-forecast" style="height:420px"></div></div>
+    <div id="sp-fc-table-wrap"></div>
+  </div>
+
+  <!-- ── SUPPLIER RISK ── -->
+  <div class="spend-panel" id="sp-panel-risk">
+    <div id="sp-risk-kpis" class="sp-kpi-grid"></div>
+    <div class="sp-card"><h3> Geographic Risk Exposure</h3><div id="sp-ch-geo" style="height:420px"></div></div>
+    <div class="sp-card">
+      <h3> Supplier Concentration Table</h3>
+      <p style="font-size:.82rem;color:rgba(255,255,255,.45);margin:0 0 14px">
+        Suppliers with share &gt;80% are flagged as high-risk.
+      </p>
+      <div id="sp-risk-table" style="overflow-x:auto;max-height:380px;overflow-y:auto"></div>
+    </div>
+  </div>
+
+  <!-- ── ANOMALIES ── -->
+  <div class="spend-panel" id="sp-panel-anomaly">
+    <div class="sp-card" style="margin-bottom:14px">
+      <div style="display:flex;align-items:center;gap:14px;flex-wrap:wrap">
+        <label class="sp-label" style="margin:0">Flag threshold (×avg):</label>
+        <input id="sp-anom-thresh" class="sp-input" type="number" step="0.05" value="1.3" min="1.0" max="5.0" style="width:100px">
+        <button class="sp-btn sp-btn-primary" onclick="spLoadAnomalies(true)"> Detect Anomalies</button>
+      </div>
+    </div>
+    <div id="sp-anom-kpis" class="sp-kpi-grid"></div>
+    <div class="sp-chart-grid-2">
+      <div class="sp-card"><h3> Anomalies by Supplier</h3><div id="sp-ch-anom-bar" style="height:360px"></div></div>
+      <div class="sp-card">
+        <h3> Anomalous Rows</h3>
+        <div id="sp-anom-table" style="overflow-x:auto;max-height:320px;overflow-y:auto"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- ── SHOULD-COST GAP ── -->
+  <div class="spend-panel" id="sp-panel-shouldcost">
+    <div id="sp-sc-kpis" class="sp-kpi-grid"></div>
+    <div class="sp-card">
+      <h3> Top SKUs — Should-Cost Gap</h3>
+      <p style="font-size:.82rem;color:rgba(255,255,255,.45);margin:0 0 14px">
+        Gap = actual price − should-cost (25th percentile benchmark). Decomposed into Material / Conversion / Margin variance.
+      </p>
+      <div id="sp-sc-table" style="overflow-x:auto;max-height:420px;overflow-y:auto"></div>
+    </div>
+    <div class="sp-card"><h3> Gap Distribution by SKU</h3><div id="sp-ch-sc-bar" style="height:380px"></div></div>
+  </div>
+
+  <!-- ── CHAT / ASK AI ── -->
+  <div class="spend-panel" id="sp-panel-chat">
+    <div class="sp-card">
+      <h3>Ask Your Spend Data</h3>
+      <p style="font-size:.84rem;color:rgba(255,255,255,.5);margin:0 0 16px">
+        Type a question in plain English. Examples: <em>"Show spend by supplier in 2024"</em> · <em>"Top SKUs by volume"</em> · <em>"Which suppliers are overpaid?"</em> · <em>"Show forecast"</em> · <em>"Anomaly count"</em>
+      </p>
+      <div style="display:flex;gap:10px">
+        <input id="sp-chat-input" class="sp-input" type="text" placeholder="Ask a question about your spend data…"
+               onkeydown="if(event.key==='Enter')spAskAI()"
+               style="flex:1">
+        <button class="sp-btn sp-btn-primary" onclick="spAskAI()">Ask →</button>
+      </div>
+      <div style="margin-top:12px;display:flex;flex-wrap:wrap;gap:8px" id="sp-chat-chips">
+        <button class="sp-chip" onclick="spChip('Show spend by supplier')">Spend by supplier</button>
+        <button class="sp-chip" onclick="spChip('Top SKUs by volume')"> Top SKUs</button>
+        <button class="sp-chip" onclick="spChip('Show PPV savings')"> PPV savings</button>
+        <button class="sp-chip" onclick="spChip('Price trend by supplier')"> Price trend</button>
+        <button class="sp-chip" onclick="spChip('Show anomalies')"> Anomalies</button>
+        <button class="sp-chip" onclick="spChip('Supplier risk concentration')"> Risk</button>
+        <button class="sp-chip" onclick="spChip('Show forecast')"> Forecast</button>
+        <button class="sp-chip" onclick="spChip('Show should cost gap')"> Should-cost</button>
+      </div>
+    </div>
+    <div id="sp-chat-result"></div>
+  </div>
+
+</div><!-- end .spend-page -->
+
+<script>
+// ═══════════════════════ SPEND ANALYTICS JS ════════════════════════════════
+const SP = {
+  parsedData: null,    // {columns, preview, roles, filename}
+  chartsLoaded: {},    // track which panels have loaded charts
+  filters: { country: 'all', year: 'all', category: 'all', supplier: 'all' },
+};
+
+// ── Filter Management ────────────────────────────────────────────────────
+async function spLoadFilterOptions() {
+  try {
+    const r = await fetch('/api/spend/filter_options');
+    if (!r.ok) return;
+    const d = await r.json();
+    const bar = document.getElementById('sp-filter-bar');
+    const hasData = (d.countries.length + d.years.length + d.categories.length + d.suppliers.length) > 0;
+    bar.style.display = hasData ? 'block' : 'none';
+    _spPopSel('sp-f-country', d.countries, 'All Countries');
+    _spPopSel('sp-f-year', d.years, 'All Years');
+    _spPopSel('sp-f-category', d.categories, 'All Categories');
+    _spPopSel('sp-f-supplier', d.suppliers, 'All Suppliers');
+  } catch(e) { console.warn('Filter load fail', e); }
+}
+function _spPopSel(id, items, allLabel) {
+  const sel = document.getElementById(id);
+  if (!sel) return;
+  const cur = sel.value;
+  sel.innerHTML = '<option value="all">' + allLabel + '</option>' +
+    items.map(v => '<option value="' + v + '">' + v + '</option>').join('');
+  if (cur && cur !== 'all') sel.value = cur;
+}
+function _spFilterQS() {
+  const p = new URLSearchParams();
+  if (SP.filters.country !== 'all') p.set('country', SP.filters.country);
+  if (SP.filters.year !== 'all') p.set('year', SP.filters.year);
+  if (SP.filters.category !== 'all') p.set('category', SP.filters.category);
+  if (SP.filters.supplier !== 'all') p.set('supplier', SP.filters.supplier);
+  const qs = p.toString();
+  return qs ? '?' + qs : '';
+}
+function _spFilterQSAmp() {
+  const qs = _spFilterQS();
+  return qs ? '&' + qs.substring(1) : '';
+}
+function spApplyFilters() {
+  SP.filters.country  = document.getElementById('sp-f-country').value;
+  SP.filters.year     = document.getElementById('sp-f-year').value;
+  SP.filters.category = document.getElementById('sp-f-category').value;
+  SP.filters.supplier = document.getElementById('sp-f-supplier').value;
+  // Count active filters
+  const active = Object.values(SP.filters).filter(v => v !== 'all').length;
+  document.getElementById('sp-filter-badge').textContent = active > 0 ? active + ' filter(s) active' : '';
+  // Force reload of all loaded panels
+  SP.chartsLoaded = {};
+  // Reload the active panel
+  const activePanel = document.querySelector('.spend-panel.active');
+  if (activePanel) {
+    const name = activePanel.id.replace('sp-panel-', '');
+    SP.chartsLoaded[name] = true;
+    if (name === 'dashboard')  spLoadDashboard();
+    if (name === 'supplier')   spLoadSupplier();
+    if (name === 'sku')        spLoadSKU();
+    if (name === 'price')      spLoadPrice();
+    if (name === 'insights')   spLoadInsights();
+    if (name === 'datasets')   spLoadDatasets();
+    if (name === 'ppv')        spLoadPPV();
+    if (name === 'forecast')   spLoadForecast(false);
+    if (name === 'risk')       spLoadRisk();
+    if (name === 'anomaly')    spLoadAnomalies(false);
+    if (name === 'shouldcost') spLoadShouldCost();
+  }
+}
+function spResetFilters() {
+  document.getElementById('sp-f-country').value = 'all';
+  document.getElementById('sp-f-year').value = 'all';
+  document.getElementById('sp-f-category').value = 'all';
+  document.getElementById('sp-f-supplier').value = 'all';
+  spApplyFilters();
+}
+
+// ── Tab switching ─────────────────────────────────────────────────────────
+function spTab(name) {
+  document.querySelectorAll('.spend-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.spend-panel').forEach(p => p.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+  document.getElementById('sp-panel-' + name).classList.add('active');
+  // Lazy-load charts on first visit
+  if (!SP.chartsLoaded[name]) {
+    SP.chartsLoaded[name] = true;
+    if (name === 'dashboard')  spLoadDashboard();
+    if (name === 'supplier')   spLoadSupplier();
+    if (name === 'sku')        spLoadSKU();
+    if (name === 'price')      spLoadPrice();
+    if (name === 'insights')   spLoadInsights();
+    if (name === 'datasets')   spLoadDatasets();
+  }
+}
+
+// ── File handling ─────────────────────────────────────────────────────────
+function spHandleDrop(e) {
+  e.preventDefault();
+  document.getElementById('sp-drop-zone').classList.remove('drag-over');
+  const file = e.dataTransfer.files[0];
+  if (file) spParseFile(file);
+}
+function spFileSelected(input) {
+  if (input.files[0]) spParseFile(input.files[0]);
+}
+async function spParseFile(file) {
+  const zone = document.getElementById('sp-drop-zone');
+  zone.innerHTML = '<span class="sp-spinner"></span> Parsing file…';
+  const fd = new FormData();
+  fd.append('file', file);
+  try {
+    const r = await fetch('/api/spend/upload', {method:'POST', body: fd});
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Parse failed');
+    SP.parsedData = d;
+    spRenderPreview(d);
+  } catch(e) {
+    zone.innerHTML = `<p style="color:#e63946">❌ ${e.message}</p>`;
+    zone.onclick = () => document.getElementById('sp-file-input').click();
+  }
+}
+
+function spRenderPreview(d) {
+  document.getElementById('sp-drop-zone').innerHTML =
+    `<p style="color:rgba(255,255,255,.6)"> <strong style="color:white">${d.filename}</strong> — ${d.total_rows.toLocaleString()} rows × ${d.columns.length} columns</p>`;
+  document.getElementById('sp-preview-section').style.display = 'block';
+  document.getElementById('sp-preview-badge').textContent = `${d.total_rows.toLocaleString()} rows detected`;
+  document.getElementById('sp-preview-title').textContent = 'Preview — ' + d.filename;
+
+  // Build preview table
+  if (d.preview && d.preview.length) {
+    let th = '<tr>' + d.columns.map(c => `<th style="white-space:nowrap;padding:6px 10px;border-bottom:1px solid rgba(255,255,255,.1);color:rgba(255,255,255,.55);font-size:.75rem">${c}</th>`).join('') + '</tr>';
+    let rows = d.preview.map(row =>
+      '<tr>' + d.columns.map(c => `<td style="padding:5px 10px;border-bottom:1px solid rgba(255,255,255,.04);font-size:.8rem;white-space:nowrap;max-width:160px;overflow:hidden;text-overflow:ellipsis">${row[c] !== null && row[c] !== undefined ? row[c] : ''}</td>`).join('') + '</tr>'
+    ).join('');
+    document.getElementById('sp-preview-table').innerHTML =
+      `<table style="border-collapse:collapse;width:100%"><thead>${th}</thead><tbody>${rows}</tbody></table>`;
+  }
+
+  // Build role mapping table
+  const roleCssMap = {
+    volume_metric:'rt-vol', price_metric:'rt-price', value_metric:'rt-price',
+    sku_id:'rt-id', sku_desc:'rt-id', supplier:'rt-sup', plant:'rt-sup',
+    dimension:'rt-dim', spec:'rt-spec', skip:'rt-skip'
+  };
+  const roleOptions = ['volume_metric','price_metric','value_metric','sku_id','sku_desc',
+                       'supplier','plant','dimension','spec','skip'];
+  let thead = `<tr><th>Column</th><th>Detected Role</th><th>Override</th><th>Sample Values</th></tr>`;
+  let tbody = d.columns.map((col, i) => {
+    const role = d.roles[col] || 'dimension';
+    const css  = roleCssMap[role] || 'rt-dim';
+    const samp = (d.samples[col] || []).slice(0,3).join(' | ');
+    const opts = roleOptions.map(r =>
+      `<option value="${r}" ${r===role?'selected':''}>${r.replace('_',' ')}</option>`).join('');
+    return `<tr>
+      <td style="font-weight:600">${col}</td>
+      <td><span class="sp-role-tag ${css}">${role.replace('_',' ')}</span></td>
+      <td><select id="sp-role-${i}" data-col="${col}" class="sp-select" style="padding:5px 8px;font-size:.78rem">
+        ${opts}
+      </select></td>
+      <td style="color:rgba(255,255,255,.45);font-size:.78rem">${samp}</td>
+    </tr>`;
+  }).join('');
+  document.getElementById('sp-role-table-wrap').innerHTML =
+    `<table class="sp-role-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>`;
+}
+
+async function spStoreData() {
+  if (!SP.parsedData) return;
+  const btn = document.getElementById('sp-store-btn');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="sp-spinner"></span> Running AI pipeline & storing…';
+
+  // Collect overridden roles
+  const overrides = {};
+  document.querySelectorAll('[id^="sp-role-"]').forEach(sel => {
+    overrides[sel.dataset.col] = sel.value;
+  });
+
+  const payload = {
+    filename: SP.parsedData.filename,
+    country:  document.getElementById('sp-country').value || 'Global',
+    year:     parseInt(document.getElementById('sp-year').value) || 2024,
+    category: document.getElementById('sp-category').value,
+    roles:    overrides,
+  };
+
+  try {
+    // Use the AI-enriched store endpoint
+    const r = await fetch('/api/spend/store_ai', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(payload)
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Store failed');
+    spResetUpload();
+    SP.chartsLoaded = {};  // invalidate chart cache so next visit reloads
+    spLoadFilterOptions();  // refresh filter dropdown options
+    const ai = d.ai_summary || {};
+    let msg = `✅ ${d.rows.toLocaleString()} rows stored with AI enrichment!\n`;
+    if (ai.anomaly_count)         msg += ` ${ai.anomaly_count} price anomalies flagged\n`;
+    if (ai.ppv_savings_potential) msg += ` $${Number(ai.ppv_savings_potential).toLocaleString()} savings potential identified`;
+    alert(msg);
+  } catch(e) {
+    alert('❌ ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = 'Clean & Store Data';
+  }
+}
+
+function spResetUpload() {
+  SP.parsedData = null;
+  document.getElementById('sp-file-input').value = '';
+  document.getElementById('sp-preview-section').style.display = 'none';
+  const zone = document.getElementById('sp-drop-zone');
+  zone.onclick = () => document.getElementById('sp-file-input').click();
+  zone.innerHTML = `
+    <svg fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"/></svg>
+    <p style="margin:0;font-size:.9rem">Drop your file here or <strong style="color:var(--orange)">browse</strong></p>
+    <p style="margin:4px 0 0;font-size:.78rem">.xlsx · .xls · .csv</p>`;
+}
+
+// ── Chart rendering helpers ───────────────────────────────────────────────
+async function spFetchChart(endpoint) {
+  const sep = endpoint.includes('?') ? '&' : '?';
+  const fqs = _spFilterQS().substring(1);
+  const url = fqs ? endpoint + sep + fqs : endpoint;
+  const r = await fetch(url);
+  if (!r.ok) return null;
+  const d = await r.json();
+  return d.chart || null;
+}
+
+function spPlot(divId, chart) {
+  const el = document.getElementById(divId);
+  if (!el) return;
+  if (!chart) {
+    el.innerHTML = '<div class="sp-empty"><p>No data available for this chart.</p></div>';
+    return;
+  }
+  const cfg = {responsive: true, displayModeBar: false};
+  Plotly.newPlot(divId, chart.data, chart.layout, cfg);
+}
+
+function spRenderKpis(kpis, containerId) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = Object.values(kpis).map(k =>
+    `<div class="sp-kpi"><div class="sp-kpi-lbl">${k.label}</div><div class="sp-kpi-val">${k.value}</div></div>`
+  ).join('');
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────
+async function spLoadDashboard() {
+  const kpiR = await fetch('/api/spend/data?summary=1' + _spFilterQSAmp());
+  if (kpiR.ok) { const d = await kpiR.json(); spRenderKpis(d.kpis || {}, 'sp-kpi-strip'); }
+  const charts = [
+    ['/api/spend/chart/category_bar',  'sp-ch-cat-bar'],
+    ['/api/spend/chart/category_donut','sp-ch-cat-donut'],
+    ['/api/spend/chart/supplier_bar',  'sp-ch-sup-bar'],
+    ['/api/spend/chart/plant_bar',     'sp-ch-plant-bar'],
+  ];
+  for (const [url, id] of charts) { spPlot(id, await spFetchChart(url)); }
+}
+
+async function spLoadSupplier() {
+  const charts = [
+    ['/api/spend/chart/supplier_horiz', 'sp-ch-sup-h'],
+    ['/api/spend/chart/supplier_donut', 'sp-ch-sup-donut'],
+    ['/api/spend/chart/supplier_cat_heat','sp-ch-sup-heat'],
+    ['/api/spend/chart/supplier_trend', 'sp-ch-sup-trend'],
+  ];
+  for (const [url, id] of charts) { spPlot(id, await spFetchChart(url)); }
+}
+
+async function spLoadSKU() {
+  const charts = [
+    ['/api/spend/chart/sku_bar',  'sp-ch-sku-bar'],
+    ['/api/spend/chart/sku_donut','sp-ch-sku-donut'],
+    ['/api/spend/chart/sku_sup_heat','sp-ch-sku-heat'],
+  ];
+  for (const [url, id] of charts) { spPlot(id, await spFetchChart(url)); }
+}
+
+async function spLoadPrice() {
+  const charts = [
+    ['/api/spend/chart/price_box',  'sp-ch-price-box'],
+    ['/api/spend/chart/price_sup',  'sp-ch-price-sup'],
+    ['/api/spend/chart/price_cat',  'sp-ch-price-cat'],
+    ['/api/spend/chart/price_trend','sp-ch-price-trend'],
+  ];
+  for (const [url, id] of charts) { spPlot(id, await spFetchChart(url)); }
+}
+
+async function spLoadInsights() {
+  const kpiR = await fetch('/api/spend/data?summary=1' + _spFilterQSAmp());
+  if (kpiR.ok) { const d = await kpiR.json(); spRenderKpis(d.kpis || {}, 'sp-insights-kpis'); }
+  const r = await fetch('/api/spend/insights' + _spFilterQS());
+  const list = document.getElementById('sp-insights-list');
+  if (!r.ok) { list.innerHTML = '<p style="color:rgba(255,255,255,.4)">Could not load insights.</p>'; return; }
+  const d = await r.json();
+  if (!d.insights || !d.insights.length) {
+    list.innerHTML = '<p style="color:rgba(255,255,255,.4)">No data yet — upload a file first.</p>'; return;
+  }
+  list.innerHTML = d.insights.map(ins =>
+    `<div class="sp-insight ${ins.sev}">
+      <div class="sp-insight-title">${ins.icon} ${ins.title}</div>
+      <div class="sp-insight-detail">${ins.detail}</div>
+    </div>`
+  ).join('');
+}
+
+async function spLoadDatasets() {
+  const kpiR = await fetch('/api/spend/data?summary=1' + _spFilterQSAmp());
+  if (kpiR.ok) { const d = await kpiR.json(); spRenderKpis(d.kpis || {}, 'sp-datasets-kpis'); }
+  const r = await fetch('/api/spend/datasets' + _spFilterQS());
+  const wrap = document.getElementById('sp-ds-rows');
+  if (!r.ok) { wrap.innerHTML = '<p style="color:rgba(255,255,255,.4)">Could not load datasets.</p>'; return; }
+  const d = await r.json();
+  if (!d.datasets || !d.datasets.length) {
+    wrap.innerHTML = '<p style="color:rgba(255,255,255,.4)">No datasets stored yet.</p>'; return;
+  }
+  wrap.innerHTML = d.datasets.map(ds =>
+    `<div class="sp-ds-row">
+      <div>
+        <div class="sp-ds-info"> ${ds.source_file}</div>
+        <div class="sp-ds-meta">${ds.row_count.toLocaleString()} rows · ${ds.category} · ${ds.country} · ${ds.year} · uploaded ${ds.uploaded_at}</div>
+      </div>
+      <button class="sp-btn sp-btn-danger" style="padding:6px 14px;font-size:.78rem" onclick="spDeleteDataset(${ds.id}, this)">🗑️</button>
+    </div>`
+  ).join('');
+}
+
+async function spDeleteDataset(id, btn) {
+  if (!confirm('Delete this dataset?')) return;
+  btn.disabled = true;
+  const r = await fetch('/api/spend/dataset/' + id, {method:'DELETE'});
+  if (r.ok) {
+    SP.chartsLoaded = {};
+    spLoadDatasets();
+  } else {
+    alert('Delete failed');
+    btn.disabled = false;
+  }
+}
+
+async function spClearDB() {
+  if (!confirm('Clear ALL spend analytics data? This cannot be undone.')) return;
+  const r = await fetch('/api/spend/clear', {method:'POST'});
+  if (r.ok) { SP.chartsLoaded = {}; spLoadDatasets(); }
+}
+
+// ── Extend spTab to handle new panels ─────────────────────────────────────
+const _spTabOrig = spTab;
+function spTab(name) {
+  document.querySelectorAll('.spend-tab').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.spend-panel').forEach(p => p.classList.remove('active'));
+  event.currentTarget.classList.add('active');
+  const panel = document.getElementById('sp-panel-' + name);
+  if (panel) panel.classList.add('active');
+  if (!SP.chartsLoaded[name]) {
+    SP.chartsLoaded[name] = true;
+    if (name === 'dashboard')  spLoadDashboard();
+    if (name === 'supplier')   spLoadSupplier();
+    if (name === 'sku')        spLoadSKU();
+    if (name === 'price')      spLoadPrice();
+    if (name === 'insights')   spLoadInsights();
+    if (name === 'datasets')   spLoadDatasets();
+    if (name === 'ppv')        spLoadPPV();
+    if (name === 'forecast')   spLoadForecast(false);
+    if (name === 'risk')       spLoadRisk();
+    if (name === 'anomaly')    spLoadAnomalies(false);
+    if (name === 'shouldcost') spLoadShouldCost();
+  }
+}
+
+// ── Generic table renderer ─────────────────────────────────────────────────
+function spRenderTable(rows, containerId, flagCol, flagVal) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  if (!rows || !rows.length) {
+    el.innerHTML = '<p style="color:rgba(255,255,255,.4);padding:12px">No data available.</p>';
+    return;
+  }
+  const cols = Object.keys(rows[0]);
+  const thead = '<tr>' + cols.map(c => `<th>${c.replace(/_/g,' ')}</th>`).join('') + '</tr>';
+  const tbody = rows.map(row => {
+    const isFlag = flagCol && row[flagCol] === flagVal;
+    return '<tr>' + cols.map(c => {
+      let v = row[c];
+      if (v === null || v === undefined) v = '';
+      if (typeof v === 'number') v = v.toLocaleString(undefined, {maximumFractionDigits:3});
+      if (c === flagCol && v) return `<td><span class="sp-anom-flag">⚠ FLAGGED</span></td>`;
+      if (c === 'risk_flag') return `<td class="${v ? 'sp-risk-high' : 'sp-risk-ok'}">${v ? '🔴 High Risk' : '✅ Normal'}</td>`;
+      return `<td>${v}</td>`;
+    }).join('') + '</tr>';
+  }).join('');
+  el.innerHTML = `<table class="sp-ai-table"><thead>${thead}</thead><tbody>${tbody}</tbody></table>`;
+}
+
+// ── PPV & Savings ──────────────────────────────────────────────────────────
+async function spLoadPPV() {
+  const el = document.getElementById('sp-ppv-kpis');
+  el.innerHTML = '<div class="sp-kpi"><div class="sp-kpi-lbl">Loading…</div></div>';
+  try {
+    const r = await fetch('/api/spend/ppv' + _spFilterQS());
+    const d = await r.json();
+    if (d.empty) { el.innerHTML = '<p style="color:rgba(255,255,255,.4)">No data loaded.</p>'; return; }
+
+    el.innerHTML = `
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Total Savings Potential</div><div class="sp-kpi-val">$${Number(d.total_savings_potential||0).toLocaleString(undefined,{maximumFractionDigits:0})}</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Overpaid Rows</div><div class="sp-kpi-val" style="color:#e63946">${Number(d.overpaid_row_pct||0).toFixed(1)}%</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Overpaid Records</div><div class="sp-kpi-val">${(d.top_overpaid||[]).length ? d.top_overpaid.length + ' shown' : '0'}</div></div>
+    `;
+    spPlot('sp-ch-ppv-sup', (d.charts||{}).supplier_ppv);
+    spPlot('sp-ch-ppv-cat', (d.charts||{}).category_ppv);
+    spRenderTable(d.top_overpaid || [], 'sp-ppv-table', 'overpaid', true);
+  } catch(e) {
+    el.innerHTML = `<p style="color:#e63946">Error: ${e.message}</p>`;
+  }
+}
+
+// ── Forecast ──────────────────────────────────────────────────────────────
+async function spLoadForecast(force) {
+  const periods = document.getElementById('sp-fc-periods')?.value || 3;
+  const chartEl = document.getElementById('sp-ch-forecast');
+  if (!force && chartEl && chartEl.querySelector('.js-plotly-plot')) return;
+  if (chartEl) chartEl.innerHTML = '<div style="padding:40px;text-align:center"><span class="sp-spinner"></span> Computing forecast…</div>';
+
+  try {
+    const r = await fetch(`/api/spend/forecast?periods=${periods}` + _spFilterQSAmp());
+    const d = await r.json();
+    if (d.empty) { chartEl.innerHTML = '<p style="color:rgba(255,255,255,.4);padding:20px">No data loaded.</p>'; return; }
+    spPlot('sp-ch-forecast', d.chart);
+    const m = document.getElementById('sp-fc-method');
+    if (m) m.textContent = d.method ? `Method: ${d.method}` : '';
+
+    // Table of forecast numbers
+    const wrap = document.getElementById('sp-fc-table-wrap');
+    if (wrap && d.results) {
+      const rows = [];
+      for (const [cat, fc] of Object.entries(d.results)) {
+        fc.dates.forEach((yr, i) => rows.push({Category:cat, Year:yr,
+          Forecast:Math.round(fc.forecast[i]).toLocaleString(),
+          Lower:Math.round(fc.lower[i]).toLocaleString(),
+          Upper:Math.round(fc.upper[i]).toLocaleString()}));
+      }
+      wrap.innerHTML = '<div class="sp-card"><h3> Forecast Numbers</h3><div id="sp-fc-num-table" style="overflow-x:auto;max-height:300px;overflow-y:auto"></div></div>';
+      spRenderTable(rows, 'sp-fc-num-table');
+    }
+  } catch(e) {
+    if (chartEl) chartEl.innerHTML = `<p style="color:#e63946;padding:20px">Error: ${e.message}</p>`;
+  }
+}
+
+// ── Supplier Risk ─────────────────────────────────────────────────────────
+async function spLoadRisk() {
+  const kpiEl = document.getElementById('sp-risk-kpis');
+  kpiEl.innerHTML = '<div class="sp-kpi"><div class="sp-kpi-lbl">Loading…</div></div>';
+  try {
+    const r = await fetch('/api/spend/risk' + _spFilterQS());
+    const d = await r.json();
+    if (d.empty) { kpiEl.innerHTML = '<p style="color:rgba(255,255,255,.4)">No data loaded.</p>'; return; }
+
+    kpiEl.innerHTML = `
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Suppliers Analysed</div><div class="sp-kpi-val">${(d.risk_suppliers||[]).length}</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">High-Risk Suppliers</div><div class="sp-kpi-val" style="color:#e63946">${d.flagged_count||0}</div></div>
+    `;
+    spPlot('sp-ch-geo', (d.charts||{}).geo_spend_map);
+    spRenderTable(d.risk_suppliers || [], 'sp-risk-table', 'risk_flag', true);
+  } catch(e) {
+    kpiEl.innerHTML = `<p style="color:#e63946">Error: ${e.message}</p>`;
+  }
+}
+
+// ── Anomaly Detection ─────────────────────────────────────────────────────
+async function spLoadAnomalies(force) {
+  const thresh = document.getElementById('sp-anom-thresh')?.value || 1.3;
+  const kpiEl  = document.getElementById('sp-anom-kpis');
+  if (!force && kpiEl && kpiEl.innerHTML.includes('sp-kpi-val')) return;
+  kpiEl.innerHTML = '<div class="sp-kpi"><div class="sp-kpi-lbl">Loading…</div></div>';
+  try {
+    const r = await fetch(`/api/spend/anomalies?threshold=${thresh}` + _spFilterQSAmp());
+    const d = await r.json();
+    if (d.empty) { kpiEl.innerHTML = '<p style="color:rgba(255,255,255,.4)">No data loaded.</p>'; return; }
+
+    kpiEl.innerHTML = `
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Anomalies Found</div><div class="sp-kpi-val" style="color:#e63946">${d.anomaly_count||0}</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Anomaly Rate</div><div class="sp-kpi-val">${Number(d.anomaly_pct||0).toFixed(1)}%</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Threshold Used</div><div class="sp-kpi-val">${d.threshold_used}×</div></div>
+    `;
+    // Anomaly bar chart from existing endpoint
+    spPlot('sp-ch-anom-bar', await spFetchChart('/api/spend/chart/anomaly_bar'));
+    spRenderTable(d.anomaly_rows || [], 'sp-anom-table', 'anomaly_flag', true);
+  } catch(e) {
+    kpiEl.innerHTML = `<p style="color:#e63946">Error: ${e.message}</p>`;
+  }
+}
+
+// ── Should-Cost Gap ───────────────────────────────────────────────────────
+async function spLoadShouldCost() {
+  const kpiEl = document.getElementById('sp-sc-kpis');
+  kpiEl.innerHTML = '<div class="sp-kpi"><div class="sp-kpi-lbl">Loading…</div></div>';
+  try {
+    const r = await fetch('/api/spend/should_cost' + _spFilterQS());
+    const d = await r.json();
+    if (d.empty) { kpiEl.innerHTML = '<p style="color:rgba(255,255,255,.4)">No data loaded.</p>'; return; }
+
+    kpiEl.innerHTML = `
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Total Should-Cost Gap</div><div class="sp-kpi-val" style="color:#e63946">$${Number(d.total_should_cost_gap||0).toLocaleString(undefined,{maximumFractionDigits:0})}</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Avg Gap / Row</div><div class="sp-kpi-val">${Number(d.avg_should_cost_gap||0).toFixed(3)}</div></div>
+    `;
+    spRenderTable(d.top_skus || [], 'sp-sc-table');
+
+    // Bar chart of gap by SKU
+    if (d.top_skus && d.top_skus.length) {
+      const skus = d.top_skus.map(r => r[Object.keys(r)[0]] || '');
+      const gaps = d.top_skus.map(r => Number(r.should_cost_gap||0));
+      const colors = gaps.map(v => v > 0 ? '#e63946' : '#1f9d55');
+      const ch = {
+        data: [{type:'bar', orientation:'h', x:gaps, y:skus, marker:{color:colors},
+                text:gaps.map(v=>v.toFixed(3)), textposition:'outside'}],
+        layout: {title:'Should-Cost Gap by SKU', paper_bgcolor:'rgba(0,0,0,0)',
+                 plot_bgcolor:'rgba(0,0,0,0)', font:{color:'white',family:'Outfit'},
+                 margin:{t:50,b:60,l:160,r:60}, height:400, showlegend:false,
+                 xaxis:{title:'Gap ($)'},yaxis:{automargin:true}}
+      };
+      Plotly.newPlot('sp-ch-sc-bar', ch.data, ch.layout, {responsive:true,displayModeBar:false});
+    }
+  } catch(e) {
+    kpiEl.innerHTML = `<p style="color:#e63946">Error: ${e.message}</p>`;
+  }
+}
+
+// ── Chat / Ask AI ─────────────────────────────────────────────────────────
+function spChip(txt) {
+  document.getElementById('sp-chat-input').value = txt;
+  spAskAI();
+}
+
+async function spAskAI() {
+  const input = document.getElementById('sp-chat-input');
+  const q = input.value.trim();
+  if (!q) return;
+  const result = document.getElementById('sp-chat-result');
+
+  // Show question bubble
+  result.innerHTML = `
+    <div class="sp-chat-q"> <strong>You:</strong> ${q}</div>
+    <div class="sp-chat-a"><span class="sp-spinner"></span> Thinking…</div>
+  `;
+
+  try {
+    const r = await fetch('/api/spend_query' + _spFilterQS(), {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({question: q})
+    });
+    const d = await r.json();
+    if (!r.ok) throw new Error(d.error || 'Query failed');
+
+    let inner = `<div class="sp-chat-summary"> <em>${d.summary}</em></div>`;
+
+    if (d.chart) {
+      inner += `<div id="sp-chat-chart" style="height:400px;margin-top:8px"></div>`;
+    }
+    if (d.table && d.table.length) {
+      inner += `<div style="overflow-x:auto;margin-top:12px"><div id="sp-chat-table"></div></div>`;
+    }
+    if (!d.chart && (!d.table || !d.table.length)) {
+      inner += `<p style="color:rgba(255,255,255,.45);font-size:.85rem">No results — try a different query.</p>`;
+    }
+
+    result.innerHTML = `
+      <div class="sp-chat-q"> <strong>You:</strong> ${q}</div>
+      <div class="sp-chat-a">${inner}</div>
+    `;
+
+    if (d.chart) Plotly.newPlot('sp-chat-chart', d.chart.data, d.chart.layout, {responsive:true,displayModeBar:false});
+    if (d.table && d.table.length) spRenderTable(d.table, 'sp-chat-table');
+  } catch(e) {
+    result.innerHTML = `
+      <div class="sp-chat-q"> <strong>You:</strong> ${q}</div>
+      <div class="sp-chat-a"><p style="color:#e63946">❌ ${e.message}</p></div>
+    `;
+  }
+}
+
+// ── Initialize filters on page load ──────────────────────────────────────
+spLoadFilterOptions();
+</script>
+"""
+
+
+# ── Initialise spend DB on import ──────────────────────────────────────────
+spend_init_db()
+
+
+# ── In-memory parsed file cache keyed by session (simple dict) ─────────────
+_SPEND_PARSE_CACHE = {}   # {session_key: {filename, df, roles}}
+
+
+# =============================================================================
+#  FLASK ROUTES — SPEND ANALYTICS
+# =============================================================================
+
+@app.route("/analytics/spend")
+@login_required
+def spend_analytics():
+    """Spend Analytics main page."""
+    return render_template_string(
+        BASE_HTML.replace("{{ content | safe }}", SPEND_UI_HTML),
+        active="SpendAnalytics", user_role=session.get('role', 'viewer')
+    )
+
+
+@app.route("/api/spend/upload", methods=["POST"])
+@login_required
+def spend_upload():
+    """Parse uploaded file, classify columns, return preview + roles (no DB write yet)."""
+    if 'file' not in request.files:
+        return jsonify({"error": "No file attached"}), 400
+    f = request.files['file']
+    if not f or f.filename == '':
+        return jsonify({"error": "Empty filename"}), 400
+
+    try:
+        df = spend_read_flask_file(f)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+    roles = spend_classify_columns(df)
+
+    # Build sample values per column
+    samples = {}
+    for col in df.columns:
+        samples[col] = [str(v) for v in df[col].dropna().head(3).tolist()]
+
+    # Cache parsed df for the store step
+    cache_key = session.get('username', 'anon') + "_spend"
+    _SPEND_PARSE_CACHE[cache_key] = {"filename": f.filename, "df": df, "roles": roles}
+
+    preview_records = df.head(30).where(pd.notna(df), None).to_dict(orient='records')
+
+    return jsonify({
+        "filename":   f.filename,
+        "total_rows": len(df),
+        "columns":    list(df.columns),
+        "roles":      roles,
+        "samples":    samples,
+        "preview":    preview_records,
+    })
+
+
+@app.route("/api/spend/store", methods=["POST"])
+@login_required
+def spend_store():
+    """Clean and store the previously parsed file into the DB."""
+    body     = request.get_json(force=True)
+    filename = body.get("filename", "")
+    country  = body.get("country", "Global")
+    year     = body.get("year", 2024)
+    category = body.get("category", "Other")
+    overrides = body.get("roles", {})
+
+    cache_key = session.get('username', 'anon') + "_spend"
+    cached    = _SPEND_PARSE_CACHE.get(cache_key)
+    if not cached or cached["filename"] != filename:
+        return jsonify({"error": "Upload session expired — please re-upload the file"}), 400
+
+    df   = cached["df"]
+    # Merge auto roles with user overrides
+    roles = {**cached["roles"], **{k: v for k, v in overrides.items() if v != ""}}
+
+    try:
+        cleaned = spend_clean_dataframe(df, roles)
+    except Exception as e:
+        return jsonify({"error": f"Cleaning failed: {e}"}), 500
+
+    if cleaned.empty:
+        return jsonify({"error": "No rows survived cleaning — check your file"}), 400
+
+    try:
+        ds_id = spend_insert_dataset(filename, country, year, category, roles, cleaned)
+    except Exception as e:
+        return jsonify({"error": f"DB insert failed: {e}"}), 500
+
+    # Clear cache entry
+    _SPEND_PARSE_CACHE.pop(cache_key, None)
+
+    return jsonify({"ok": True, "dataset_id": ds_id, "rows": len(cleaned)})
+
+
+@app.route("/api/spend/datasets", methods=["GET"])
+@login_required
+def spend_datasets_list():
+    """List all stored datasets."""
+    ds = spend_get_datasets()
+    if ds.empty:
+        return jsonify({"datasets": []})
+    records = ds[["id","source_file","country","year","category","row_count","uploaded_at"]].to_dict(orient='records')
+    return jsonify({"datasets": records})
+
+
+@app.route("/api/spend/dataset/<int:ds_id>", methods=["DELETE"])
+@login_required
+def spend_dataset_delete(ds_id):
+    """Delete a specific dataset."""
+    try:
+        spend_delete_dataset(ds_id)
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/spend/clear", methods=["POST"])
+@login_required
+def spend_clear():
+    """Clear entire spend database."""
+    try:
+        spend_clear_db()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/spend/filter_options", methods=["GET"])
+@login_required
+def spend_filter_options():
+    """Return distinct values for country, year, category, supplier from stored data."""
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"countries": [], "years": [], "categories": [], "suppliers": []})
+    countries = sorted(df['country'].dropna().unique().tolist()) if 'country' in df.columns else []
+    years = sorted([int(y) for y in df['year'].dropna().unique()], reverse=True) if 'year' in df.columns else []
+    categories = sorted(df['category'].dropna().unique().tolist()) if 'category' in df.columns else []
+    # Find supplier column
+    sup_col = _spend_get_metric_col(role_map, "supplier")
+    suppliers = sorted(df[sup_col].dropna().unique().tolist()) if sup_col and sup_col in df.columns else []
+    return jsonify({"countries": countries, "years": years, "categories": categories, "suppliers": suppliers})
+
+
+@app.route("/api/spend/data", methods=["GET"])
+@login_required
+def spend_data_summary():
+    """Return KPI summary of all loaded data."""
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"kpis": {}, "empty": True})
+    kpis = _spend_build_kpis(df, role_map)
+    return jsonify({"kpis": kpis, "empty": False})
+
+
+@app.route("/api/spend/insights", methods=["GET"])
+@login_required
+def spend_insights():
+    """Return automated insights as JSON."""
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"insights": [{"title":"No Data","detail":"Upload a file to see insights.","sev":"info"}]})
+    return jsonify({"insights": spend_generate_insights(df, role_map)})
+
+
+# =============================================================================
+# ████████████████████  END SPEND ANALYTICS INTEGRATION  ██████████████████████
+# =============================================================================
+
+# =============================================================================
+# ████████████  NEW AI SPEND ANALYTICS ROUTES (Features 1–9)  ████████████████
+# =============================================================================
+
+@app.route("/api/spend/ai_enrich", methods=["POST"])
+@login_required
+def spend_ai_enrich():
+    """
+    Run full AI pipeline on stored data and return enriched summary.
+    POST body (optional): { "dataset_id": int }
+    Returns KPIs + anomaly count + PPV summary.
+    """
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"error": "No data loaded"}), 400
+
+    try:
+        df = spend_run_ai_pipeline(df, role_map)
+    except Exception as e:
+        return jsonify({"error": f"AI pipeline error: {e}"}), 500
+
+    anomaly_count  = int(df.get("anomaly_flag", pd.Series(dtype=bool)).sum())
+    ppv_total      = float(df.get("savings_potential", pd.Series(dtype=float)).sum()) if "savings_potential" in df.columns else 0
+    overpaid_count = int(df.get("overpaid", pd.Series(dtype=bool)).sum()) if "overpaid" in df.columns else 0
+    cats           = df["category_ai"].value_counts().to_dict() if "category_ai" in df.columns else {}
+    canonical_sup  = df["canonical_supplier"].value_counts().head(10).to_dict() if "canonical_supplier" in df.columns else {}
+
+    return jsonify({
+        "ok": True,
+        "anomaly_count":   anomaly_count,
+        "ppv_total":       round(ppv_total, 2),
+        "overpaid_rows":   overpaid_count,
+        "category_ai_dist": cats,
+        "canonical_suppliers_top10": canonical_sup,
+    })
+
+
+@app.route("/api/spend/ppv", methods=["GET"])
+@login_required
+def spend_ppv():
+    """
+    PPV analytics endpoint.
+    Returns: overpaid summary + top offenders + Plotly charts (supplier_ppv, category_ppv).
+    """
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"empty": True})
+
+    df = compute_ppv(df, role_map)
+    df = _spend_add_ai_categories(df, role_map)
+
+    sup_col = _spend_get_metric_col(role_map, "supplier")
+    sku_col = _spend_get_metric_col(role_map, "sku_id")
+
+    total_savings = float(df["savings_potential"].sum()) if "savings_potential" in df.columns else 0
+    overpaid_pct  = float((df["overpaid"].sum() / max(len(df), 1) * 100)) if "overpaid" in df.columns else 0
+
+    # Top 10 overpaid rows
+    if "ppv" in df.columns:
+        top_overpaid = (df[df["overpaid"] == True]
+                        .nlargest(10, "savings_potential")
+                        .where(pd.notna(df[df["overpaid"] == True]), None)
+                        .to_dict(orient="records"))
+    else:
+        top_overpaid = []
+
+    supplier_ppv_chart  = _spend_chart_supplier_ppv(df, role_map)
+    category_ppv_chart  = _spend_chart_category_ppv(df)
+
+    return jsonify({
+        "total_savings_potential": round(total_savings, 2),
+        "overpaid_row_pct": round(overpaid_pct, 2),
+        "top_overpaid": top_overpaid,
+        "charts": {
+            "supplier_ppv": supplier_ppv_chart,
+            "category_ppv": category_ppv_chart,
+        }
+    })
+
+
+@app.route("/api/spend/forecast", methods=["GET"])
+@login_required
+def spend_forecast():
+    """
+    Quarterly/annual spend forecast.
+    Query params: periods (int, default 3)
+    Returns: { results: {category: {dates, forecast, lower, upper}}, chart: Plotly }
+    """
+    periods = int(request.args.get("periods", 3))
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"empty": True})
+
+    df = _spend_add_ai_categories(df, role_map)
+    fc = forecast_spend_by_category(df, role_map, periods=periods)
+    chart = _spend_chart_forecast(fc)
+
+    return jsonify({
+        "results": fc,
+        "chart":   chart,
+        "method":  next((v.get("method") for v in fc.values()), "N/A") if fc else "N/A",
+    })
+
+
+@app.route("/api/spend_query", methods=["POST"])
+@login_required
+def spend_nl_query():
+    """
+    Chat-to-Spend: natural language query → pandas + Plotly response.
+    POST body: { "question": "Show spend by supplier in 2025" }
+    Returns: { chart, table, summary, chart_type }
+    """
+    body = request.get_json(force=True)
+    question = body.get("question", "").strip()
+    if not question:
+        return jsonify({"error": "question is required"}), 400
+
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"error": "No data loaded. Upload a spend file first."}), 400
+
+    # Run AI pipeline to ensure enriched columns exist
+    try:
+        df = spend_run_ai_pipeline(df, role_map)
+    except Exception:
+        pass
+
+    result = nl_spend_query(question, df, role_map)
+    return jsonify(result)
+
+
+@app.route("/api/spend/should_cost", methods=["GET"])
+@login_required
+def spend_should_cost():
+    """
+    Should-cost gap analysis.
+    Returns top SKUs with highest gap + decomposed variance breakdown.
+    """
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"empty": True})
+
+    df = compute_should_cost_gap(df, role_map)
+    sku_col = _spend_get_metric_col(role_map, "sku_id")
+
+    top_gap = df.nlargest(20, "should_cost_gap") if "should_cost_gap" in df.columns else df.head(20)
+    cols_keep = [c for c in [sku_col, "should_cost_gap", "gap_pct",
+                              "material_var", "conversion_var", "margin_var"] if c and c in top_gap.columns]
+    table_data = top_gap[cols_keep].where(pd.notna(top_gap[cols_keep]), None).to_dict(orient="records") if cols_keep else []
+
+    total_gap = float(df["should_cost_gap"].sum()) if "should_cost_gap" in df.columns else 0
+    avg_gap   = float(df["should_cost_gap"].mean()) if "should_cost_gap" in df.columns else 0
+
+    return jsonify({
+        "total_should_cost_gap": round(total_gap, 2),
+        "avg_should_cost_gap":   round(avg_gap, 4),
+        "top_skus": table_data,
+    })
+
+
+@app.route("/api/spend/risk", methods=["GET"])
+@login_required
+def spend_supplier_risk():
+    """
+    Supplier concentration risk analytics.
+    Returns: risk table + geo_spend_map Plotly chart.
+    """
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"empty": True})
+
+    risk_df = compute_supplier_risk(df, role_map)
+    geo_chart = _spend_chart_geo_risk(risk_df)
+
+    flagged = risk_df[risk_df["risk_flag"] == True] if not risk_df.empty and "risk_flag" in risk_df.columns else pd.DataFrame()
+    table_data = risk_df.head(20).where(pd.notna(risk_df), None).to_dict(orient="records") if not risk_df.empty else []
+
+    return jsonify({
+        "risk_suppliers":    table_data,
+        "flagged_count":     len(flagged),
+        "charts": {
+            "geo_spend_map": geo_chart,
+        }
+    })
+
+
+@app.route("/api/spend/anomalies", methods=["GET"])
+@login_required
+def spend_anomalies():
+    """
+    Price anomaly detection across all loaded data.
+    Returns: anomaly rows + count + percentage.
+    Query params: threshold (float, default 1.3)
+    """
+    threshold = float(request.args.get("threshold", 1.3))
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"empty": True})
+
+    df = detect_price_anomalies(df, role_map, threshold=threshold)
+
+    price_col = _spend_get_metric_col(role_map, "price_metric")
+    sku_col   = _spend_get_metric_col(role_map, "sku_id")
+    sup_col   = _spend_get_metric_col(role_map, "supplier")
+
+    anomalies = df[df["anomaly_flag"] == True] if "anomaly_flag" in df.columns else pd.DataFrame()
+    pct = round(len(anomalies) / max(len(df), 1) * 100, 2)
+
+    cols_keep = [c for c in [sku_col, sup_col, price_col, "price_hist_avg", "anomaly_score"] if c and c in anomalies.columns]
+    table_data = (anomalies[cols_keep].nlargest(50, "anomaly_score") if cols_keep and "anomaly_score" in anomalies.columns
+                  else anomalies.head(50)).where(pd.notna(anomalies[cols_keep] if cols_keep else anomalies), None).to_dict(orient="records") if not anomalies.empty else []
+
+    return jsonify({
+        "anomaly_count":   len(anomalies),
+        "anomaly_pct":     pct,
+        "threshold_used":  threshold,
+        "anomaly_rows":    table_data,
+    })
+
+
+@app.route("/api/spend/chart/<chart_type>", methods=["GET"])
+@login_required
+def spend_chart(chart_type):
+    """Return a Plotly JSON figure for the requested chart type (extended)."""
+    df, role_map, _ = spend_load_all_data()
+    df = _spend_apply_filters(df)
+    if df.empty:
+        return jsonify({"chart": None})
+
+    # Run AI pipeline for enriched chart types
+    _ai_chart_types = {"supplier_ppv", "category_ppv", "forecast", "geo_risk", "anomaly_bar"}
+    if chart_type in _ai_chart_types:
+        try:
+            df = spend_run_ai_pipeline(df, role_map)
+        except Exception:
+            pass
+
+    vol_col   = _spend_get_metric_col(role_map, "volume_metric")
+    price_col = _spend_get_metric_col(role_map, "price_metric")
+    sup_col   = _spend_get_metric_col(role_map, "supplier")
+    plant_col = _spend_get_metric_col(role_map, "plant")
+    sku_col   = _spend_get_metric_col(role_map, "sku_id")
+
+    def _safe(fn, *a, **kw):
+        try:
+            return fn(*a, **kw)
+        except Exception:
+            return None
+
+    chart = None
+
+    # ── Original chart types ──
+    if chart_type == "category_bar" and vol_col and "category" in df.columns:
+        chart = _safe(_spend_chart_bar, df, "category", vol_col, title="Volume by Category")
+    elif chart_type == "category_donut" and vol_col and "category" in df.columns:
+        chart = _safe(_spend_chart_donut, df, "category", vol_col, title="Category Mix")
+    elif chart_type == "supplier_bar" and vol_col and sup_col and sup_col in df.columns:
+        chart = _safe(_spend_chart_bar, df, sup_col, vol_col, title="Top Suppliers by Volume")
+    elif chart_type == "supplier_horiz" and vol_col and sup_col and sup_col in df.columns:
+        chart = _safe(_spend_chart_bar, df, sup_col, vol_col, title="Supplier Volume", horiz=True)
+    elif chart_type == "supplier_donut" and vol_col and sup_col and sup_col in df.columns:
+        chart = _safe(_spend_chart_donut, df, sup_col, vol_col, title="Supplier Share")
+    elif chart_type == "supplier_cat_heat" and vol_col and sup_col and sup_col in df.columns and "category" in df.columns:
+        chart = _safe(_spend_chart_heatmap, df, sup_col, "category", vol_col, title="Supplier × Category")
+    elif chart_type == "supplier_trend" and vol_col and sup_col and sup_col in df.columns and "year" in df.columns:
+        chart = _safe(_spend_chart_trend, df, "year", sup_col, vol_col, title="YoY Volume per Supplier")
+    elif chart_type == "plant_bar" and vol_col and plant_col and plant_col in df.columns:
+        chart = _safe(_spend_chart_bar, df, plant_col, vol_col, title=f"Volume by {plant_col}")
+    elif chart_type == "sku_bar" and vol_col and sku_col and sku_col in df.columns:
+        chart = _safe(_spend_chart_bar, df, sku_col, vol_col, title="Top SKUs by Volume", horiz=True)
+    elif chart_type == "sku_donut" and vol_col and sku_col and sku_col in df.columns:
+        chart = _safe(_spend_chart_donut, df, sku_col, vol_col, title="SKU Volume Mix")
+    elif chart_type == "sku_sup_heat" and vol_col and sku_col and sku_col in df.columns and sup_col and sup_col in df.columns:
+        chart = _safe(_spend_chart_heatmap, df, sku_col, sup_col, vol_col, title="SKU × Supplier")
+    elif chart_type == "price_box" and price_col and sku_col:
+        chart = _safe(_spend_chart_price_variance, df, sku_col, price_col)
+    elif chart_type == "price_sup" and price_col and sup_col and sup_col in df.columns:
+        chart = _safe(_spend_chart_bar, df, sup_col, price_col, title="Avg Price by Supplier")
+    elif chart_type == "price_cat" and price_col and "category" in df.columns:
+        chart = _safe(_spend_chart_bar, df, "category", price_col, title="Avg Price by Category")
+    elif chart_type == "price_trend" and price_col and "year" in df.columns and sup_col and sup_col in df.columns:
+        chart = _safe(_spend_chart_trend, df, "year", sup_col, price_col, title="YoY Price Trend by Supplier")
+    # ── New AI chart types ──
+    elif chart_type == "supplier_ppv":
+        chart = _safe(_spend_chart_supplier_ppv, df, role_map)
+    elif chart_type == "category_ppv":
+        chart = _safe(_spend_chart_category_ppv, df)
+    elif chart_type == "forecast":
+        fc = forecast_spend_by_category(df, role_map)
+        chart = _safe(_spend_chart_forecast, fc)
+    elif chart_type == "geo_risk":
+        risk_df = compute_supplier_risk(df, role_map)
+        chart = _safe(_spend_chart_geo_risk, risk_df)
+    elif chart_type == "anomaly_bar" and "anomaly_flag" in df.columns and sup_col and sup_col in df.columns:
+        anom_grp = df[df["anomaly_flag"] == True].groupby(sup_col).size().reset_index(name="anomaly_count")
+        anom_grp = anom_grp.sort_values("anomaly_count", ascending=False).head(15)
+        if not anom_grp.empty:
+            trace = dict(type="bar", x=anom_grp[sup_col].tolist(), y=anom_grp["anomaly_count"].tolist(),
+                         marker=dict(color="#e63946"))
+            layout = dict(title="Anomalies by Supplier",
+                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                          font=dict(color="white", family="Outfit"),
+                          margin=dict(t=50, b=80, l=50, r=20), height=360)
+            chart = dict(data=[trace], layout=layout)
+
+    return jsonify({"chart": chart})
+
+
+# ── Override spend_store to auto-run AI pipeline ──────────────────────────
+@app.route("/api/spend/store_ai", methods=["POST"])
+@login_required
+def spend_store_ai():
+    """
+    Enhanced store endpoint: runs full AI pipeline (normalisation, categorisation,
+    PPV, anomaly detection) before persisting.
+    Same request body as /api/spend/store.
+    """
+    body     = request.get_json(force=True)
+    filename = body.get("filename", "")
+    country  = body.get("country", "Global")
+    year     = body.get("year", 2024)
+    category = body.get("category", "Other")
+    overrides = body.get("roles", {})
+
+    cache_key = session.get('username', 'anon') + "_spend"
+    cached    = _SPEND_PARSE_CACHE.get(cache_key)
+    if not cached or cached["filename"] != filename:
+        return jsonify({"error": "Upload session expired — please re-upload the file"}), 400
+
+    df   = cached["df"]
+    roles = {**cached["roles"], **{k: v for k, v in overrides.items() if v != ""}}
+
+    try:
+        cleaned = spend_clean_dataframe(df, roles)
+    except Exception as e:
+        return jsonify({"error": f"Cleaning failed: {e}"}), 500
+
+    if cleaned.empty:
+        return jsonify({"error": "No rows survived cleaning — check your file"}), 400
+
+    # AI enrichment step
+    try:
+        cleaned = spend_run_ai_pipeline(cleaned, roles)
+    except Exception as e:
+        logger.warning(f"AI pipeline warning (non-fatal): {e}")
+
+    try:
+        ds_id = spend_insert_dataset(filename, country, year, category, roles, cleaned)
+    except Exception as e:
+        return jsonify({"error": f"DB insert failed: {e}"}), 500
+
+    _SPEND_PARSE_CACHE.pop(cache_key, None)
+
+    anomalies = int(cleaned.get("anomaly_flag", pd.Series(dtype=bool)).sum()) if "anomaly_flag" in cleaned.columns else 0
+    ppv_total = float(cleaned.get("savings_potential", pd.Series(0.0)).sum()) if "savings_potential" in cleaned.columns else 0.0
+
+    return jsonify({
+        "ok": True,
+        "dataset_id": ds_id,
+        "rows": len(cleaned),
+        "ai_summary": {
+            "anomaly_count": anomalies,
+            "ppv_savings_potential": round(ppv_total, 2),
+            "categories_detected": cleaned["category_ai"].value_counts().to_dict() if "category_ai" in cleaned.columns else {},
+        }
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# UNIVERSAL SKU COMPARISON ENGINE v2 — AI-POWERED DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════
+
+_SKU_COMPARE_CACHE = {}
+
+def _sku_cache_key(inputs_dict):
+    """Generate MD5 hash for SKU input caching."""
+    raw = json.dumps(inputs_dict, sort_keys=True, default=str)
+    return hashlib.md5(raw.encode()).hexdigest()
+
+
+def run_model_universal(model_type, inputs, model_id=None):
+    """Universal model runner — evaluates ANY model type and returns raw results.
+    Works for: EBM, Flexibles, Carton, Carton Advanced, and any Cost Model Builder model.
+    Does NOT modify existing calculation logic — wraps existing endpoints."""
+    cache_key = _sku_cache_key({'model': model_type, 'inputs': inputs, 'model_id': model_id})
+    if cache_key in _SKU_COMPARE_CACHE:
+        return _SKU_COMPARE_CACHE[cache_key]
+
+    result = {}
+    try:
+        if model_type in ('ebm',):
+            result = _run_calc_internal(api_calc_ebm, inputs)
+        elif model_type in ('carton_advanced', 'carton_adv', 'carton-adv'):
+            result = _run_calc_internal(api_calc_carton_advanced, inputs)
+        elif model_type in ('carton', 'folding_carton'):
+            result = _run_calc_internal(api_calc_carton, inputs)
+        elif model_type in ('flexibles', 'flexible'):
+            result = _run_calc_internal(api_calc_flexibles, inputs)
+        elif model_id:
+            # Custom Cost Model Builder model
+            model_path = MODELS_DIR / f"{model_id}.json"
+            if model_path.exists():
+                with open(model_path, 'r') as f:
+                    model_json = json.load(f)
+                raw_results = run_cost_simulation(model_json, inputs)
+                mapped = _map_model_to_cost_structure(model_json, raw_results)
+                result = {'_custom': True, 'results': raw_results, 'mapped': mapped,
+                          'model_name': model_json.get('name', 'Custom')}
+    except Exception as e:
+        logger.warning(f"run_model_universal error ({model_type}): {e}")
+        result = {}
+
+    _SKU_COMPARE_CACHE[cache_key] = result
+    return result
+
+
+def extract_cost_breakdown(model_type, results, inputs=None):
+    """Universal cost breakdown extractor — returns 5 standard categories.
+    Works with ANY model. Uses field-name inference for unknown models."""
+    breakdown = {
+        'material_cost': 0.0,
+        'conversion_cost': 0.0,
+        'overhead_cost': 0.0,
+        'logistics_cost': 0.0,
+        'margin': 0.0,
+        'total_cost': 0.0,
+    }
+
+    if not results:
+        return breakdown
+
+    # For custom models, use the mapped structure
+    if isinstance(results, dict) and results.get('_custom'):
+        mapped = results.get('mapped', {})
+        raw = results.get('results', {})
+        breakdown['material_cost'] = float(mapped.get('material_cost', 0))
+        breakdown['conversion_cost'] = float(mapped.get('conversion_cost', 0))
+        breakdown['logistics_cost'] = float(mapped.get('freight_cost', 0)) + float(mapped.get('packing_cost', 0))
+        breakdown['margin'] = float(mapped.get('margin', 0))
+        breakdown['total_cost'] = float(mapped.get('total_cost_per_1000', 0))
+        # Infer overhead from remaining fields
+        known_sum = sum([breakdown['material_cost'], breakdown['conversion_cost'],
+                         breakdown['logistics_cost'], breakdown['margin']])
+        if breakdown['total_cost'] > known_sum:
+            breakdown['overhead_cost'] = round(breakdown['total_cost'] - known_sum, 2)
+        # Deep inference from raw results if mapped was empty
+        if breakdown['total_cost'] == 0 and raw:
+            breakdown = _infer_breakdown_from_fields(raw)
+        return breakdown
+
+    # For standard models, use _extract_result_metrics patterns
+    metrics = _extract_result_metrics(model_type, results, inputs or {})
+    breakdown['material_cost'] = float(metrics.get('material_cost', 0))
+    breakdown['conversion_cost'] = float(metrics.get('conversion_cost', 0))
+    breakdown['margin'] = float(metrics.get('margin', 0))
+    breakdown['total_cost'] = float(metrics.get('total_cost_per_1000', 0))
+
+    # Infer logistics from results
+    for k, v in results.items():
+        kl = k.lower()
+        if any(w in kl for w in ['freight', 'shipping', 'transport', 'logistics', 'packing_cost']):
+            try:
+                breakdown['logistics_cost'] += float(v)
+            except (ValueError, TypeError):
+                pass
+        elif any(w in kl for w in ['overhead', 'repair', 'depreciation', 'interest', 'premises']):
+            try:
+                breakdown['overhead_cost'] += float(v)
+            except (ValueError, TypeError):
+                pass
+
+    # If overhead still 0, infer from total
+    if breakdown['overhead_cost'] == 0 and breakdown['total_cost'] > 0:
+        known = sum([breakdown['material_cost'], breakdown['conversion_cost'],
+                     breakdown['logistics_cost'], breakdown['margin']])
+        if breakdown['total_cost'] > known:
+            breakdown['overhead_cost'] = round(breakdown['total_cost'] - known, 2)
+
+    return breakdown
+
+
+def _infer_breakdown_from_fields(results_dict):
+    """Heuristic inference: classify result fields into cost categories by keyword matching."""
+    breakdown = {
+        'material_cost': 0.0, 'conversion_cost': 0.0,
+        'overhead_cost': 0.0, 'logistics_cost': 0.0,
+        'margin': 0.0, 'total_cost': 0.0,
+    }
+    _mat_kw = ['material', 'resin', 'polymer', 'board', 'raw_mat', 'film_cost', 'ink_cost', 'substrate']
+    _conv_kw = ['conversion', 'machine', 'labour', 'labor', 'energy', 'power', 'processing', 'manufacturing']
+    _log_kw = ['freight', 'shipping', 'transport', 'logistics', 'packing', 'delivery']
+    _margin_kw = ['margin', 'profit', 'markup']
+    _total_kw = ['total', 'final', 'grand', 'selling']
+    _overhead_kw = ['overhead', 'depreciation', 'interest', 'repair', 'admin', 'insurance', 'premises', 'rent']
+
+    for fid, val in results_dict.items():
+        try:
+            v = float(val)
+        except (ValueError, TypeError):
+            continue
+        fl = fid.lower()
+        if any(k in fl for k in _total_kw):
+            if v > breakdown['total_cost']:
+                breakdown['total_cost'] = v
+        elif any(k in fl for k in _margin_kw):
+            breakdown['margin'] += v
+        elif any(k in fl for k in _mat_kw):
+            breakdown['material_cost'] += v
+        elif any(k in fl for k in _conv_kw):
+            breakdown['conversion_cost'] += v
+        elif any(k in fl for k in _log_kw):
+            breakdown['logistics_cost'] += v
+        elif any(k in fl for k in _overhead_kw):
+            breakdown['overhead_cost'] += v
+
+    if breakdown['total_cost'] == 0:
+        breakdown['total_cost'] = sum([
+            breakdown['material_cost'], breakdown['conversion_cost'],
+            breakdown['overhead_cost'], breakdown['logistics_cost'], breakdown['margin']
+        ])
+    return breakdown
+
+
+@app.route("/api/sku_compare_dashboard", methods=["POST"])
+@login_required
+def api_sku_compare_dashboard():
+    """Universal SKU Comparison Dashboard API.
+    Accepts up to 5 SKUs, returns full dashboard data including:
+    - cost breakdowns, radar data, waterfall deltas, bar chart, index chart.
+    Works with EBM, Flexibles, Carton, and ALL Cost Model Builder models."""
+    data = request.get_json()
+    if not data or 'skus' not in data:
+        return jsonify({"error": "No SKU data provided"}), 400
+
+    skus = data['skus'][:5]  # Max 5
+    if len(skus) < 2:
+        return jsonify({"error": "Need at least 2 SKUs"}), 400
+
+    base_idx = data.get('base_index', 0)
+    dashboard_items = []
+
+    for sku in skus:
+        model_type = sku.get('model', 'ebm')
+        model_id = sku.get('model_id', '').replace('custom_', '') if model_type.startswith('custom_') else sku.get('model_id', '')
+        if model_type.startswith('custom_'):
+            model_type = 'custom'
+        inputs = sku.get('inputs', {})
+        results = sku.get('results', {})
+
+        # Extract cost breakdown from stored results (no re-calculation needed)
+        if results:
+            if model_type == 'custom':
+                # For custom models, wrap results to match expected format
+                wrapped = {'_custom': True, 'results': results, 'mapped': {}}
+                # Try to extract mapped fields from results
+                mapped = _infer_breakdown_from_fields(results)
+                wrapped['mapped'] = {
+                    'material_cost': mapped['material_cost'],
+                    'conversion_cost': mapped['conversion_cost'],
+                    'margin': mapped['margin'],
+                    'freight_cost': mapped['logistics_cost'],
+                    'packing_cost': 0,
+                    'total_cost_per_1000': mapped['total_cost'],
+                }
+                bd = extract_cost_breakdown('custom', wrapped, inputs)
+            else:
+                bd = extract_cost_breakdown(model_type, results, inputs)
+        else:
+            bd = extract_cost_breakdown(model_type, {}, inputs)
+
+        # Ensure total
+        if bd['total_cost'] == 0:
+            bd['total_cost'] = sum([bd['material_cost'], bd['conversion_cost'],
+                                    bd['overhead_cost'], bd['logistics_cost'], bd['margin']])
+
+        dashboard_items.append({
+            'sku_name': sku.get('name', 'Unknown'),
+            'model': sku.get('model_name', model_type),
+            'country': inputs.get('country', sku.get('country', '-')),
+            'supplier': inputs.get('l1_polymer_type', inputs.get('resin', inputs.get('supplier', '-'))),
+            'technology': model_type,
+            'cost_breakdown': {
+                'material': round(bd['material_cost'], 2),
+                'conversion': round(bd['conversion_cost'], 2),
+                'overhead': round(bd['overhead_cost'], 2),
+                'logistics': round(bd['logistics_cost'], 2),
+                'margin': round(bd['margin'], 2),
+            },
+            'total_cost': round(bd['total_cost'], 2),
+            'all_results': results,
+            'inputs': inputs,
+        })
+
+    # Derive delta and index relative to base SKU
+    base_cost = dashboard_items[base_idx]['total_cost'] if dashboard_items[base_idx]['total_cost'] > 0 else 1
+    for item in dashboard_items:
+        item['delta'] = round(item['total_cost'] - base_cost, 2)
+        item['index'] = round((item['total_cost'] / base_cost) * 100, 1) if base_cost > 0 else 100
+
+    # Radar chart data (normalized 0-100)
+    categories = ['material', 'conversion', 'overhead', 'logistics', 'margin']
+    max_vals = {}
+    for cat in categories:
+        vals = [item['cost_breakdown'].get(cat, 0) for item in dashboard_items]
+        max_vals[cat] = max(vals) if max(vals) > 0 else 1
+
+    radar_data = []
+    for item in dashboard_items:
+        radar_data.append({
+            'sku_name': item['sku_name'],
+            'values': [round((item['cost_breakdown'].get(cat, 0) / max_vals[cat]) * 100, 1) for cat in categories],
+        })
+
+    return jsonify({
+        'success': True,
+        'items': dashboard_items,
+        'base_index': base_idx,
+        'base_sku': dashboard_items[base_idx]['sku_name'],
+        'radar': {'categories': [c.title() for c in categories], 'series': radar_data},
+        'summary': {
+            'min_cost': min(i['total_cost'] for i in dashboard_items),
+            'max_cost': max(i['total_cost'] for i in dashboard_items),
+            'avg_cost': round(sum(i['total_cost'] for i in dashboard_items) / len(dashboard_items), 2),
+            'spread_pct': round(((max(i['total_cost'] for i in dashboard_items) - min(i['total_cost'] for i in dashboard_items)) / base_cost) * 100, 1) if base_cost else 0,
+        }
+    })
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AI COST OPTIMIZATION ADVISOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _load_resin_rates():
+    """Load resin supplier rates from RESIN_EXCEL for comparison."""
+    rates = {}
+    try:
+        xl = load_excel_cached('resin')
+        if xl is None:
+            return rates
+        for sheet in xl.sheet_names:
+            if sheet.lower() in ('readme', 'summary', 'index', 'price history'):
+                continue
+            try:
+                df = xl.parse(sheet)
+                df.columns = [str(c).strip() for c in df.columns]
+                if 'Location' in df.columns and 'Grade' in df.columns:
+                    # Find latest price column (rightmost numeric)
+                    price_cols = [c for c in df.columns if c not in ('Location', 'Grade', 'Supplier', 'Source', 'Unit', 'Currency')]
+                    num_prices = []
+                    for pc in reversed(price_cols):
+                        try:
+                            vals = pd.to_numeric(df[pc], errors='coerce')
+                            if vals.notna().sum() > 0:
+                                num_prices.append((pc, vals))
+                                break
+                        except Exception:
+                            continue
+                    if num_prices:
+                        pc, vals = num_prices[0]
+                        for idx, row in df.iterrows():
+                            loc = str(row.get('Location', '')).strip()
+                            grade = str(row.get('Grade', '')).strip()
+                            supplier = str(row.get('Supplier', loc)).strip()
+                            price = vals.iloc[idx] if idx < len(vals) else None
+                            if pd.notna(price) and price > 0:
+                                key = f"{sheet}_{grade}_{loc}"
+                                rates[key] = {
+                                    'resin_type': sheet,
+                                    'grade': grade,
+                                    'location': loc,
+                                    'supplier': supplier,
+                                    'price': float(price),
+                                }
+            except Exception:
+                continue
+    except Exception as e:
+        logger.warning(f"Resin rates load error: {e}")
+    return rates
+
+
+def _load_country_costs():
+    """Load geo variable costs for country optimization."""
+    country_data = {}
+    try:
+        df = load_excel_cached('cost', sheet_name="Data", header=9)
+        if isinstance(df, pd.DataFrame) and not df.empty:
+            df.columns = [str(c).strip() for c in df.columns]
+            for _, row in df.iterrows():
+                country = str(row.iloc[0]).strip()
+                if not country or country == 'nan':
+                    continue
+                info = {'name': country}
+                for col in df.columns[1:]:
+                    cl = col.lower()
+                    try:
+                        val = float(row[col])
+                    except (ValueError, TypeError):
+                        continue
+                    if 'electricity' in cl:
+                        info['electricity'] = val
+                    elif any(k in cl for k in ['labour', 'operator']) and 'engineer' not in cl:
+                        info['labour'] = val
+                    elif 'land' in cl:
+                        info['land'] = val
+                country_data[country] = info
+    except Exception as e:
+        logger.warning(f"Country costs load error: {e}")
+    return country_data
+
+
+# Material substitution map
+_MATERIAL_SUBSTITUTIONS = {
+    'HDPE': [('rHDPE', 'Recycled HDPE — typically 10-20% cheaper', 0.15)],
+    'PET': [('rPET', 'Recycled PET — growing availability, 5-15% cheaper', 0.10)],
+    'LDPE': [('LLDPE', 'LLDPE blend — better strength-to-cost ratio', 0.08)],
+    'PP': [('rPP', 'Recycled PP — 8-12% cost reduction', 0.10)],
+    'PVC': [('PET', 'PET substitution — lighter, recyclable', 0.12)],
+    'PS': [('PP', 'PP substitution — better recyclability', 0.05)],
+    'LLDPE': [('mLLDPE', 'Metallocene LLDPE — downgauge potential 10-15%', 0.12)],
+}
+
+
+@app.route("/api/cost_advisor", methods=["POST"])
+@login_required
+def api_cost_advisor():
+    """AI Cost Optimization Advisor — analyzes SKUs and suggests savings.
+    Input: list of SKU objects with inputs/results/model fields.
+    Output: ranked optimization opportunities."""
+    data = request.get_json()
+    if not data or 'skus' not in data:
+        return jsonify({"error": "No SKU data"}), 400
+
+    skus = data['skus'][:5]
+    recommendations = []
+
+    # Load reference data
+    resin_rates = _load_resin_rates()
+    country_costs = _load_country_costs()
+
+    for sku in skus:
+        sku_name = sku.get('name', 'Unknown')
+        inputs = sku.get('inputs', {})
+        results = sku.get('results', {})
+        model_type = sku.get('model', 'ebm')
+
+        # ── 1. RESIN / MATERIAL OPTIMIZATION ──
+        resin_type = inputs.get('l1_polymer_type', inputs.get('resin', inputs.get('resin_type', '')))
+        current_rate = 0
+        for k in ['l1_polymer_rate', 'resin_cost', 'resin_rate', 'mat_cost', 'board_cost']:
+            try:
+                v = float(inputs.get(k, 0))
+                if v > 0:
+                    current_rate = v
+                    break
+            except (ValueError, TypeError):
+                continue
+
+        if resin_type and current_rate > 0:
+            # Find cheaper suppliers for same resin type
+            cheaper = []
+            for rk, rv in resin_rates.items():
+                if rv['resin_type'].upper() == resin_type.upper() and rv['price'] < current_rate:
+                    saving = current_rate - rv['price']
+                    cheaper.append({
+                        'supplier': rv['supplier'],
+                        'location': rv['location'],
+                        'grade': rv['grade'],
+                        'price': rv['price'],
+                        'saving': round(saving, 2),
+                    })
+            cheaper.sort(key=lambda x: x['saving'], reverse=True)
+            if cheaper:
+                best = cheaper[0]
+                saving_pct = round((best['saving'] / current_rate) * 100, 1)
+                recommendations.append({
+                    'sku': sku_name,
+                    'title': 'Resin Supplier Optimization',
+                    'category': 'material',
+                    'impact': f"₹{best['saving']}/kg saving ({saving_pct}%)",
+                    'impact_value': best['saving'],
+                    'confidence': 'High' if saving_pct > 5 else 'Medium',
+                    'action': f"Switch to {best['supplier']} ({best['location']}) — ₹{best['price']}/kg vs current ₹{current_rate}/kg",
+                    'details': f"Found {len(cheaper)} cheaper supplier(s) for {resin_type}",
+                })
+
+        # ── 2. MATERIAL SUBSTITUTION ──
+        if resin_type and resin_type.upper() in _MATERIAL_SUBSTITUTIONS:
+            for alt, desc, saving_ratio in _MATERIAL_SUBSTITUTIONS[resin_type.upper()]:
+                estimated_saving = round(current_rate * saving_ratio, 2) if current_rate > 0 else 0
+                recommendations.append({
+                    'sku': sku_name,
+                    'title': 'Material Substitution',
+                    'category': 'material',
+                    'impact': f"~₹{estimated_saving}/kg potential saving" if estimated_saving > 0 else f"~{int(saving_ratio*100)}% potential saving",
+                    'impact_value': estimated_saving,
+                    'confidence': 'Medium',
+                    'action': f"Consider {alt} instead of {resin_type} — {desc}",
+                    'details': f"Requires qualification testing. Estimated {int(saving_ratio*100)}% cost reduction.",
+                })
+
+        # ── 3. COUNTRY / GEO OPTIMIZATION ──
+        current_country = inputs.get('country', '')
+        if current_country and country_costs:
+            current_cc = country_costs.get(current_country, {})
+            current_elec = current_cc.get('electricity', 0)
+            current_labour = current_cc.get('labour', 0)
+
+            if current_elec > 0 or current_labour > 0:
+                cheaper_countries = []
+                for cn, cc in country_costs.items():
+                    if cn == current_country:
+                        continue
+                    score = 0
+                    details = []
+                    if current_elec > 0 and cc.get('electricity', 0) > 0:
+                        elec_saving = current_elec - cc['electricity']
+                        if elec_saving > 0:
+                            score += elec_saving
+                            details.append(f"Electricity: {cc['electricity']} vs {current_elec}")
+                    if current_labour > 0 and cc.get('labour', 0) > 0:
+                        lab_saving = current_labour - cc['labour']
+                        if lab_saving > 0:
+                            score += lab_saving * 0.001  # Normalize
+                            details.append(f"Labour: {cc['labour']:,.0f} vs {current_labour:,.0f}")
+                    if score > 0:
+                        cheaper_countries.append({'country': cn, 'score': score, 'details': details})
+
+                cheaper_countries.sort(key=lambda x: x['score'], reverse=True)
+                if cheaper_countries:
+                    best_cc = cheaper_countries[0]
+                    recommendations.append({
+                        'sku': sku_name,
+                        'title': 'Country Cost Optimization',
+                        'category': 'geography',
+                        'impact': f"Lower operating costs in {best_cc['country']}",
+                        'impact_value': best_cc['score'],
+                        'confidence': 'Medium',
+                        'action': f"Evaluate production in {best_cc['country']} — {'; '.join(best_cc['details'][:2])}",
+                        'details': f"Top alternatives: {', '.join(c['country'] for c in cheaper_countries[:3])}",
+                    })
+
+        # ── 4. FREIGHT CONSOLIDATION ──
+        if len(skus) > 1:
+            suppliers_used = set()
+            for s in skus:
+                si = s.get('inputs', {})
+                sup = si.get('l1_polymer_type', si.get('resin', si.get('supplier', '')))
+                if sup:
+                    suppliers_used.add(sup)
+            if len(suppliers_used) == 1 and len(skus) >= 2:
+                recommendations.append({
+                    'sku': 'All SKUs',
+                    'title': 'Freight Consolidation',
+                    'category': 'logistics',
+                    'impact': 'Potential 5-15% freight saving',
+                    'impact_value': 5.0,
+                    'confidence': 'High',
+                    'action': f"All {len(skus)} SKUs use same supplier ({list(suppliers_used)[0]}) — consolidate shipments",
+                    'details': 'Negotiate volume-based freight rates for combined orders',
+                })
+            elif len(suppliers_used) > 2:
+                recommendations.append({
+                    'sku': 'All SKUs',
+                    'title': 'Supplier Consolidation',
+                    'category': 'logistics',
+                    'impact': 'Reduce procurement complexity + freight',
+                    'impact_value': 3.0,
+                    'confidence': 'Medium',
+                    'action': f"Currently using {len(suppliers_used)} different suppliers — consider consolidating to 1-2 strategic partners",
+                    'details': f"Suppliers: {', '.join(list(suppliers_used)[:5])}",
+                })
+
+        # ── 5. MACHINE EFFICIENCY (if EBM) ──
+        if model_type == 'ebm':
+            cycle_time = float(inputs.get('mould_cycle_time', 0))
+            cavitation = int(inputs.get('mould_cavitation', 0))
+            if cycle_time > 0 and cavitation > 0:
+                # Suggest optimization
+                if cycle_time > 15:
+                    recommendations.append({
+                        'sku': sku_name,
+                        'title': 'Cycle Time Optimization',
+                        'category': 'conversion',
+                        'impact': f"Reducing cycle from {cycle_time}s to {cycle_time*0.9:.1f}s = ~10% throughput gain",
+                        'impact_value': 2.0,
+                        'confidence': 'Medium',
+                        'action': f"Optimize mould cooling — current {cycle_time}s cycle with {cavitation} cavities",
+                        'details': 'Consider: enhanced cooling channels, better mould material, process parameter tuning',
+                    })
+                if cavitation < 8:
+                    recommendations.append({
+                        'sku': sku_name,
+                        'title': 'Cavitation Increase',
+                        'category': 'conversion',
+                        'impact': 'Higher cavitation reduces per-piece machine cost',
+                        'impact_value': 2.5,
+                        'confidence': 'Low',
+                        'action': f"Current cavitation: {cavitation} — evaluate higher-cavity mould (ROI analysis needed)",
+                        'details': 'Requires new mould investment but reduces conversion cost per piece significantly',
+                    })
+
+    # ── RANK BY IMPACT ──
+    recommendations.sort(key=lambda x: x.get('impact_value', 0), reverse=True)
+
+    # Calculate total potential
+    total_saving = sum(r.get('impact_value', 0) for r in recommendations if r.get('confidence') in ('High', 'Medium'))
+
+    # Deduplicate freight/consolidation (keep only one per title for multi-sku)
+    seen_titles = set()
+    deduped = []
+    for r in recommendations:
+        key = r['title'] + '_' + r.get('sku', '')
+        if key not in seen_titles:
+            seen_titles.add(key)
+            deduped.append(r)
+
+    return jsonify({
+        'success': True,
+        'recommendations': deduped[:10],
+        'total_potential_saving': round(total_saving, 2),
+        'skus_analyzed': len(skus),
+    })
+
 
 # ================= APPLICATION STARTUP =================
 if __name__ == "__main__":
