@@ -1166,6 +1166,519 @@ def parse_pet_film_pdf(file_bytes, filename=""):
     return records
 
 
+def parse_bopp_film_pdf(file_bytes, filename=""):
+    """Parse JPFL-style BOPP film price-list PDFs.
+
+    Returns a list of dicts with keys matching the resin-import record format.
+    The BOPP PDF groups prices by film type category, with lines like:
+        '12 (Print Lamination grade) / WPP 119.0'
+        '25/28/30/33/35/38/40/50 Plain H1-LS 110.0'
+    """
+    import re
+    from datetime import datetime as dt
+
+    try:
+        import pdfplumber
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "pdfplumber", "--break-system-packages", "-q"])
+        import pdfplumber
+
+    records = []
+
+    pdf_file = io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
+    pdf_file.seek(0)
+
+    with pdfplumber.open(pdf_file) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    if not full_text.strip():
+        logger.warning(f"BOPP PDF '{filename}': no extractable text")
+        return records
+
+    # --- Extract effective date (W.E.F dd.mm.yyyy) ---
+    date_col = "Unknown"
+    date_match = re.search(
+        r'W\.?\s*E\.?\s*F\.?\s*[:\-]?\s*[\s\S]{0,30}?(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})',
+        full_text, re.IGNORECASE
+    )
+    if not date_match:
+        date_match = re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})', full_text[:500])
+    if date_match:
+        d, m, y = date_match.groups()
+        y = y if len(y) == 4 else f"20{y}"
+        try:
+            price_date = dt.strptime(f"{d}/{m}/{y}", "%d/%m/%Y")
+            date_col = f"{price_date.month}/{price_date.day}/{price_date.year}"
+        except ValueError:
+            date_col = f"{d}/{m}/{y}"
+
+    # --- Detect supplier ---
+    supplier = "JPFL"
+    for name, patterns in SUPPLIER_PATTERNS.items():
+        for pat in patterns:
+            if _re.search(pat, full_text.upper()) or _re.search(pat, filename.upper()):
+                supplier = name
+                break
+
+    # --- Parse line-by-line ---
+    lines = full_text.split("\n")
+
+    # BOPP category patterns (order matters: more specific first)
+    BOPP_CATEGORY_PATTERNS = [
+        (r'METALISED\s*FILMS?',                            'Metallised Films'),
+        (r'TAPE\s+TEXTILE\s*[-–]\s*BGR\s*/\s*BGS',        'Tape Textile BGR/BGS'),
+        (r'TAPE\s+TEXTILE\s*[-–]\s*BGB.*?/\s*ULH',        'Tape Textile BGB/ULH'),
+        (r'TAPE\s+TEXTILE\s*[-–]\s*ATC\s*/\s*BGC',        'Tape Textile ATC/BGC'),
+        (r'TAPE\s+TEXTILE',                                'Tape Textile'),
+        (r'(?:Plain\s*)?Non\s*Heat\s*[Ss]ealable',        'Plain Non-HS'),   # MUST come before Heat Sealable
+        (r'Type\s*:\s*Plain\s*Non',                        'Plain Non-HS'),
+        (r'Heat\s*Sealable\s*Films?',                      'Heat Sealable'),
+        (r'Type\s*:\s*Heat\s*Seal',                        'Heat Sealable'),
+    ]
+
+    current_category = "General"
+
+    # Pattern: lines starting with micron spec, description, then price at end
+    # e.g. "12 (Print Lamination grade) / WPP 119.0"
+    # e.g. "25/28/30/33/35/38/40/50 Plain H1-LS 110.0"
+    bopp_line_re = re.compile(
+        r'^(\d+(?:\s*/\s*\d+)*(?:\s*[-–]\s*\d+)?(?:\s*(?:to|[-–])\s*\d+)?)'  # micron spec
+        r'\s+'
+        r'(.+?)'                                                                # description
+        r'\s+'
+        r'(\d+(?:\.\d+)?)\s*$'                                                 # price
+    )
+
+    # Concatenated pattern: micron glued to grade, e.g. "18N1-HCF 116.0", "55H2-PLG 119.0"
+    concat_line_re = re.compile(
+        r'^(\d+)([A-Z][A-Za-z0-9/\-]+)'    # micron + grade (no space)
+        r'\s+'
+        r'(.+?)\s*'                          # optional extra description
+        r'(\d+(?:\.\d+)?)\s*$'               # price
+    )
+
+    # Even simpler concat: "18N1-HCF 116.0" (micron+grade then just price)
+    concat_simple_re = re.compile(
+        r'^(\d+)([A-Z][A-Za-z0-9/\-]+)\s+'  # micron + grade (no space)
+        r'(\d+(?:\.\d+)?)\s*$'               # price
+    )
+
+    # Simpler pattern for metallised/tape textile: "15 N2 129.0" or "20 108.0"
+    simple_line_re = re.compile(
+        r'^(\d+(?:\s*/\s*\d+)*(?:\s*[-–]\s*\d+)?(?:\s*(?:to|[-–])\s*\d+)?)'  # micron
+        r'\s+'
+        r'(\d+(?:\.\d+)?)\s*$'                                                 # price only
+    )
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Skip non-data lines
+        if re.search(r'Page\s+\d+\s+of\s+\d+', stripped, re.IGNORECASE):
+            continue
+        if re.search(r'Contact\s+(?:our|sales)', stripped, re.IGNORECASE):
+            continue
+        if re.search(r'Other\s+(?:Information|terms)', stripped, re.IGNORECASE):
+            continue
+        if re.search(r'(?:NON\s+TAPE\s+TEXTILE\s*:|Including\s+Freight|JPFL\s+Prime|INR\s*/\s*Kg|STANDARD\s*-?\s*Micron|Untreated|From\s+\d+:\d+|Onwards|Upcharge|E-\s*Commerce|esales@|Price\s+above|Cash\s+Discount)', stripped, re.IGNORECASE):
+            continue
+
+        # --- Check for category header ---
+        matched_cat = False
+        for pat, cat_name in BOPP_CATEGORY_PATTERNS:
+            if re.search(pat, stripped, re.IGNORECASE):
+                current_category = cat_name
+                matched_cat = True
+                break
+
+        if matched_cat:
+            # Some category lines may also have data on them — skip if pure header
+            if not re.search(r'\d+\.\d+\s*$', stripped):
+                continue
+
+        # --- Try full pattern: micron + description + price ---
+        m = bopp_line_re.match(stripped)
+        if m:
+            micron_spec = m.group(1).strip()
+            description = m.group(2).strip()
+            price_str = m.group(3).strip()
+            try:
+                price = float(price_str)
+                grade_label = f"{current_category} {micron_spec} {description}".strip()
+                records.append({
+                    'resin_type': 'BOPP',
+                    'supplier': supplier,
+                    'country': 'India',
+                    'location': 'India',
+                    'grade': grade_label,
+                    'unit': 'Rs/ Kg',
+                    'date': date_col,
+                    'price': price,
+                    'state': '',
+                    'depot': '',
+                })
+            except (ValueError, TypeError):
+                pass
+            continue
+
+        # --- Try concatenated pattern: "18N1-HCF 116.0" or "55H2-PLG 119.0" ---
+        mc = concat_simple_re.match(stripped)
+        if not mc:
+            mc = concat_line_re.match(stripped)
+        if mc:
+            groups = mc.groups()
+            micron_spec = groups[0].strip()
+            grade_code = groups[1].strip()
+            price_str = groups[-1].strip()
+            # Extra description if 4-group match
+            extra = groups[2].strip() if len(groups) == 4 else ""
+            try:
+                price = float(price_str)
+                if 50 <= price <= 500:
+                    desc_parts = [grade_code]
+                    if extra and not re.match(r'^\d+(?:\.\d+)?$', extra):
+                        desc_parts.append(extra)
+                    grade_label = f"{current_category} {micron_spec} {' '.join(desc_parts)}".strip()
+                    records.append({
+                        'resin_type': 'BOPP',
+                        'supplier': supplier,
+                        'country': 'India',
+                        'location': 'India',
+                        'grade': grade_label,
+                        'unit': 'Rs/ Kg',
+                        'date': date_col,
+                        'price': price,
+                        'state': '',
+                        'depot': '',
+                    })
+            except (ValueError, TypeError):
+                pass
+            continue
+
+        # --- Try simple pattern: micron + price only ---
+        m2 = simple_line_re.match(stripped)
+        if m2:
+            micron_spec = m2.group(1).strip()
+            price_str = m2.group(2).strip()
+            try:
+                price = float(price_str)
+                # Only accept if price is in reasonable range (100-300 for BOPP)
+                if 50 <= price <= 500:
+                    grade_label = f"{current_category} {micron_spec}".strip()
+                    records.append({
+                        'resin_type': 'BOPP',
+                        'supplier': supplier,
+                        'country': 'India',
+                        'location': 'India',
+                        'grade': grade_label,
+                        'unit': 'Rs/ Kg',
+                        'date': date_col,
+                        'price': price,
+                        'state': '',
+                        'depot': '',
+                    })
+            except (ValueError, TypeError):
+                pass
+
+        # --- Fallback: lines with trailing dash on micron, e.g. "15- Opaque 138.0" ---
+        dash_fallback = re.match(
+            r'^(\d+)\s*[-–]\s*(.+?)\s+(\d+(?:\.\d+)?)\s*$', stripped
+        )
+        if dash_fallback:
+            micron_spec = dash_fallback.group(1).strip()
+            description = dash_fallback.group(2).strip()
+            price_str = dash_fallback.group(3).strip()
+            try:
+                price = float(price_str)
+                if 50 <= price <= 500:
+                    grade_label = f"{current_category} {micron_spec} {description}".strip()
+                    # Avoid duplicating records already captured above
+                    if not any(r['grade'] == grade_label and r['price'] == price for r in records[-5:]):
+                        records.append({
+                            'resin_type': 'BOPP',
+                            'supplier': supplier,
+                            'country': 'India',
+                            'location': 'India',
+                            'grade': grade_label,
+                            'unit': 'Rs/ Kg',
+                            'date': date_col,
+                            'price': price,
+                            'state': '',
+                            'depot': '',
+                        })
+            except (ValueError, TypeError):
+                pass
+
+    logger.info(f"BOPP PDF '{filename}': extracted {len(records)} price records, date={date_col}")
+    return records
+
+
+def parse_cpp_film_pdf(file_bytes, filename=""):
+    """Parse JPFL-style CPP film price-list PDFs.
+
+    Returns a list of dicts with keys matching the resin-import record format.
+    The CPP PDF groups prices by film type, with lines like:
+        '15 Mic 111.0'
+        '28 to 60 mic 105.0'
+    """
+    import re
+    from datetime import datetime as dt
+
+    try:
+        import pdfplumber
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "pdfplumber", "--break-system-packages", "-q"])
+        import pdfplumber
+
+    records = []
+
+    pdf_file = io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
+    pdf_file.seek(0)
+
+    with pdfplumber.open(pdf_file) as pdf:
+        full_text = "\n".join(page.extract_text() or "" for page in pdf.pages)
+
+    if not full_text.strip():
+        logger.warning(f"CPP PDF '{filename}': no extractable text")
+        return records
+
+    # --- Extract effective date ---
+    date_col = "Unknown"
+    date_match = re.search(
+        r'W\.?\s*E\.?\s*F\.?\s*[:\-]?\s*[\s\S]{0,30}?(\d{1,2})[./-](\d{1,2})[./-](\d{2,4})',
+        full_text, re.IGNORECASE
+    )
+    if not date_match:
+        date_match = re.search(r'(\d{1,2})[./-](\d{1,2})[./-](\d{4})', full_text[:500])
+    if date_match:
+        d, m, y = date_match.groups()
+        y = y if len(y) == 4 else f"20{y}"
+        try:
+            price_date = dt.strptime(f"{d}/{m}/{y}", "%d/%m/%Y")
+            date_col = f"{price_date.month}/{price_date.day}/{price_date.year}"
+        except ValueError:
+            date_col = f"{d}/{m}/{y}"
+
+    # --- Detect supplier ---
+    supplier = "JPFL"
+    for name, patterns in SUPPLIER_PATTERNS.items():
+        for pat in patterns:
+            if _re.search(pat, full_text.upper()) or _re.search(pat, filename.upper()):
+                supplier = name
+                break
+
+    # --- Parse line-by-line ---
+    lines = full_text.split("\n")
+
+    # CPP category patterns
+    CPP_CATEGORY_PATTERNS = [
+        (r'METALISED\s*FILMS?',                          'Metallised Films'),
+        (r'Stationery\s*Grade\s*SCPP',                   'Stationery SCPP'),
+        (r'TCPP\s*CPP\s*Film',                           'TCPP'),
+        (r'Bread\s*Wrap.*?H1-BR.*?High\s*Impact',        'Bread Wrap H1-BR'),
+        (r'Bread\s*Wrap.*?S1-BR',                        'Bread Wrap S1-BR'),
+        (r'Bread\s*Wrap.*?BRE',                          'Bread Wrap BRE'),
+        (r'Bread\s*Wrap',                                'Bread Wrap'),
+        (r'White\s*Opaque.*?OPL',                        'White Opaque OPL'),
+        (r'White\s*Opaque',                              'White Opaque'),
+        (r'Plain\s*CPP\s*Film.*?\(Low\s*Strength\)',     'Plain CPP Low Strength'),
+        (r'Plain\s*CPP\s*Film\s*[-–]?\s*\(?(TH1\s*LSIMZ)\)?', 'Plain CPP LSIMZ'),
+        (r'Plain\s*CPP\s*Film\s*[-–]?\s*\(?(TH1\s*LSIPL)\)?', 'Plain CPP LSIPL'),
+        (r'Plain\s*CPP\s*Film\s*[-–]?\s*\(?(TH1\s*LSMZ)\)?',  'Plain CPP LSMZ'),
+        (r'Plain\s*CPP\s*Film\s*[-–]?\s*\(?(TH1\s*LSPL)\)?',  'Plain CPP LSPL'),
+        (r'Plain\s*CPP\s*Film\s*[-–]?\s*\(?(TH1\s*MZ)\)?',    'Plain CPP MZ'),
+        (r'Plain\s*CPP\s*Film\s*[-–]?\s*\(?(TH1\s*PL)\)?',    'Plain CPP PL'),
+        (r'Plain\s*CPP\s*Film',                          'Plain CPP'),
+    ]
+
+    current_category = "General"
+
+    # Pattern: "15 Mic 111.0" or "28 to 60 mic 105.0" or "120 Mic 111.0"
+    cpp_mic_price_re = re.compile(
+        r'^(\d+(?:\s*(?:to|[-–])\s*\d+)?)\s*'   # micron spec
+        r'[Mm]ic(?:ron)?\s+'                      # "Mic" or "mic"
+        r'(\d+(?:\.\d+)?)\s*$'                    # price
+    )
+
+    # Pattern for lines without "Mic": "30 to 60 mic 109.0" already covered,
+    # but also handle "120 Mic 111.0" style for stationery grade
+    # And category-level prices: "20 TO 39 Mic 106.0"
+    cpp_range_price_re = re.compile(
+        r'^(\d+)\s+TO\s+(\d+)\s+[Mm]ic(?:ron)?\s+'
+        r'(\d+(?:\.\d+)?)\s*$',
+        re.IGNORECASE
+    )
+
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+
+        # Skip non-data lines
+        if re.search(r'Page\s+\d+\s+of\s+\d+', stripped, re.IGNORECASE):
+            continue
+        if re.search(r'Contact\s+(?:our|sales)', stripped, re.IGNORECASE):
+            continue
+        if re.search(r'Other\s+(?:Information|terms)', stripped, re.IGNORECASE):
+            continue
+        if re.search(r'(?:JPFL\s+Prime|INR\s*/\s*Kg|FREIGHT|GST\s+EXTRA|Upcharge|E-\s*Commerce|esales@|Price\s+above|Cash\s+Discount|Standard\s+Thickness)', stripped, re.IGNORECASE):
+            continue
+
+        # --- Check for category header ---
+        matched_cat = False
+        for pat, cat_name in CPP_CATEGORY_PATTERNS:
+            if re.search(pat, stripped, re.IGNORECASE):
+                current_category = cat_name
+                matched_cat = True
+                break
+
+        if matched_cat:
+            # Some lines are both category headers AND have data (e.g.
+            # "Plain CPP Film (Low Strength)TH1 PLB) 25 Mic 103.0")
+            inline_mic = re.search(
+                r'(\d+(?:\s*(?:to|[-–])\s*\d+)?)\s*[Mm]ic(?:ron)?\s+(\d+(?:\.\d+)?)\s*$',
+                stripped
+            )
+            if inline_mic:
+                try:
+                    price = float(inline_mic.group(2))
+                    mic_spec = inline_mic.group(1).strip()
+                    grade_label = f"{current_category} {mic_spec} Mic"
+                    records.append({
+                        'resin_type': 'CPP',
+                        'supplier': supplier,
+                        'country': 'India',
+                        'location': 'India',
+                        'grade': grade_label,
+                        'unit': 'Rs/ Kg',
+                        'date': date_col,
+                        'price': price,
+                        'state': '',
+                        'depot': '',
+                    })
+                except (ValueError, TypeError):
+                    pass
+                continue  # Already extracted data from this line
+            if not re.search(r'\d+\.\d+\s*$', stripped):
+                continue
+
+        # --- Try TO range pattern: "20 TO 39 Mic 106.0" ---
+        m_range = cpp_range_price_re.match(stripped)
+        if m_range:
+            mic_from = m_range.group(1).strip()
+            mic_to = m_range.group(2).strip()
+            price_str = m_range.group(3).strip()
+            try:
+                price = float(price_str)
+                grade_label = f"{current_category} {mic_from}-{mic_to} Mic"
+                records.append({
+                    'resin_type': 'CPP',
+                    'supplier': supplier,
+                    'country': 'India',
+                    'location': 'India',
+                    'grade': grade_label,
+                    'unit': 'Rs/ Kg',
+                    'date': date_col,
+                    'price': price,
+                    'state': '',
+                    'depot': '',
+                })
+            except (ValueError, TypeError):
+                pass
+            continue
+
+        # --- Try standard mic+price pattern ---
+        m = cpp_mic_price_re.match(stripped)
+        if m:
+            micron_spec = m.group(1).strip()
+            price_str = m.group(2).strip()
+            try:
+                price = float(price_str)
+                grade_label = f"{current_category} {micron_spec} Mic"
+                records.append({
+                    'resin_type': 'CPP',
+                    'supplier': supplier,
+                    'country': 'India',
+                    'location': 'India',
+                    'grade': grade_label,
+                    'unit': 'Rs/ Kg',
+                    'date': date_col,
+                    'price': price,
+                    'state': '',
+                    'depot': '',
+                })
+            except (ValueError, TypeError):
+                pass
+
+    logger.info(f"CPP PDF '{filename}': extracted {len(records)} price records, date={date_col}")
+    return records
+
+
+def detect_film_pdf_type(file_bytes, filename=""):
+    """Detect whether a PDF is a BOPP, CPP, or PET (BOPET) film price list.
+
+    Returns one of: 'BOPP', 'CPP', 'PET', or None if unrecognised.
+    Checks filename first, then PDF text content.
+    """
+    import re
+
+    fname_upper = filename.upper()
+
+    # Filename-based detection (most reliable)
+    if re.search(r'\bBOPP\b', fname_upper):
+        return 'BOPP'
+    if re.search(r'\bCPP\b', fname_upper):
+        return 'CPP'
+    if re.search(r'\bBOPET\b|\bPET\b', fname_upper):
+        return 'PET'
+
+    # Content-based detection
+    try:
+        import pdfplumber
+    except ImportError:
+        import subprocess, sys
+        subprocess.check_call([sys.executable, "-m", "pip", "install",
+                               "pdfplumber", "--break-system-packages", "-q"])
+        import pdfplumber
+
+    pdf_file = io.BytesIO(file_bytes) if isinstance(file_bytes, bytes) else file_bytes
+    pdf_file.seek(0)
+
+    try:
+        with pdfplumber.open(pdf_file) as pdf:
+            # Read first 2 pages for detection
+            text = "\n".join(
+                (pdf.pages[i].extract_text() or "") for i in range(min(2, len(pdf.pages)))
+            )
+    except Exception:
+        return None
+
+    text_upper = text.upper()
+
+    if re.search(r'\bBOPP\b', text_upper):
+        return 'BOPP'
+    if re.search(r'\bCPP\s+FILM\b|\bCPP\b', text_upper):
+        return 'CPP'
+    if re.search(r'\bBOPET\b|\bPET\s+FILM\b', text_upper):
+        return 'PET'
+
+    # Heuristic: check for distinctive keywords
+    if re.search(r'TAPE\s+TEXTILE|HEAT\s*SEALABLE\s*FILMS|NON\s*HEAT\s*SEALABLE', text_upper):
+        return 'BOPP'
+    if re.search(r'BREAD\s*WRAP|TCPP|STATIONERY\s*GRADE\s*SCPP', text_upper):
+        return 'CPP'
+    if re.search(r'THIN\s*FILM|THICK\s*FILM|YARN\s*GRADE|TWIST\s*GRADE', text_upper):
+        return 'PET'
+
+    return None
+
+
 @app.route("/api/import_resin_prices", methods=["POST"])
 @role_required('admin')
 def api_import_resin_prices():
@@ -1192,11 +1705,34 @@ def api_import_resin_prices():
                 continue
             fname = file_obj.filename
 
-            # --- PDF path: PET film price lists ---
+            # --- PDF path: BOPP / CPP / PET film price lists ---
             if fname.lower().endswith('.pdf'):
                 try:
                     pdf_bytes = file_obj.read()
-                    pdf_records = parse_pet_film_pdf(pdf_bytes, filename=fname)
+
+                    # Auto-detect film type from filename & content
+                    film_type = detect_film_pdf_type(pdf_bytes, filename=fname)
+                    logger.info(f"PDF '{fname}': detected film type = {film_type}")
+
+                    if film_type == 'BOPP':
+                        pdf_records = parse_bopp_film_pdf(pdf_bytes, filename=fname)
+                    elif film_type == 'CPP':
+                        pdf_records = parse_cpp_film_pdf(pdf_bytes, filename=fname)
+                    elif film_type == 'PET':
+                        pdf_records = parse_pet_film_pdf(pdf_bytes, filename=fname)
+                    else:
+                        # Try all parsers; use whichever yields the most records
+                        pet_recs = parse_pet_film_pdf(pdf_bytes, filename=fname)
+                        bopp_recs = parse_bopp_film_pdf(pdf_bytes, filename=fname)
+                        cpp_recs = parse_cpp_film_pdf(pdf_bytes, filename=fname)
+                        best = max(
+                            [('PET', pet_recs), ('BOPP', bopp_recs), ('CPP', cpp_recs)],
+                            key=lambda x: len(x[1])
+                        )
+                        film_type = best[0] if best[1] else 'Unknown'
+                        pdf_records = best[1]
+                        logger.info(f"PDF '{fname}': fallback detection chose {film_type} ({len(pdf_records)} records)")
+
                     if pdf_records:
                         all_records.extend(pdf_records)
                         file_results.append({
@@ -1208,7 +1744,7 @@ def api_import_resin_prices():
                                 "sheet": "PDF",
                                 "status": "success",
                                 "records": len(pdf_records),
-                                "resin_type": "PET"
+                                "resin_type": film_type or "Unknown"
                             }],
                         })
                     else:
@@ -1459,7 +1995,7 @@ def api_import_resin_prices():
             if records_df.empty:
                 return jsonify({
                     "error": f"All {unknown_count} records have Unknown resin type. "
-                             "Ensure files contain HDPE/LLDPE/LDPE/PP/PET etc. in headers, "
+                             "Ensure files contain HDPE/LLDPE/LDPE/PP/PET/BOPP/CPP etc. in headers, "
                              "sheet names, or filenames.",
                     "file_results": file_results
                 }), 400
@@ -7529,7 +8065,14 @@ def api_multi_country_generic():
             'Costa Rica':{'elec':115.84,'labour':8329800,'engineer':19824924,'pm':45147516,'euro':581.9},
         }
 
-        base_cv = cdb.get(base_country, cdb['India'])
+        base_cv = cdb.get(base_country)
+        if not base_cv:
+            for k in cdb:
+                if k.lower() in base_country.lower() or base_country.lower() in k.lower():
+                    base_cv = cdb[k]
+                    break
+            if not base_cv:
+                base_cv = cdb['India']
         base_euro = base_cv['euro']
         # Normalize base costs to EUR for comparison
         base_mat = float(base_result.get('material_cost', 0))
@@ -7587,7 +8130,12 @@ def api_multi_country_generic():
                 conv_eur = conv_local_scaled / base_euro if base_euro > 0 else 0
 
                 # Margin: proportional to conversion (same margin %)
-                margin_pct = (base_margin / base_conv) if base_conv > 0 else 0.20
+                if base_conv > 0:
+                    margin_pct = base_margin / base_conv
+                elif base_total > 0:
+                    margin_pct = base_margin / base_total
+                else:
+                    margin_pct = 0.20
                 margin_eur = conv_eur * margin_pct
 
                 # Packing: scale by EUR rate ratio
@@ -8386,18 +8934,14 @@ ADMIN_DASHBOARD_HTML = """
             color: white; 
         }
         .navbar {
-    background: linear-gradient(
-        135deg,
-        var(--royal-blue) 0%,
-        var(--royal-blue-light) 50%,
-        var(--royal-blue-dark) 100%
-    );
-    padding: 20px 40px;
-    display: flex;
-    align-items: center;
-    border-bottom: 1px solid rgba(255,255,255,0.15);
-}
-
+            background: rgba(0,0,0,0.3);
+            backdrop-filter: blur(10px);
+            -webkit-backdrop-filter: blur(10px);
+            padding: 0 40px;
+            height: 60px;
+            display: flex;
+            align-items: center;
+            border-bottom: 1px solid rgba(255,255,255,0.1);
         }
         .navbar h1 {
             flex: 1;
@@ -8687,7 +9231,7 @@ ADMIN_DASHBOARD_HTML = """
         
         <div class="card">
             <h2>📊 Import Monthly Resin Prices</h2>
-            <p style="margin-bottom:15px;opacity:0.85;">Upload monthly price Excel files (from Reliance/IOCL etc.) or PET film price-list PDFs (JPFL etc.) to auto-parse grades, locations & prices into the resin database.</p>
+            <p style="margin-bottom:15px;opacity:0.85;">Upload monthly price Excel files (from Reliance/IOCL etc.) or film price-list PDFs (JPFL BOPP/CPP/BOPET etc.) to auto-parse grades, locations & prices into the resin database.</p>
             <form id="import-form" enctype="multipart/form-data">
                 <div style="margin-bottom:15px;">
                     <label for="price-files" style="display:block;margin-bottom:8px;font-weight:600;font-size:1rem;cursor:pointer;">
@@ -11237,50 +11781,54 @@ BASE_HTML = """
         .navbar { 
             background: rgba(0,0,0,0.3); 
             backdrop-filter: blur(10px); 
-            padding: 0 40px; 
+            -webkit-backdrop-filter: blur(10px);
+            padding: 0 32px; 
             display: flex; 
             align-items: center; 
             border-bottom: 1px solid rgba(255,255,255,0.1);
-            height: 64px;
-            position: relative;
+            height: 60px;
+            position: sticky;
+            top: 0;
             z-index: 100;
         }
         .navbar-logo {
-            margin-right: 40px;
+            margin-right: 28px;
             display: flex;
             align-items: center;
+            flex-shrink: 0;
         }
         .navbar-logo img {
-            height: 40px;
+            height: 36px;
             width: auto;
         }
         .nav-links { 
             margin-left: auto; 
             display: flex; 
-            gap: 4px;
+            gap: 2px;
             align-items: center;
             height: 100%;
         }
         .nav-links > a, .nav-group > .nav-group-toggle { 
-            color: white; 
+            color: rgba(255,255,255,0.85); 
             text-decoration: none; 
             font-weight: 600; 
-            padding: 10px 16px; 
-            border-radius: 10px; 
-            font-size: 0.78rem; 
+            padding: 8px 12px; 
+            border-radius: 8px; 
+            font-size: 0.76rem; 
             text-transform: uppercase; 
-            transition: all 0.3s;
+            letter-spacing: 0.3px;
+            transition: all 0.2s;
             cursor: pointer;
             border: none;
             background: transparent;
             font-family: 'Outfit', sans-serif;
             display: flex;
             align-items: center;
-            gap: 5px;
+            gap: 4px;
             white-space: nowrap;
         }
-        .nav-links > a:hover, .nav-group:hover > .nav-group-toggle { background: rgba(255,255,255,0.1); }
-        .nav-links > a.active, .nav-group-toggle.active { background: var(--orange); }
+        .nav-links > a:hover, .nav-group:hover > .nav-group-toggle { background: rgba(255,255,255,0.1); color: #ffffff; }
+        .nav-links > a.active, .nav-group-toggle.active { background: var(--orange); color: #ffffff; }
         .nav-group { position: relative; height: 100%; display: flex; align-items: center; }
         .nav-group-toggle svg { width: 12px; height: 12px; transition: transform 0.2s; }
         .nav-group:hover .nav-group-toggle svg { transform: rotate(180deg); }
@@ -11566,7 +12114,7 @@ BASE_HTML = """
         .stat-number { 
             font-size: 3rem; 
             font-weight: 800; 
-            color: var(--orange); 
+            color: #ffffff; 
             margin: 15px 0; 
         }
         .stat-label { 
@@ -11616,7 +12164,7 @@ BASE_HTML = """
         .section-title { 
             font-size: 1.5rem; 
             font-weight: 800; 
-            color: var(--orange); 
+            color: #ffffff; 
             text-transform: uppercase; 
             letter-spacing: 2px; 
         }
@@ -11740,7 +12288,7 @@ BASE_HTML = """
                 <!-- Hidden select for compatibility with existing fetch interceptor -->
                 <select id="project-switcher" style="display:none;"></select>
             </div>
-            <a href="/admin/logout" style="font-size:0.72rem; opacity:0.7;">Logout ({{ session.get('username','') }})</a>
+            <a href="/admin/logout" style="font-size:0.72rem; opacity:0.7; padding:6px 10px; border:1px solid rgba(255,255,255,0.12); border-radius:6px;">{{ session.get('username','') }} · Logout</a>
             {% endif %}
         </div>
     </nav>
@@ -12045,7 +12593,7 @@ DASH_HTML = """
     font-weight: 800;
     text-transform: uppercase;
     letter-spacing: 1.8px;
-    color: var(--orange);
+    color: #ffffff;
     margin-bottom: 4px;
 }
 .dash-mi-subtitle { font-size: 0.8rem; opacity: 0.55; margin-bottom: 18px; }
@@ -12062,16 +12610,16 @@ DASH_HTML = """
 }
 .dash-price-row:hover { background: rgba(255,255,255,0.2); }
 .dash-price-label { font-size: 0.9rem; font-weight: 700; }
-.dash-price-val { font-family: 'JetBrains Mono', monospace; font-size: 1.05rem; font-weight: 800; color: var(--orange); }
+.dash-price-val { font-family: 'JetBrains Mono', monospace; font-size: 1.05rem; font-weight: 800; color: #ffffff; }
 .dash-trend-badge {
     display: inline-flex; align-items: center; gap: 4px;
     padding: 3px 10px; border-radius: 20px;
     font-size: 0.72rem; font-weight: 800;
     font-family: 'JetBrains Mono', monospace;
 }
-.dash-trend-rising { background: rgba(220,53,69,0.2); color: #ff6b7a; border: 1px solid rgba(220,53,69,0.3); }
-.dash-trend-falling { background: rgba(40,167,69,0.2); color: #5ddd8a; border: 1px solid rgba(40,167,69,0.3); }
-.dash-trend-stable { background: rgba(255,193,7,0.2); color: #ffc107; border: 1px solid rgba(255,193,7,0.3); }
+.dash-trend-rising { background: #dc2626; color: #ffffff; border: 1px solid #ef4444; }
+.dash-trend-falling { background: #16a34a; color: #ffffff; border: 1px solid #22c55e; }
+.dash-trend-stable { background: rgba(100,116,139,0.5); color: #e2e8f0; border: 1px solid rgba(148,163,184,0.5); }
 .dash-kpi-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; margin-bottom: 30px; }
 .dash-kpi-card {
     background: rgba(255,255,255,0.15);
@@ -12097,7 +12645,7 @@ DASH_HTML = """
     background: linear-gradient(90deg, var(--orange), #ff8f5e);
 }
 .dash-kpi-icon { font-size: 1.8rem; margin-bottom: 8px; opacity: 0.85; }
-.dash-kpi-num { font-size: clamp(1.5rem, 4vw, 2.2rem); font-weight: 800; color: var(--orange); margin: 4px 0; }
+.dash-kpi-num { font-size: clamp(1.5rem, 4vw, 2.2rem); font-weight: 800; color: #ffffff; margin: 4px 0; }
 .dash-kpi-lbl { font-size: 0.72rem; text-transform: uppercase; letter-spacing: 1.2px; opacity: 0.65; }
 .dash-kpi-sub { font-size: 0.75rem; color: #10b981; margin-top: 6px; }
 .dash-chart-wrap { margin-top: 18px; min-height: 200px; }
@@ -12119,19 +12667,19 @@ DASH_HTML = """
 <!-- ── KPI Cards ────────────────────────────────────────────── -->
 <div class="dash-kpi-grid" id="stats-container">
     <div class="dash-kpi-card">
-        <div class="dash-kpi-icon">🧪</div>
+        <div class="dash-kpi-icon"></div>
         <div class="dash-kpi-lbl">Resin Types</div>
         <div class="dash-kpi-num" id="stat-resin"><span class="loading"></span></div>
         <div class="dash-kpi-sub">Market Coverage</div>
     </div>
     <div class="dash-kpi-card">
-        <div class="dash-kpi-icon">⚙️</div>
+        <div class="dash-kpi-icon"></div>
         <div class="dash-kpi-lbl">Machine Database</div>
         <div class="dash-kpi-num" id="stat-machines"><span class="loading"></span></div>
         <div class="dash-kpi-sub">Equipment Options</div>
     </div>
     <div class="dash-kpi-card">
-        <div class="dash-kpi-icon">🌍</div>
+        <div class="dash-kpi-icon"></div>
         <div class="dash-kpi-lbl">Global Markets</div>
         <div class="dash-kpi-num" id="stat-countries"><span class="loading"></span></div>
         <div class="dash-kpi-sub">Countries Tracked</div>
@@ -12171,7 +12719,7 @@ DASH_HTML = """
 
         <!-- Resin Prices Card -->
         <div class="dash-mi-card">
-            <div class="dash-mi-title">🧪 Resin Price Summary</div>
+            <div class="dash-mi-title"> Resin Price Summary</div>
             <div class="dash-mi-subtitle">Latest average prices by resin type (INR)</div>
             <div id="dash-resin-list"><div class="dash-no-data"><span class="loading"></span> Loading...</div></div>
             <div class="dash-chart-wrap"><div id="dash-resin-chart" style="height:200px;"></div></div>
@@ -12182,7 +12730,7 @@ DASH_HTML = """
 
         <!-- Global Material Prices Card -->
         <div class="dash-mi-card">
-            <div class="dash-mi-title">🌐 Global Material Prices</div>
+            <div class="dash-mi-title"> Global Material Prices</div>
             <div class="dash-mi-subtitle">Latest quarterly average prices by commodity (EUR)</div>
             <div id="dash-gm-list"><div class="dash-no-data"><span class="loading"></span> Loading...</div></div>
             <div class="dash-chart-wrap"><div id="dash-gm-chart" style="height:200px;"></div></div>
@@ -12245,7 +12793,7 @@ async function loadDashboardData() {
             // Bar chart
             const names = pd.resin.map(r => r.resin_type);
             const vals  = pd.resin.map(r => r.avg_price);
-            const cols  = pd.resin.map(r => r.trend === 'Rising' ? '#e63946' : r.trend === 'Falling' ? '#1f9d55' : '#E8601C');
+            const cols  = pd.resin.map(r => r.trend === 'Rising' ? '#ef4444' : r.trend === 'Falling' ? '#22c55e' : '#60a5fa');
             if (typeof Plotly !== 'undefined') {
                 Plotly.newPlot('dash-resin-chart', [{
                     x: names, y: vals, type: 'bar',
@@ -12390,9 +12938,9 @@ RESIN_UI = """
 .worst .location-badge {
     background: #e63946;
 }
-.badge-positive { color: #1f9d55; font-weight: 600; }
-.badge-negative { color: #e63946; font-weight: 600; }
-.badge-warning  { color: #ff7a18; font-weight: 600; }
+.badge-positive { color: #22c55e; font-weight: 700; }
+.badge-negative { color: #f87171; font-weight: 700; }
+.badge-warning  { color: #fbbf24; font-weight: 700; }
 .stat-row {
     display: flex;
     justify-content: space-between;
@@ -12415,16 +12963,16 @@ RESIN_UI = """
     font-weight: 700;
 }
 .trend-rising {
-    background: #e63946;
+    background: #dc2626;
     color: white;
 }
 .trend-falling {
-    background: #1f9d55;
+    background: #16a34a;
     color: white;
 }
 .trend-stable {
-    background: #ffc107;
-    color: #000;
+    background: #64748b;
+    color: white;
 }
 input[type="checkbox"] {
     width: 18px;
@@ -12629,13 +13177,13 @@ async function genRes() {
             <div style="background: linear-gradient(135deg, rgba(232, 96, 28, 0.2) 0%, rgba(232, 96, 28, 0.05) 100%); border: 2px solid var(--orange); border-radius: 15px; padding: 25px; margin-bottom: 25px;">
                 <div class="resin-kpi-grid" style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px; margin-bottom: 20px;">
                     <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">CURRENT PRICE</div><div style="font-size:clamp(1.3rem,4vw,2rem); font-weight:900; color:var(--orange);">${i.curr}</div></div>
-                    <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">PERIOD CHANGE</div><div style="font-size:clamp(1.3rem,4vw,2rem); font-weight:900; ${parseFloat(i.diff) > 0 ? 'color:#e63946;' : 'color:#10b981;'}">${i.diff}</div></div>
+                    <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">PERIOD CHANGE</div><div style="font-size:clamp(1.3rem,4vw,2rem); font-weight:900; ${parseFloat(i.diff) > 0 ? 'color:#fb7185;' : 'color:#10b981;'}">${i.diff}</div></div>
                     <div><div style="opacity:0.7; font-size:0.8rem; margin-bottom:5px;">MARKET STATUS</div><div><span class="badge ${i.badge}" style="font-size:0.9rem; padding:8px 15px;">${i.status}</span></div></div>
                 </div>
                 <div class="resin-kpi-grid" style="display:grid; grid-template-columns: repeat(3, 1fr); gap: 20px; padding-top: 20px; border-top: 1px solid rgba(255,255,255,0.2);">
                     <div><div style="opacity:0.7; font-size:0.8rem;">Average Price</div><div style="font-weight:800; font-size:1.1rem;">${i.avg}</div></div>
                     <div><div style="opacity:0.7; font-size:0.8rem;">Min Price</div><div style="font-weight:800; font-size:1.1rem; color:#10b981;">${i.min}</div></div>
-                    <div><div style="opacity:0.7; font-size:0.8rem;">Max Price</div><div style="font-weight:800; font-size:1.1rem; color:#e63946;">${i.max}</div></div>
+                    <div><div style="opacity:0.7; font-size:0.8rem;">Max Price</div><div style="font-weight:800; font-size:1.1rem; color:#fb7185;">${i.max}</div></div>
                 </div>
             </div>
        
@@ -12798,11 +13346,11 @@ async function compareRegions() {
     } catch (error) {
         console.error('Error comparing regions:', error);
         // Display the actual error message from the server
-        resultsDiv.innerHTML = `<div class="card" style="border-color:#e63946; background: rgba(230, 57, 70, 0.1); padding: 30px;">
+        resultsDiv.innerHTML = `<div class="card" style="border-color:#fb7185; background: rgba(230, 57, 70, 0.1); padding: 30px;">
             <div style="text-align: center;">
                 <div style="font-size: 3rem; margin-bottom: 15px;">⚠️</div>
-                <h3 style="color:#e63946; margin-bottom: 15px;">Comparison Failed</h3>
-                <p style="color:#e63946; font-size: 1.05rem; line-height: 1.6; margin-bottom: 20px;">${error.message}</p>
+                <h3 style="color:#fb7185; margin-bottom: 15px;">Comparison Failed</h3>
+                <p style="color:#fb7185; font-size: 1.05rem; line-height: 1.6; margin-bottom: 20px;">${error.message}</p>
                 <p style="opacity: 0.7; font-size: 0.9rem;">Please check your selections and try again. If the problem persists, verify your data source.</p>
             </div>
         </div>`;
@@ -12917,7 +13465,7 @@ MACH_HTML = """
 .cmp-tbl{width:100%;border-collapse:collapse;font-size:.85rem;color:white;}
 .cmp-tbl th,.cmp-tbl td{padding:10px 12px;text-align:left;border-bottom:1px solid rgba(255,255,255,0.12);}
 .cmp-tbl th{background:rgba(255,255,255,0.08);font-weight:800;font-size:.72rem;text-transform:uppercase;color:rgba(255,255,255,0.65);}
-.cmp-tbl td.best{color:var(--orange);font-weight:800;text-shadow:0 0 8px rgba(232,96,28,0.3);}
+.cmp-tbl td.best{color:#22c55e;font-weight:800;text-shadow:0 0 8px rgba(34,197,94,0.3);}
 .mach-cb{width:18px;height:18px;cursor:pointer;accent-color:var(--orange);}
 .wi-slider{width:100%;accent-color:var(--orange);cursor:pointer;height:6px;-webkit-appearance:none;appearance:none;background:rgba(255,255,255,0.15);border-radius:3px;outline:none;}
 .wi-slider::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:16px;height:16px;border-radius:50%;background:var(--orange);cursor:pointer;}
@@ -13017,7 +13565,7 @@ async function loadMachs() {
     try {
         const r = await fetch('/api/mach_res', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify({cat, proc})});
         const d = await r.json();
-        if (d.error) { document.getElementById('m_res').innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946">' + d.error + '</p></div>'; return; }
+        if (d.error) { document.getElementById('m_res').innerHTML = '<div class="card" style="border-color:#fb7185"><p style="color:#fb7185">' + d.error + '</p></div>'; return; }
 
         currentResults = d.results || [];
         selectedForCompare = [];
@@ -13058,7 +13606,7 @@ async function loadMachs() {
         document.getElementById('m_res').innerHTML = h;
     } catch(e) {
         console.error('Error loading machines:', e);
-        document.getElementById('m_res').innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946">Failed to load machines: ' + e.message + '</p></div>';
+        document.getElementById('m_res').innerHTML = '<div class="card" style="border-color:#fb7185"><p style="color:#fb7185">Failed to load machines: ' + e.message + '</p></div>';
     } finally {
         btn.disabled = false;
         btn.innerHTML = 'Search Machines';
@@ -13211,7 +13759,7 @@ CALC_HTML = """
 .summary-row .label { opacity: 0.8; }
 .summary-row .value { font-weight: 700; }
 .summary-total { display: flex; justify-content: space-between; padding: 15px 0; margin-top: 10px; border-top: 2px solid var(--orange); font-size: 1.1rem; font-weight: 800; }
-.summary-total .value { color: var(--orange); font-size: 1.3rem; }
+.summary-total .value { color: #ffffff; font-size: 1.3rem; }
 .cost-bar { height: 8px; border-radius: 4px; margin-top: 4px; transition: width 0.5s ease; }
 
 /* --- Flex Layers --- */
@@ -13246,8 +13794,8 @@ CALC_HTML = """
 .sc-compare-table{width:100%;border-collapse:collapse;font-size:0.83rem;margin-top:12px;}
 .sc-compare-table th{padding:10px 8px;font-size:0.72rem;text-transform:uppercase;opacity:0.5;border-bottom:2px solid rgba(255,255,255,0.15);text-align:left;}
 .sc-compare-table td{padding:9px 8px;border-bottom:1px solid rgba(255,255,255,0.06);}
-.sc-compare-table .sc-best{color:#4CAF50;font-weight:700;}
-.sc-compare-table .sc-worst{color:#ef4444;opacity:0.7;}
+.sc-compare-table .sc-best{color:#22c55e;font-weight:700;}
+.sc-compare-table .sc-worst{color:#f87171;opacity:0.9;}
 .sc-delta{font-size:0.7rem;opacity:0.5;margin-left:4px;}
 .sc-delta.positive{color:#ef4444;opacity:1;}
 .sc-delta.negative{color:#4CAF50;opacity:1;}
@@ -13925,6 +14473,13 @@ CALC_HTML = """
     <div class="card">
         <div class="calc-section-title">Multi-Country Comparison</div>
         <p style="opacity:0.7; font-size:0.85rem; margin-bottom:15px;">Run the same SKU across multiple countries side-by-side. Works with <strong>all models</strong> — EBM, Carton, Flexibles, and custom Cost Model Builder models. First calculate your cost model in the Calculator tab, then select countries below. You can override cost parameters per country.</p>
+        <div id="mc-no-model-warning" style="display:none; padding:12px; background:rgba(239,68,68,0.15); border:1px solid rgba(239,68,68,0.3); border-radius:10px; margin-bottom:15px; font-size:0.85rem; color:#fca5a5;">
+            ⚠ No model calculated yet. Go to the <strong>Cost Calculator</strong> tab and calculate first.
+        </div>
+        <div id="mc-model-info" style="display:none; padding:10px 14px; background:rgba(34,197,94,0.1); border:1px solid rgba(34,197,94,0.25); border-radius:10px; margin-bottom:15px; font-size:0.85rem;">
+            <span style="color:#4ade80; font-weight:700;" id="mc-model-label">Model: —</span>
+            <span style="opacity:0.6; margin-left:12px;" id="mc-base-total">Base Total: —</span>
+        </div>
         <div style="display:flex; flex-wrap:wrap; gap:8px; margin-bottom:15px;" id="country-checkboxes"></div>
         <div id="mc-override-toggle" style="display:none; margin-bottom:15px;">
             <label style="font-size:0.85rem; display:flex; align-items:center; gap:8px; cursor:pointer;">
@@ -13941,6 +14496,29 @@ CALC_HTML = """
 </div>
 
 <div id="universal-whatif" class="calculator-view">
+    <!-- Scenario Save & Compare Section -->
+    <div class="card" style="margin-bottom:20px;">
+        <div class="calc-section-title">Saved Scenarios</div>
+        <p style="opacity:0.6; font-size:0.82rem; margin-bottom:12px;">Save your calculated models as scenarios, then select 2+ to compare side-by-side.</p>
+        <div style="display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
+            <button class="btn-analyze" onclick="scSaveCurrent()" style="padding:10px 20px; font-size:0.85rem;">Save Current as Scenario</button>
+            <button class="btn-secondary" onclick="scToggleCompare()" style="padding:10px 20px; font-size:0.85rem;">Compare Selected</button>
+            <button class="btn-secondary" onclick="scExportComparison()" style="padding:10px 20px; font-size:0.85rem;">Export Comparison</button>
+        </div>
+        <div id="sc-saved-list" class="sc-saved-list">
+            <span style="opacity:0.4;font-size:0.82rem;">No scenarios saved yet — calculate a model and click Save Scenario.</span>
+        </div>
+        <div id="sc-compare-area" style="display:none; margin-top:20px;">
+            <div class="calc-section-title" style="color:#22c55e;">Scenario Comparison</div>
+            <div style="overflow-x:auto;">
+                <table class="sc-compare-table">
+                    <thead id="sc-compare-head"></thead>
+                    <tbody id="sc-compare-body"></tbody>
+                </table>
+            </div>
+        </div>
+    </div>
+
     <div class="card">
         <div class="calc-section-title">What-If Scenario Analysis</div>
         <p style="opacity:0.7; font-size:0.85rem; margin-bottom:15px;">Adjust sliders to see how parameter changes affect total cost. Works with all cost models — first calculate in the Calculator tab.</p>
@@ -14026,8 +14604,10 @@ function switchUniversalTab(tab) {
         document.querySelectorAll('.model-view').forEach(v => v.classList.remove('active'));
         if (tab === 'compare') {
             document.getElementById('universal-compare').classList.add('active');
+            if (typeof updateMCModelStatus === 'function') updateMCModelStatus();
         } else if (tab === 'whatif') {
             document.getElementById('universal-whatif').classList.add('active');
+            if (typeof scRenderList === 'function') scRenderList();
         } else if (tab === 'skucompare') {
             document.getElementById('universal-skucompare').classList.add('active');
             refreshSKUCompareList();
@@ -14389,6 +14969,7 @@ async function calculateCarton() {
         
         // Enable compare & show export buttons
         document.getElementById('compareCountriesBtn').disabled = false;
+        if (typeof updateMCModelStatus === 'function') updateMCModelStatus();
         var expDiv = document.getElementById('carton-export-btns');
         if (expDiv) expDiv.style.display = 'block';
         
@@ -14513,6 +15094,7 @@ async function calculateFlexibles() {
         
         // Enable compare & show export buttons
         document.getElementById('compareCountriesBtn').disabled = false;
+        if (typeof updateMCModelStatus === 'function') updateMCModelStatus();
         var expDiv = document.getElementById('flex-export-btns');
         if (expDiv) expDiv.style.display = 'block';
         
@@ -14675,6 +15257,7 @@ async function calculateEBM() {
         renderEBMPieChart(d);
         document.getElementById('ebm-export-btns').style.display = 'block';
         document.getElementById('compareCountriesBtn').disabled = false;
+        if (typeof updateMCModelStatus === 'function') updateMCModelStatus();
     } catch(e) {
         document.getElementById('ebm-summary').innerHTML = '<h3>Error</h3><p style="color:#ef4444;margin-top:10px;">' + e.message + '</p>';
     } finally {
@@ -14832,6 +15415,26 @@ function initCountryCheckboxes() {
     container.innerHTML = ALL_COUNTRIES.map(c => 
         '<label class="checkbox-label" style="background:rgba(255,255,255,0.05);border-radius:6px;padding:6px 10px;font-size:0.82rem;"><input type="checkbox" value="' + c + '" onchange="updateCompareBtn()"> ' + c + '</label>'
     ).join('');
+    updateMCModelStatus();
+}
+
+function updateMCModelStatus() {
+    var warnEl = document.getElementById('mc-no-model-warning');
+    var infoEl = document.getElementById('mc-model-info');
+    if (!warnEl || !infoEl) return;
+    if (lastModelResult && lastModelType) {
+        warnEl.style.display = 'none';
+        infoEl.style.display = 'block';
+        var modelNames = {ebm:'EBM Blow Moulding', carton:'Carton Cost', flexibles:'Flexibles Cost', 'carton-adv':'Carton Advanced', custom:'Custom Model'};
+        var mname = modelNames[lastModelType] || lastModelType.toUpperCase();
+        var sym = lastModelResult.currency_symbol || lastModelResult.symbol || lastModelResult.currency || '₹';
+        var total = lastModelResult.total_cost_per_1000 || 0;
+        document.getElementById('mc-model-label').textContent = 'Active Model: ' + mname;
+        document.getElementById('mc-base-total').textContent = 'Base Total: ' + sym + total.toLocaleString(undefined,{minimumFractionDigits:2});
+    } else {
+        warnEl.style.display = 'block';
+        infoEl.style.display = 'none';
+    }
 }
 
 function updateCompareBtn() {
@@ -15002,7 +15605,7 @@ async function runMultiCountry() {
         let h = '<div class="card"><div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:15px;"><h3>Country Comparison (EUR/1000 Pcs)</h3>';
         h += '<button class="btn-secondary" onclick="exportMultiCountryExcel()">Export Excel</button></div>';
         h += '<div style="overflow-x:auto;"><table style="width:100%;border-collapse:collapse;font-size:0.82rem;">';
-        h += '<tr style="border-bottom:2px solid var(--orange);"><th style="padding:10px;text-align:left;">Country</th><th style="padding:10px;text-align:right;">Material</th><th style="padding:10px;text-align:right;">Conversion</th><th style="padding:10px;text-align:right;">Margin</th><th style="padding:10px;text-align:right;">Packing</th><th style="padding:10px;text-align:right;">Freight</th><th style="padding:10px;text-align:right;color:var(--orange);font-weight:800;">Total EUR</th></tr>';
+        h += '<tr style="border-bottom:2px solid var(--orange);"><th style="padding:10px;text-align:left;">Country</th><th style="padding:10px;text-align:right;">Material</th><th style="padding:10px;text-align:right;">Conversion</th><th style="padding:10px;text-align:right;">Margin</th><th style="padding:10px;text-align:right;">Packing</th><th style="padding:10px;text-align:right;">Freight</th><th style="padding:10px;text-align:right;color:#ffffff;font-weight:800;">Total EUR</th></tr>';
         
         d.results.forEach((r, i) => {
             if (r.error) { h += '<tr><td>' + r.country + '</td><td colspan="6" style="color:#ef4444;">Error: ' + r.error + '</td></tr>'; return; }
@@ -15013,7 +15616,7 @@ async function runMultiCountry() {
             h += '<td style="padding:10px;text-align:right;">€' + (r.margin_eur||0).toLocaleString('en',{minimumFractionDigits:2}) + '</td>';
             h += '<td style="padding:10px;text-align:right;">€' + (r.pkg_eur||0).toLocaleString('en',{minimumFractionDigits:2}) + '</td>';
             h += '<td style="padding:10px;text-align:right;">€' + (r.frt_eur||0).toLocaleString('en',{minimumFractionDigits:2}) + '</td>';
-            h += '<td style="padding:10px;text-align:right;font-weight:800;color:var(--orange);">€' + (r.total_eur||0).toLocaleString('en',{minimumFractionDigits:2}) + '</td></tr>';
+            h += '<td style="padding:10px;text-align:right;font-weight:800;color:#ffffff;">€' + (r.total_eur||0).toLocaleString('en',{minimumFractionDigits:2}) + '</td></tr>';
         });
         h += '</table></div></div>';
         document.getElementById('multi-country-results').innerHTML = h;
@@ -15131,7 +15734,7 @@ function updateWhatIf() {
     const diffPct = baseTotal !== 0 ? (diff / baseTotal * 100) : 0;
     
     const fmt = (v) => v.toLocaleString('en-IN', {minimumFractionDigits:2, maximumFractionDigits:2});
-    const clr = diff > 0 ? '#ef4444' : diff < 0 ? '#10b981' : 'white';
+    const clr = diff > 0 ? '#f87171' : diff < 0 ? '#4ade80' : 'white';
     // Fix 3: Use actual currency from result, not hard-coded ₹
     const currencySymbol = lastModelResult?.currency_symbol || lastModelResult?.symbol || lastModelResult?.currency || '₹';
     const unitLabel = mt === 'flexibles' ? (currencySymbol + '/kg') : (currencySymbol + '/1000');
@@ -15165,7 +15768,7 @@ function updateWhatIf() {
     h += '<div style="font-size:0.82rem;">';
     items.forEach(it => {
         const d2 = it.new_val - it.base;
-        const c = d2 > 0.01 ? '#ef4444' : d2 < -0.01 ? '#10b981' : 'rgba(255,255,255,0.6)';
+        const c = d2 > 0.01 ? '#f87171' : d2 < -0.01 ? '#4ade80' : 'rgba(255,255,255,0.6)';
         h += '<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid rgba(255,255,255,0.08);">';
         h += '<span style="opacity:0.8;">' + it.label + '</span>';
         h += '<span>' + unitLabel.charAt(0) + fmt(it.base) + ' → <span style="color:' + c + ';font-weight:700;">' + unitLabel.charAt(0) + fmt(it.new_val) + '</span></span>';
@@ -15188,8 +15791,8 @@ function updateWhatIf() {
     var trace = {
         x: waterfallLabels, y: waterfallValues, type: 'waterfall',
         connector: {line: {color: 'rgba(255,255,255,0.3)'}},
-        decreasing: {marker: {color: '#10b981'}},
-        increasing: {marker: {color: '#ef4444'}},
+        decreasing: {marker: {color: '#4ade80'}},
+        increasing: {marker: {color: '#f87171'}},
         totals: {marker: {color: '#E8601C'}},
         measure: waterfallMeasure,
     };
@@ -15386,6 +15989,7 @@ function renderCartonAdvSummary(d) {
     window.lastCartonAdvResults = d; // SKU FEATURE: Store results
     showSaveSKUButton('carton_advanced'); // SKU FEATURE: Show save button
     document.getElementById('compareCountriesBtn').disabled = false;
+        if (typeof updateMCModelStatus === 'function') updateMCModelStatus();
     
     // Show export buttons
     var expDiv = document.getElementById('carton-adv-export-btns');
@@ -17579,8 +18183,8 @@ GLOBAL_MATERIAL_UI = """
 .gm-grid-5 { grid-template-columns:repeat(5,1fr); }
 .gm-result-card { background:linear-gradient(135deg,rgba(232,96,28,0.1) 0%,rgba(232,96,28,0.03) 100%); border:2px solid rgba(232,96,28,0.25); border-radius:12px; padding:20px; transition:transform 0.2s; }
 .gm-result-card:hover { transform:translateY(-3px); border-color:#e8601c; }
-.gm-result-card.best { border-color:#1f9d55; background:linear-gradient(135deg,rgba(40,167,69,0.12) 0%,rgba(40,167,69,0.03) 100%); }
-.gm-result-card.worst { border-color:#e63946; background:linear-gradient(135deg,rgba(220,53,69,0.12) 0%,rgba(220,53,69,0.03) 100%); }
+.gm-result-card.best { border-color:#4ade80; background:linear-gradient(135deg,rgba(40,167,69,0.12) 0%,rgba(40,167,69,0.03) 100%); }
+.gm-result-card.worst { border-color:#fb7185; background:linear-gradient(135deg,rgba(220,53,69,0.12) 0%,rgba(220,53,69,0.03) 100%); }
 .gm-price-primary { font-size:1.5rem; font-weight:900; color:var(--orange); }
 .gm-price-sub { font-size:0.78rem; opacity:0.55; font-family:'JetBrains Mono',monospace; }
 .gm-stat { display:flex; justify-content:space-between; padding:8px 0; border-bottom:1px solid rgba(255,255,255,0.08); }
@@ -17595,8 +18199,8 @@ GLOBAL_MATERIAL_UI = """
 .gm-xc-table th { background:rgba(232,96,28,0.15); padding:12px 14px; text-align:left; font-weight:800; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.5px; color:rgba(255,255,255,0.8); border-bottom:2px solid rgba(232,96,28,0.3); }
 .gm-xc-table td { padding:11px 14px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'JetBrains Mono',monospace; font-size:0.84rem; }
 .gm-xc-table tr:hover { background:rgba(232,96,28,0.06); }
-.gm-xc-best { color:#1f9d55; font-weight:800; }
-.gm-xc-worst { color:#e63946; font-weight:700; }
+.gm-xc-best { color:#4ade80; font-weight:800; }
+.gm-xc-worst { color:#fb7185; font-weight:700; }
 .gm-pill-group { display:inline-flex; gap:0; background:rgba(255,255,255,0.08); border-radius:8px; overflow:hidden; border:1px solid rgba(255,255,255,0.12); }
 .gm-pill { padding:6px 14px; font-size:0.76rem; font-weight:700; cursor:pointer; border:none; background:transparent; color:rgba(255,255,255,0.5); font-family:'JetBrains Mono',monospace; transition:all 0.2s; }
 .gm-pill.active { background:var(--orange); color:#fff; box-shadow:0 2px 8px rgba(232,96,28,0.4); }
@@ -17759,7 +18363,7 @@ async function gmSearch() {
         if (!r.ok) throw new Error(d.error||'Search failed');
         _gmData = d;
         gmRenderResults(d);
-    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">'+e.message+'</p></div>'; }
+    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#fb7185"><p style="color:#fb7185;text-align:center">'+e.message+'</p></div>'; }
     finally { btn.disabled = false; btn.innerHTML = 'Search Material Prices'; }
 }
 
@@ -17854,7 +18458,7 @@ async function gmCompare() {
         const d = await r.json();
         if (!r.ok) throw new Error(d.error||'Failed');
         gmRenderXC(d, ccy);
-    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">'+e.message+'</p></div>'; }
+    } catch(e) { res.innerHTML = '<div class="card" style="border-color:#fb7185"><p style="color:#fb7185;text-align:center">'+e.message+'</p></div>'; }
     finally { btn.disabled = false; btn.innerHTML = 'Compare Countries'; }
 }
 
@@ -17872,8 +18476,8 @@ function gmRenderXC(d, ccy) {
 
     // Summary bar
     html += '<div style="display:flex;gap:30px;flex-wrap:wrap;margin-bottom:18px;padding:14px;background:rgba(255,255,255,0.05);border-radius:10px;font-size:0.88rem;">';
-    html += '<div><span style="opacity:.55">Cheapest:</span> <strong style="color:#1f9d55">'+d.summary.cheapest+'</strong></div>';
-    html += '<div><span style="opacity:.55">Most Expensive:</span> <strong style="color:#e63946">'+d.summary.most_expensive+'</strong></div>';
+    html += '<div><span style="opacity:.55">Cheapest:</span> <strong style="color:#4ade80">'+d.summary.cheapest+'</strong></div>';
+    html += '<div><span style="opacity:.55">Most Expensive:</span> <strong style="color:#fb7185">'+d.summary.most_expensive+'</strong></div>';
     html += '<div><span style="opacity:.55">Spread:</span> <strong>'+sym+(isUSD?d.summary.spread_usd:d.summary.spread_eur).toLocaleString(undefined,{minimumFractionDigits:2})+'</strong></div>';
     html += '<div><span style="opacity:.55">Countries:</span> <strong>'+d.summary.total+'</strong></div>';
     html += '</div>';
@@ -17889,13 +18493,13 @@ function gmRenderXC(d, ccy) {
         const cls = isBest?'gm-xc-best':(isWorst?'gm-xc-worst':'');
         const trendCls = loc.trend==='Rising'?'gm-rising':loc.trend==='Falling'?'gm-falling':'gm-stable';
         html += '<tr>';
-        html += '<td style="font-weight:800;'+(isBest?'color:#1f9d55':isWorst?'color:#e63946':'')+'">'+String(idx+1)+'</td>';
+        html += '<td style="font-weight:800;'+(isBest?'color:#4ade80':isWorst?'color:#fb7185':'')+'">'+String(idx+1)+'</td>';
         html += '<td style="font-weight:700;">'+loc.country+'<span class="gm-ccy-badge">'+loc.home_code+'</span></td>';
         html += '<td class="'+cls+'">'+sym+price.toLocaleString(undefined,{minimumFractionDigits:2})+(isBest?' ★':'')+'</td>';
         html += '<td>'+loc.portfolio+'</td>';
         html += '<td><span class="gm-badge '+trendCls+'">'+loc.trend+' '+loc.change_pct+'%</span></td>';
         html += '<td>'+loc.home_symbol+loc.curr_home.toLocaleString(undefined,{minimumFractionDigits:2})+'</td>';
-        html += '<td style="font-weight:700;'+(pctVsBest>10?'color:#e63946':pctVsBest>0?'color:#ffc107':'color:#1f9d55')+'">'+(pctVsBest>0?'+':'')+pctVsBest.toFixed(1)+'%</td>';
+        html += '<td style="font-weight:700;'+(pctVsBest>10?'color:#fb7185':pctVsBest>0?'color:#ffc107':'color:#4ade80')+'">'+(pctVsBest>0?'+':'')+pctVsBest.toFixed(1)+'%</td>';
         html += '</tr>';
     });
     html += '</tbody></table>';
@@ -18027,8 +18631,8 @@ MATERIAL_TRACKER_UI = """
 
 .mt-region-card { background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.1); border-radius:10px; padding:16px; transition:all 0.2s; }
 .mt-region-card:hover { border-color:var(--orange); transform:translateY(-2px); }
-.mt-region-card.best { border-color:#1f9d55; background:rgba(40,167,69,0.08); }
-.mt-region-card.worst { border-color:#e63946; background:rgba(220,53,69,0.08); }
+.mt-region-card.best { border-color:#4ade80; background:rgba(40,167,69,0.08); }
+.mt-region-card.worst { border-color:#fb7185; background:rgba(220,53,69,0.08); }
 .mt-xc-table { width:100%; border-collapse:collapse; font-size:0.85rem; }
 .mt-xc-table th { background:rgba(232,96,28,0.12); padding:12px 14px; text-align:left; font-weight:800; font-size:0.72rem; text-transform:uppercase; letter-spacing:0.5px; border-bottom:2px solid rgba(232,96,28,0.3); }
 .mt-xc-table td { padding:11px 14px; border-bottom:1px solid rgba(255,255,255,0.06); font-family:'JetBrains Mono',monospace; font-size:0.84rem; }
@@ -18050,7 +18654,7 @@ MATERIAL_TRACKER_UI = """
 .ts-wrapper.multi .ts-control input { color:white; }
 .ts-wrapper.multi .ts-control .item { background:rgba(232,96,28,0.25); border:1px solid rgba(232,96,28,0.5); color:white; border-radius:5px; padding:2px 8px; font-size:0.82rem; font-weight:600; }
 .ts-wrapper.multi .ts-control .item .remove { color:rgba(255,255,255,0.7); border-left:1px solid rgba(255,255,255,0.15); }
-.ts-wrapper.multi .ts-control .item .remove:hover { color:#e63946; }
+.ts-wrapper.multi .ts-control .item .remove:hover { color:#fb7185; }
 .ts-dropdown { background:#1e293b; border:1px solid rgba(255,255,255,0.15); border-radius:8px; color:white; }
 .ts-dropdown .option { color:white; padding:10px 14px; font-size:0.88rem; }
 .ts-dropdown .option:hover, .ts-dropdown .active { background:rgba(232,96,28,0.18); color:white; }
@@ -18298,7 +18902,7 @@ async function mtIndiaRegion() {
         if (!r.ok) throw new Error(d.error || 'Failed');
         mtRenderIndiaRegion(d);
     } catch(e) {
-        res.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">' + e.message + '</p></div>';
+        res.innerHTML = '<div class="card" style="border-color:#fb7185"><p style="color:#fb7185;text-align:center">' + e.message + '</p></div>';
         document.getElementById('mt-ir-chart').innerHTML = '';
     } finally {
         btn.disabled = false; btn.innerHTML = 'Compare Regions';
@@ -18313,17 +18917,17 @@ function mtRenderIndiaRegion(d) {
     html += '<div class="card" style="overflow-x:auto;"><table class="mt-xc-table">';
     html += '<tr><th>Region</th><th>Grade</th><th style="text-align:right;">Price (₹)</th><th>Date</th><th style="text-align:right;">Avg</th><th style="text-align:right;">Min</th><th style="text-align:right;">Max</th><th style="text-align:right;">Change</th></tr>';
     d.results.forEach((r, i) => {
-        const cls = i === 0 ? ' style="color:#1f9d55;font-weight:800;"' : (i === d.results.length-1 ? ' style="color:#e63946;font-weight:700;"' : '');
-        const tag = i === 0 ? ' <span style="color:#1f9d55;font-size:0.7rem;">CHEAPEST</span>' : (i === d.results.length-1 ? ' <span style="color:#e63946;font-size:0.7rem;">HIGHEST</span>' : '');
-        const chgClr = r.change_pct > 0 ? '#e63946' : r.change_pct < 0 ? '#1f9d55' : '#ffc107';
+        const cls = i === 0 ? ' style="color:#4ade80;font-weight:800;"' : (i === d.results.length-1 ? ' style="color:#fb7185;font-weight:700;"' : '');
+        const tag = i === 0 ? ' <span style="color:#4ade80;font-size:0.7rem;">CHEAPEST</span>' : (i === d.results.length-1 ? ' <span style="color:#fb7185;font-size:0.7rem;">HIGHEST</span>' : '');
+        const chgClr = r.change_pct > 0 ? '#e63946' : r.change_pct < 0 ? '#1f9d55' : '#fbbf24';
         html += '<tr>';
         html += '<td' + cls + '>' + r.region + tag + '</td>';
         html += '<td>' + r.grade + '</td>';
         html += '<td style="text-align:right;font-weight:700;">₹' + r.price.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
         html += '<td style="opacity:0.7;font-size:0.82rem;">' + (r.date || '') + '</td>';
         html += '<td style="text-align:right;">₹' + r.avg.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
-        html += '<td style="text-align:right;color:#1f9d55;">₹' + r.min.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
-        html += '<td style="text-align:right;color:#e63946;">₹' + r.max.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+        html += '<td style="text-align:right;color:#4ade80;">₹' + r.min.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
+        html += '<td style="text-align:right;color:#fb7185;">₹' + r.max.toLocaleString(undefined,{minimumFractionDigits:2}) + '</td>';
         html += '<td style="text-align:right;color:' + chgClr + ';font-weight:700;">' + (r.change_pct > 0?'+':'') + r.change_pct + '%</td>';
         html += '</tr>';
     });
@@ -18411,7 +19015,7 @@ async function mtCrossCountry() {
         if (!r.ok) throw new Error(d.error || 'Failed');
         mtRenderCrossCountry(d);
     } catch(e) {
-        res.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">' + e.message + '</p></div>';
+        res.innerHTML = '<div class="card" style="border-color:#fb7185"><p style="color:#fb7185;text-align:center">' + e.message + '</p></div>';
         document.getElementById('mt-xc-chart').innerHTML = '';
     } finally {
         btn.disabled = false; btn.innerHTML = 'Compare Countries';
@@ -18426,9 +19030,9 @@ function mtRenderCrossCountry(d) {
     html += '<div class="card" style="overflow-x:auto;"><table class="mt-xc-table">';
     html += '<tr><th>Country</th><th>Grade</th><th style="text-align:right;">Price (€)</th><th style="text-align:right;">Price ($)</th><th style="text-align:right;">Local Currency</th><th style="text-align:right;">Change</th></tr>';
     d.results.forEach((r, i) => {
-        const cls = i === 0 ? ' style="color:#1f9d55;font-weight:800;"' : (i === d.results.length-1 ? ' style="color:#e63946;font-weight:700;"' : '');
-        const tag = i === 0 ? ' <span style="color:#1f9d55;font-size:0.7rem;">CHEAPEST</span>' : (i === d.results.length-1 ? ' <span style="color:#e63946;font-size:0.7rem;">MOST EXPENSIVE</span>' : '');
-        const chgClr = r.change_pct > 0 ? '#e63946' : r.change_pct < 0 ? '#1f9d55' : '#ffc107';
+        const cls = i === 0 ? ' style="color:#4ade80;font-weight:800;"' : (i === d.results.length-1 ? ' style="color:#fb7185;font-weight:700;"' : '');
+        const tag = i === 0 ? ' <span style="color:#4ade80;font-size:0.7rem;">CHEAPEST</span>' : (i === d.results.length-1 ? ' <span style="color:#fb7185;font-size:0.7rem;">MOST EXPENSIVE</span>' : '');
+        const chgClr = r.change_pct > 0 ? '#e63946' : r.change_pct < 0 ? '#1f9d55' : '#fbbf24';
         html += '<tr>';
         html += '<td' + cls + '>' + r.country + tag + '</td>';
         html += '<td>' + (r.grade || '') + '</td>';
@@ -18602,7 +19206,7 @@ async function mtAnalyze() {
         if (!r.ok) throw new Error(d.error || 'Analysis failed');
         mtRenderResults(d);
     } catch (e) {
-        resCont.innerHTML = '<div class="card" style="border-color:#e63946"><p style="color:#e63946;text-align:center">' + e.message + '</p></div>';
+        resCont.innerHTML = '<div class="card" style="border-color:#fb7185"><p style="color:#fb7185;text-align:center">' + e.message + '</p></div>';
     } finally {
         btn.disabled = false;
         btn.innerHTML = 'Generate Analysis';
@@ -18632,10 +19236,10 @@ function mtRenderResults(d) {
     html += '<div class="mt-kpi-strip">';
     html += '<div class="mt-kpi"><div class="mt-kpi-label">Current</div><div class="mt-kpi-value">' + sym + ins.current.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
     html += '<div class="mt-kpi"><div class="mt-kpi-label">Previous</div><div class="mt-kpi-value">' + sym + ins.previous.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
-    html += '<div class="mt-kpi"><div class="mt-kpi-label">Change</div><div class="mt-kpi-value" style="color:' + (ins.change_pct > 0 ? '#e63946' : ins.change_pct < 0 ? '#1f9d55' : '#ffc107') + '">' + (ins.change_pct > 0 ? '+' : '') + ins.change_pct + '%</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Change</div><div class="mt-kpi-value" style="color:' + (ins.change_pct > 0 ? '#e63946' : ins.change_pct < 0 ? '#1f9d55' : '#fbbf24') + '">' + (ins.change_pct > 0 ? '+' : '') + ins.change_pct + '%</div></div>';
     html += '<div class="mt-kpi"><div class="mt-kpi-label">Average</div><div class="mt-kpi-value">' + sym + ins.avg.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
-    html += '<div class="mt-kpi"><div class="mt-kpi-label">Min</div><div class="mt-kpi-value" style="color:#1f9d55">' + sym + ins.min.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
-    html += '<div class="mt-kpi"><div class="mt-kpi-label">Max</div><div class="mt-kpi-value" style="color:#e63946">' + sym + ins.max.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Min</div><div class="mt-kpi-value" style="color:#4ade80">' + sym + ins.min.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
+    html += '<div class="mt-kpi"><div class="mt-kpi-label">Max</div><div class="mt-kpi-value" style="color:#fb7185">' + sym + ins.max.toLocaleString(undefined, {minimumFractionDigits:2}) + '</div></div>';
     html += '</div>';
 
     // ── Multi-currency info (global only) ──
@@ -18752,7 +19356,7 @@ async function mtFetchForecast(material, country, histPrices, sym, chartElId, pa
             const f90 = fc.forecast_90 || latest;
             const pct90 = fc.pct_change_90 || 0;
             const trend = fc.trend_direction || 'Stable';
-            const trendClr = trend === 'Up' ? '#e63946' : (trend === 'Down' ? '#1f9d55' : '#ffc107');
+            const trendClr = trend === 'Up' ? '#e63946' : (trend === 'Down' ? '#1f9d55' : '#fbbf24');
             const trendIcon = trend === 'Up' ? '↑' : (trend === 'Down' ? '↓' : '→');
 
             let h = '<div class="mt-forecast-panel">';
@@ -20192,8 +20796,8 @@ SPEND_UI_HTML = """
 .sp-ai-table td { padding:8px 12px; border-bottom:1px solid rgba(255,255,255,.05);
                    font-family:'JetBrains Mono',monospace; font-size:0.8rem; }
 .sp-ai-table tr:hover { background:rgba(232,96,28,.05); }
-.sp-risk-high { color:#e63946; font-weight:800; }
-.sp-risk-ok   { color:#1f9d55; }
+.sp-risk-high { color:#fb7185; font-weight:800; }
+.sp-risk-ok   { color:#4ade80; }
 .sp-anom-flag { background:rgba(220,53,69,.25); border-radius:4px; padding:2px 7px;
                 color:#f1948a; font-size:.72rem; font-weight:700; }
 
@@ -20612,7 +21216,7 @@ async function spParseFile(file) {
     SP.parsedData = d;
     spRenderPreview(d);
   } catch(e) {
-    zone.innerHTML = `<p style="color:#e63946">❌ ${e.message}</p>`;
+    zone.innerHTML = `<p style="color:#fb7185">❌ ${e.message}</p>`;
     zone.onclick = () => document.getElementById('sp-file-input').click();
   }
 }
@@ -20907,14 +21511,14 @@ async function spLoadPPV() {
 
     el.innerHTML = `
       <div class="sp-kpi"><div class="sp-kpi-lbl">Total Savings Potential</div><div class="sp-kpi-val">$${Number(d.total_savings_potential||0).toLocaleString(undefined,{maximumFractionDigits:0})}</div></div>
-      <div class="sp-kpi"><div class="sp-kpi-lbl">Overpaid Rows</div><div class="sp-kpi-val" style="color:#e63946">${Number(d.overpaid_row_pct||0).toFixed(1)}%</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Overpaid Rows</div><div class="sp-kpi-val" style="color:#fb7185">${Number(d.overpaid_row_pct||0).toFixed(1)}%</div></div>
       <div class="sp-kpi"><div class="sp-kpi-lbl">Overpaid Records</div><div class="sp-kpi-val">${(d.top_overpaid||[]).length ? d.top_overpaid.length + ' shown' : '0'}</div></div>
     `;
     spPlot('sp-ch-ppv-sup', (d.charts||{}).supplier_ppv);
     spPlot('sp-ch-ppv-cat', (d.charts||{}).category_ppv);
     spRenderTable(d.top_overpaid || [], 'sp-ppv-table', 'overpaid', true);
   } catch(e) {
-    el.innerHTML = `<p style="color:#e63946">Error: ${e.message}</p>`;
+    el.innerHTML = `<p style="color:#fb7185">Error: ${e.message}</p>`;
   }
 }
 
@@ -20947,7 +21551,7 @@ async function spLoadForecast(force) {
       spRenderTable(rows, 'sp-fc-num-table');
     }
   } catch(e) {
-    if (chartEl) chartEl.innerHTML = `<p style="color:#e63946;padding:20px">Error: ${e.message}</p>`;
+    if (chartEl) chartEl.innerHTML = `<p style="color:#fb7185;padding:20px">Error: ${e.message}</p>`;
   }
 }
 
@@ -20962,12 +21566,12 @@ async function spLoadRisk() {
 
     kpiEl.innerHTML = `
       <div class="sp-kpi"><div class="sp-kpi-lbl">Suppliers Analysed</div><div class="sp-kpi-val">${(d.risk_suppliers||[]).length}</div></div>
-      <div class="sp-kpi"><div class="sp-kpi-lbl">High-Risk Suppliers</div><div class="sp-kpi-val" style="color:#e63946">${d.flagged_count||0}</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">High-Risk Suppliers</div><div class="sp-kpi-val" style="color:#fb7185">${d.flagged_count||0}</div></div>
     `;
     spPlot('sp-ch-geo', (d.charts||{}).geo_spend_map);
     spRenderTable(d.risk_suppliers || [], 'sp-risk-table', 'risk_flag', true);
   } catch(e) {
-    kpiEl.innerHTML = `<p style="color:#e63946">Error: ${e.message}</p>`;
+    kpiEl.innerHTML = `<p style="color:#fb7185">Error: ${e.message}</p>`;
   }
 }
 
@@ -20983,7 +21587,7 @@ async function spLoadAnomalies(force) {
     if (d.empty) { kpiEl.innerHTML = '<p style="color:rgba(255,255,255,.4)">No data loaded.</p>'; return; }
 
     kpiEl.innerHTML = `
-      <div class="sp-kpi"><div class="sp-kpi-lbl">Anomalies Found</div><div class="sp-kpi-val" style="color:#e63946">${d.anomaly_count||0}</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Anomalies Found</div><div class="sp-kpi-val" style="color:#fb7185">${d.anomaly_count||0}</div></div>
       <div class="sp-kpi"><div class="sp-kpi-lbl">Anomaly Rate</div><div class="sp-kpi-val">${Number(d.anomaly_pct||0).toFixed(1)}%</div></div>
       <div class="sp-kpi"><div class="sp-kpi-lbl">Threshold Used</div><div class="sp-kpi-val">${d.threshold_used}×</div></div>
     `;
@@ -20991,7 +21595,7 @@ async function spLoadAnomalies(force) {
     spPlot('sp-ch-anom-bar', await spFetchChart('/api/spend/chart/anomaly_bar'));
     spRenderTable(d.anomaly_rows || [], 'sp-anom-table', 'anomaly_flag', true);
   } catch(e) {
-    kpiEl.innerHTML = `<p style="color:#e63946">Error: ${e.message}</p>`;
+    kpiEl.innerHTML = `<p style="color:#fb7185">Error: ${e.message}</p>`;
   }
 }
 
@@ -21005,7 +21609,7 @@ async function spLoadShouldCost() {
     if (d.empty) { kpiEl.innerHTML = '<p style="color:rgba(255,255,255,.4)">No data loaded.</p>'; return; }
 
     kpiEl.innerHTML = `
-      <div class="sp-kpi"><div class="sp-kpi-lbl">Total Should-Cost Gap</div><div class="sp-kpi-val" style="color:#e63946">$${Number(d.total_should_cost_gap||0).toLocaleString(undefined,{maximumFractionDigits:0})}</div></div>
+      <div class="sp-kpi"><div class="sp-kpi-lbl">Total Should-Cost Gap</div><div class="sp-kpi-val" style="color:#fb7185">$${Number(d.total_should_cost_gap||0).toLocaleString(undefined,{maximumFractionDigits:0})}</div></div>
       <div class="sp-kpi"><div class="sp-kpi-lbl">Avg Gap / Row</div><div class="sp-kpi-val">${Number(d.avg_should_cost_gap||0).toFixed(3)}</div></div>
     `;
     spRenderTable(d.top_skus || [], 'sp-sc-table');
@@ -21026,7 +21630,7 @@ async function spLoadShouldCost() {
       Plotly.newPlot('sp-ch-sc-bar', ch.data, ch.layout, {responsive:true,displayModeBar:false});
     }
   } catch(e) {
-    kpiEl.innerHTML = `<p style="color:#e63946">Error: ${e.message}</p>`;
+    kpiEl.innerHTML = `<p style="color:#fb7185">Error: ${e.message}</p>`;
   }
 }
 
@@ -21078,7 +21682,7 @@ async function spAskAI() {
   } catch(e) {
     result.innerHTML = `
       <div class="sp-chat-q"> <strong>You:</strong> ${q}</div>
-      <div class="sp-chat-a"><p style="color:#e63946">❌ ${e.message}</p></div>
+      <div class="sp-chat-a"><p style="color:#fb7185">❌ ${e.message}</p></div>
     `;
   }
 }
