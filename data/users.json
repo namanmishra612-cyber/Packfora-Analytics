@@ -10,5 +10,9 @@
   "viewer": {
     "password": "viewer123",
     "role": "viewer"
+  },
+  "Naman.Mishra": {
+    "password": "Naman@2001",
+    "role": "admin"
   }
 }
